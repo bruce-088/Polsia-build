@@ -18,3 +18,5 @@ frontend/dist/
 
 .DS_Store
 data/chroma/
+*.db
+*.log
