@@ -1,6 +1,6 @@
 "use client";
 import { useEffect, useState } from "react";
-import { api } from "@/lib/api";
+import { api, ApiError } from "@/lib/api";
 
 type Config = {
   name: string;
@@ -16,14 +16,40 @@ type Config = {
   daily_cycle_hour: number;
 };
 
+const EMPTY_CONFIG: Config = {
+  name: "",
+  mission: "",
+  vision: "",
+  description: "",
+  target_market: "",
+  value_prop: "",
+  website_url: "",
+  industry: "",
+  product_type: "",
+  timezone: "UTC",
+  daily_cycle_hour: 6,
+};
+
 export default function SettingsPage() {
   const [config, setConfig] = useState<Config | null>(null);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
+  const [loadError, setLoadError] = useState(false);
 
   useEffect(() => {
-    api.get<Config>("/config").then(setConfig).finally(() => setLoading(false));
+    api
+      .get<Config>("/config")
+      .then(setConfig)
+      .catch((err) => {
+        if (err instanceof ApiError && err.status === 404) {
+          // No company profile created yet — start from an empty form.
+          setConfig(EMPTY_CONFIG);
+        } else {
+          setLoadError(true);
+        }
+      })
+      .finally(() => setLoading(false));
   }, []);
 
   const save = async () => {
@@ -40,7 +66,7 @@ export default function SettingsPage() {
   };
 
   if (loading) return <div className="p-6 text-gray-400">Loading…</div>;
-  if (!config) return <div className="p-6 text-red-400">Failed to load config</div>;
+  if (loadError || !config) return <div className="p-6 text-red-400">Failed to load config</div>;
 
   const field = (label: string, key: keyof Config, type: "text" | "number" = "text") => (
     <div key={key}>
