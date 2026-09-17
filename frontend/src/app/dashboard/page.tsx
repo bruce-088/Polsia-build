@@ -34,7 +34,7 @@ export default async function DashboardPage() {
         />
         <MetricsCard
           title="Active Customers"
-          value={kpis.active_customers ?? "—"}
+          value={kpis.active_customers != null ? String(kpis.active_customers) : "—"}
         />
         <MetricsCard
           title="Churn Rate"
