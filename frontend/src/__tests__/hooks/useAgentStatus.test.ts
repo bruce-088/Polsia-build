@@ -5,20 +5,6 @@ const mockStatuses = [
   { agent_type: "finance", last_run_status: "completed", last_run_at: null, tasks_today: 1, tasks_total: 5 },
 ];
 
-let fetchMock: jest.Mock;
-
-beforeEach(() => {
-  jest.useFakeTimers();
-  fetchMock = jest.fn().mockResolvedValue(mockStatuses);
-  jest.mock("@/lib/api", () => ({ api: { get: fetchMock } }), { virtual: true });
-});
-
-afterEach(() => {
-  jest.useRealTimers();
-  jest.resetModules();
-});
-
-// Re-mock api for each test
 jest.mock("@/lib/api", () => ({
   api: {
     get: jest.fn(),
@@ -27,6 +13,15 @@ jest.mock("@/lib/api", () => ({
 
 import { api } from "@/lib/api";
 const mockApiGet = api.get as jest.MockedFunction<typeof api.get>;
+
+beforeEach(() => {
+  jest.useFakeTimers();
+  mockApiGet.mockClear();
+});
+
+afterEach(() => {
+  jest.useRealTimers();
+});
 
 describe("useAgentStatus", () => {
   it("starts in loading state", () => {

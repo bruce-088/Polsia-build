@@ -15,6 +15,11 @@ const MockWebSocket = jest.fn().mockImplementation(() => {
   return mockWsInstance;
 });
 
+(MockWebSocket as any).CONNECTING = 0;
+(MockWebSocket as any).OPEN = 1;
+(MockWebSocket as any).CLOSING = 2;
+(MockWebSocket as any).CLOSED = 3;
+
 (global as any).WebSocket = MockWebSocket;
 
 describe("useActivityFeed", () => {
