@@ -12,6 +12,7 @@ class Settings(BaseSettings):
     morning_cycle_hour: int = 6
     evening_cycle_hour: int = 20
     stripe_webhook_secret: str = ""
+    stripe_secret_key: str = ""
     sandbox_mode: bool = True
     llm_provider: str = "claude"
 

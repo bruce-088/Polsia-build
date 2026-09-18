@@ -33,6 +33,20 @@ def run_agent_task(self, task_id: int):
 
             await update_task_status(db, task_id, "in_progress")
             context = await get_full_context(db)
+
+            if task.agent_type == "finance":
+                from app.services.finance_service import poll_stripe_snapshot
+
+                snapshot = await poll_stripe_snapshot(db)
+                if snapshot is not None and context:
+                    context["kpis"] = {
+                        **context.get("kpis", {}),
+                        "mrr_cents": snapshot.mrr_cents,
+                        "arr_cents": snapshot.arr_cents,
+                        "active_subscribers": snapshot.active_subscribers,
+                        "stripe_balance_cents": snapshot.stripe_balance_cents,
+                    }
+
             run = await create_agent_run(db, task.agent_type, task_id=task_id, input_context=context)
             await db.commit()
 
