@@ -53,10 +53,11 @@ class BasePolsiaAgent:
         except (json.JSONDecodeError, TypeError):
             return {"summary": raw}
 
-    def _run_llm_turn(self, prompt: str, **kwargs) -> str:
-        """Real (non-mock) LLM call. Provider chosen by settings.llm_provider —
-        this is the only place that needs to change to add a second backend."""
-        provider = getattr(settings, "llm_provider", "claude")
+    def _run_llm_turn(self, prompt: str, provider: str | None = None, **kwargs) -> str:
+        """Real (non-mock) LLM call. Provider defaults to settings.llm_provider,
+        but can be overridden per-call (used by call_dual_provider below to
+        address Claude and OpenAI in the same turn)."""
+        provider = provider or getattr(settings, "llm_provider", "claude")
         if provider == "claude":
             result = subprocess.run(
                 ["claude", "-p", prompt, "--output-format", "json"],
@@ -65,4 +66,40 @@ class BasePolsiaAgent:
                 check=True,
             )
             return json.loads(result.stdout)["result"]
+        if provider == "openai":
+            from openai import OpenAI
+
+            client = OpenAI(api_key=getattr(settings, "openai_api_key", None))
+            model = getattr(settings, "openai_model", "gpt-4o")
+            response = client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            return response.choices[0].message.content or ""
         raise NotImplementedError(f"llm_provider {provider!r} is not wired up yet")
+
+    def call_dual_provider(self, prompt: str, review_prompt_template: str | None = None) -> dict:
+        """Have Claude and OpenAI collaborate on one task: Claude drafts,
+        OpenAI reviews/critiques the draft, then Claude produces a final
+        answer informed by that critique. This is the generic "two models
+        working together" pattern — draft-then-review — not tied to any
+        specific product; swap which provider drafts vs. reviews as needed.
+
+        Falls back to a single Claude call if only one provider is
+        configured (e.g. no OPENAI_API_KEY set), so this is always safe to
+        call even without OpenAI wired up.
+        """
+        draft = self.call_claude(prompt)
+
+        if not getattr(settings, "openai_api_key", None):
+            return {"draft": draft, "critique": None, "final": draft, "providers_used": ["claude"]}
+
+        review_prompt = (review_prompt_template or "Review this draft response and list concrete improvements:\n\n{draft}").format(
+            draft=draft
+        )
+        critique = self._run_llm_turn(review_prompt, provider="openai")
+
+        final_prompt = f"Original task:\n{prompt}\n\nYour draft:\n{draft}\n\nReviewer feedback:\n{critique}\n\nProduce an improved final answer incorporating the useful feedback."
+        final = self.call_claude(final_prompt)
+
+        return {"draft": draft, "critique": critique, "final": final, "providers_used": ["claude", "openai"]}
