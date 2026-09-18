@@ -21,3 +21,6 @@ data/chroma/
 *.db
 *.log
 next-env.d.ts
+
+# Codex CLI OAuth credential copy for celery_worker container — never commit
+codex-container-auth/

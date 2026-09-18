@@ -64,6 +64,7 @@ services:
       - chroma_data:/app/data/chroma
       - ~/.claude:/root/.claude:ro
       - ~/.claude.json:/root/.claude.json:ro
+      - ./codex-container-auth:/root/.codex:rw
     depends_on:
       postgres:
         condition: service_healthy

@@ -14,8 +14,6 @@ class Settings(BaseSettings):
     stripe_webhook_secret: str = ""
     sandbox_mode: bool = True
     llm_provider: str = "claude"
-    openai_api_key: str | None = None
-    openai_model: str = "gpt-4o"
 
     model_config = {"env_file": ".env", "extra": "ignore"}
 

@@ -22,9 +22,6 @@ pydantic-settings==2.7.0
 # HTTP client
 httpx==0.28.1
 
-# Multi-provider LLM orchestration
-openai==1.58.1
-
 # Third-party integrations
 tweepy==4.14.0
 sendgrid==6.11.0
