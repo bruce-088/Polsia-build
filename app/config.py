@@ -13,6 +13,8 @@ class Settings(BaseSettings):
     evening_cycle_hour: int = 20
     stripe_webhook_secret: str = ""
     stripe_secret_key: str = ""
+    sendgrid_api_key: str = ""
+    sendgrid_from_email: str = ""
     sandbox_mode: bool = True
     llm_provider: str = "claude"
 
