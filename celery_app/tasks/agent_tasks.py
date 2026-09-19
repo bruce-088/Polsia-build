@@ -68,14 +68,23 @@ def run_agent_task(self, task_id: int):
         async with Session() as db:
             await update_task_status(db, task_id, status, result_summary=summary, error_message=error)
             await finish_agent_run(db, run.id, status, output=result, duration_secs=duration)
-            await log_activity(
-                db,
-                agent_type=task.agent_type,
-                action="task_completed" if status == "completed" else "task_failed",
-                summary=summary or error or "No output",
-                level="success" if status == "completed" else "error",
-            )
             await db.commit()
+
+        # Activity-feed logging is best-effort (drives the live dashboard
+        # feed, not task correctness) — a failure here (e.g. Redis publish)
+        # must not be able to lose the task completion committed above.
+        try:
+            async with Session() as db:
+                await log_activity(
+                    db,
+                    agent_type=task.agent_type,
+                    action="task_completed" if status == "completed" else "task_failed",
+                    summary=summary or error or "No output",
+                    level="success" if status == "completed" else "error",
+                )
+                await db.commit()
+        except Exception:
+            pass
 
         await engine.dispose()
 

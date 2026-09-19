@@ -44,14 +44,20 @@ def run_morning_cycle():
             }
             result = run_agent_for_task("orchestrator", orch_task_dict, context)
 
-            await log_activity(
-                db,
-                agent_type="orchestrator",
-                action="morning_plan_complete",
-                summary=result.get("summary", "Morning plan generated"),
-                level="success",
-            )
-            await db.commit()
+        # Best-effort — a failure here (e.g. Redis publish) must not be able
+        # to skip step 3 below.
+        try:
+            async with Session() as db:
+                await log_activity(
+                    db,
+                    agent_type="orchestrator",
+                    action="morning_plan_complete",
+                    summary=result.get("summary", "Morning plan generated"),
+                    level="success",
+                )
+                await db.commit()
+        except Exception:
+            pass
 
         # 3. Always-run agents
         for agent_type, title in [
@@ -118,15 +124,22 @@ def run_evening_cycle():
                 tasks_failed=failed.scalar() or 0,
                 metrics_snapshot=context.get("kpis", {}),
             )
-
-            await log_activity(
-                db,
-                agent_type="orchestrator",
-                action="evening_summary_complete",
-                summary=result.get("summary", "Evening summary complete"),
-                level="success",
-            )
             await db.commit()
+
+        # Best-effort — a failure here (e.g. Redis publish) must not be able
+        # to lose the evening report committed above.
+        try:
+            async with Session() as db:
+                await log_activity(
+                    db,
+                    agent_type="orchestrator",
+                    action="evening_summary_complete",
+                    summary=result.get("summary", "Evening summary complete"),
+                    level="success",
+                )
+                await db.commit()
+        except Exception:
+            pass
 
         await engine.dispose()
 
