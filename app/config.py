@@ -15,6 +15,10 @@ class Settings(BaseSettings):
     stripe_secret_key: str = ""
     sendgrid_api_key: str = ""
     sendgrid_from_email: str = ""
+    twitter_api_key: str = ""
+    twitter_api_secret: str = ""
+    twitter_access_token: str = ""
+    twitter_access_token_secret: str = ""
     sandbox_mode: bool = True
     llm_provider: str = "claude"
 
