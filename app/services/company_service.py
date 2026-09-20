@@ -48,7 +48,12 @@ def build_context_prompt(context: dict) -> str:
     company = context.get("company", {})
     lines = [
         f"Company: {company.get('name')}",
+        f"Industry: {company.get('industry')}",
         f"Mission: {company.get('mission')}",
+        f"Vision: {company.get('vision')}",
+        f"Description: {company.get('description')}",
+        f"Target market: {company.get('target_market')}",
+        f"Value proposition: {company.get('value_prop')}",
         f"KPIs: {context.get('kpis', {})}",
         f"Yesterday: {context.get('yesterday_summary')}",
         "Today's tasks:",
