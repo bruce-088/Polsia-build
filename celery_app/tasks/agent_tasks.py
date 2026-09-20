@@ -77,12 +77,13 @@ def run_agent_task(self, task_id: int):
             if reply_to:
                 try:
                     from app.config import settings
+                    from app.services import approval_service
                     from app.services.auto_send_policy import is_safe_to_auto_send
                     from app.services.email_service import send_email
 
+                    reply_subject = task.task_metadata.get("subject", task.title)
                     async with Session() as db:
                         if await is_safe_to_auto_send(db, task.description or "", result):
-                            reply_subject = task.task_metadata.get("subject", task.title)
                             send_email(
                                 to_email=reply_to,
                                 subject=f"Re: {reply_subject}",
@@ -92,6 +93,38 @@ def run_agent_task(self, task_id: int):
                             result["auto_sent"] = True
                             result["status"] = "sent"
                             summary = f"Auto-sent: {summary}"
+                        elif result.get("reply_draft"):
+                            # Not safe to send autonomously, but there's a
+                            # real draft waiting on a real inbound message —
+                            # surface it in the Founder Inbox instead of
+                            # letting it sit silently in the task list.
+                            await approval_service.create_approval_request(
+                                db,
+                                task_id=task.id,
+                                requested_by_agent="customer_support",
+                                decision_type="send_customer_reply",
+                                risk_level="YELLOW",
+                                title=f"Send reply: {reply_subject}",
+                                summary=result.get(
+                                    "summary", "A customer reply is drafted and awaiting review."
+                                ),
+                                evidence=[
+                                    f"Inbound message from {reply_to}",
+                                    (task.description or "")[:500],
+                                ],
+                                options=[
+                                    {"id": "approve", "label": "Send as drafted"},
+                                    {"id": "reject", "label": "Don't send"},
+                                ],
+                                cost_or_commitment="One outbound email reply.",
+                                payload={
+                                    "reply_to": reply_to,
+                                    "subject": f"Re: {reply_subject}",
+                                    "reply_draft": result.get("reply_draft", ""),
+                                    "from_email": settings.imap_username or None,
+                                },
+                            )
+                            await db.commit()
                 except Exception:
                     pass  # any failure here just leaves the reply as a draft
 

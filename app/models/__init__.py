@@ -3,6 +3,7 @@ create_all runs (required by alembic/env.py and tests/integration/conftest.py)."
 from app.models import (  # noqa: F401
     ads,
     agent_run,
+    approval,
     company,
     competitor,
     email,
