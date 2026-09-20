@@ -101,7 +101,21 @@ def run_social_sweep():
 
 @app.task(name="celery_app.tasks.agent_tasks.run_email_sweep")
 def run_email_sweep():
-    _create_and_run("customer_support", "Check inbox and reply to customer emails")
+    """Poll the real inbox via IMAP; each unread message becomes its own
+    customer_support task carrying that message's real content, so the
+    agent drafts a reply to a real email instead of a generic placeholder.
+    No-op if IMAP isn't configured yet (expected until Bruce sets it up)."""
+    from app.services.email_inbox_service import fetch_unread_messages
+
+    try:
+        messages = fetch_unread_messages()
+    except RuntimeError:
+        return
+
+    for msg in messages:
+        title = f"Reply to: {msg['subject'] or '(no subject)'}"
+        description = f"From: {msg['from']}\n\n{msg['body']}"
+        _create_and_run("customer_support", title, description=description)
 
 
 @app.task(name="celery_app.tasks.agent_tasks.run_ads_stripe_sync")
@@ -110,7 +124,7 @@ def run_ads_stripe_sync():
     _create_and_run("finance", "Check for failed Stripe payments and update revenue snapshot")
 
 
-def _create_and_run(agent_type: str, title: str):
+def _create_and_run(agent_type: str, title: str, description: str | None = None):
     async def _inner():
         from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
         from app.config import settings
@@ -120,7 +134,9 @@ def _create_and_run(agent_type: str, title: str):
         Session = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
         async with Session() as db:
-            task = await create_task(db, title=title, agent_type=agent_type, source="scheduler")
+            task = await create_task(
+                db, title=title, agent_type=agent_type, source="scheduler", description=description
+            )
             await db.commit()
             task_id = task.id
 

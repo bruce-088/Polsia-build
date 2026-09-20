@@ -20,6 +20,10 @@ class Settings(BaseSettings):
     twitter_access_token: str = ""
     twitter_access_token_secret: str = ""
     tavily_api_key: str = ""
+    imap_host: str = ""
+    imap_port: int = 993
+    imap_username: str = ""
+    imap_password: str = ""
     sandbox_mode: bool = True
     llm_provider: str = "claude"
 
