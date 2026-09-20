@@ -19,6 +19,7 @@ class Settings(BaseSettings):
     twitter_api_secret: str = ""
     twitter_access_token: str = ""
     twitter_access_token_secret: str = ""
+    tavily_api_key: str = ""
     sandbox_mode: bool = True
     llm_provider: str = "claude"
 
