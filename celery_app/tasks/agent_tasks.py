@@ -65,6 +65,36 @@ def run_agent_task(self, task_id: int):
 
         duration = round(time.monotonic() - start, 2)
 
+        # The one autonomous send path in the whole codebase — narrow by
+        # design. Only reachable for customer_support replies that came
+        # from the real inbound sweep (task_metadata carries a real
+        # reply_to only in that case; manually-triggered runs never have
+        # it) and only if every independent layer of auto_send_policy
+        # agrees. Any failure anywhere here just leaves the reply as a
+        # draft — the existing, safe default.
+        if status == "completed" and task.agent_type == "customer_support" and task.source == "scheduler":
+            reply_to = (task.task_metadata or {}).get("reply_to")
+            if reply_to:
+                try:
+                    from app.config import settings
+                    from app.services.auto_send_policy import is_safe_to_auto_send
+                    from app.services.email_service import send_email
+
+                    async with Session() as db:
+                        if await is_safe_to_auto_send(db, task.description or "", result):
+                            reply_subject = task.task_metadata.get("subject", task.title)
+                            send_email(
+                                to_email=reply_to,
+                                subject=f"Re: {reply_subject}",
+                                body=result.get("reply_draft", ""),
+                                from_email=settings.imap_username or None,
+                            )
+                            result["auto_sent"] = True
+                            result["status"] = "sent"
+                            summary = f"Auto-sent: {summary}"
+                except Exception:
+                    pass  # any failure here just leaves the reply as a draft
+
         async with Session() as db:
             await update_task_status(db, task_id, status, result_summary=summary, error_message=error)
             await finish_agent_run(db, run.id, status, output=result, duration_secs=duration)
@@ -115,7 +145,12 @@ def run_email_sweep():
     for msg in messages:
         title = f"Reply to: {msg['subject'] or '(no subject)'}"
         description = f"From: {msg['from']}\n\n{msg['body']}"
-        _create_and_run("customer_support", title, description=description)
+        task_metadata = {
+            "reply_to": msg["from"],
+            "message_id": msg["message_id"],
+            "subject": msg["subject"] or "(no subject)",
+        }
+        _create_and_run("customer_support", title, description=description, task_metadata=task_metadata)
 
 
 @app.task(name="celery_app.tasks.agent_tasks.run_ads_stripe_sync")
@@ -124,7 +159,9 @@ def run_ads_stripe_sync():
     _create_and_run("finance", "Check for failed Stripe payments and update revenue snapshot")
 
 
-def _create_and_run(agent_type: str, title: str, description: str | None = None):
+def _create_and_run(
+    agent_type: str, title: str, description: str | None = None, task_metadata: dict | None = None
+):
     async def _inner():
         from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
         from app.config import settings
@@ -135,7 +172,12 @@ def _create_and_run(agent_type: str, title: str, description: str | None = None)
 
         async with Session() as db:
             task = await create_task(
-                db, title=title, agent_type=agent_type, source="scheduler", description=description
+                db,
+                title=title,
+                agent_type=agent_type,
+                source="scheduler",
+                description=description,
+                task_metadata=task_metadata,
             )
             await db.commit()
             task_id = task.id
