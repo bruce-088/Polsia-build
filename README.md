@@ -80,14 +80,16 @@ The Claude CLI authenticates via the `~/.claude` directory on your host, which i
 
 ### Integrations
 
-Fill in the relevant sections of `.env` to activate each integration:
+The following integrations are live and working today (fill in the relevant `.env` keys to activate each one):
 
-- **Twitter/X** — Post social content
-- **SendGrid + IMAP** — Send cold emails, read support inbox
-- **Tavily** — Web search for competitor research
-- **Google Ads / Meta Ads** — Campaign management
-- **Stripe** — Revenue and expense tracking
-- **GitHub** — Open PRs from the code generation agent
+- **Stripe** — read-only polling of revenue and account balance
+- **SendGrid** — sends email, only when an agent explicitly decides to send
+- **Twitter/X** — posts content, only when an agent explicitly decides to post
+- **Tavily** — grounded web search used for real prospect research
+- **IMAP** — detects real inbound email replies; a narrow auto-send gate allows only simple replies to go out automatically
+- **GitHub** — powers the PR mechanism used by the code generation agent, limited to single-file changes
+
+Google Ads and Meta Ads are configured but not yet wired to live actions.
 
 ## Development
 
