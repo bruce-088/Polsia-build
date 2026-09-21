@@ -45,7 +45,26 @@ async def test_send_email_success(api_client, auth_headers):
     data = resp.json()
     assert data["status"] == "sent"
     assert data["sendgrid_message_id"] == "msg-123"
-    mock_send.assert_called_once_with("test@example.com", "Hi", "Hello")
+    mock_send.assert_called_once_with("test@example.com", "Hi", "Hello", from_email=None)
+
+
+@pytest.mark.asyncio
+async def test_send_email_with_from_email_override(api_client, auth_headers):
+    with patch("app.api.v1.emails.send_email", return_value="msg-124") as mock_send:
+        resp = await api_client.post(
+            "/api/v1/emails/send",
+            json={
+                "to": "prospect@hvacco.com",
+                "subject": "Hi",
+                "body": "Hello",
+                "from_email": "bruce@outreach.acqivo.com",
+            },
+            headers=auth_headers,
+        )
+    assert resp.status_code == 200
+    mock_send.assert_called_once_with(
+        "prospect@hvacco.com", "Hi", "Hello", from_email="bruce@outreach.acqivo.com"
+    )
 
 
 @pytest.mark.asyncio
