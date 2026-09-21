@@ -50,3 +50,34 @@ def test_timed_run_adds_duration():
     result = agent.timed_run({"title": "test"}, {})
     assert "duration_secs" in result
     assert isinstance(result["duration_secs"], float)
+
+
+def test_call_claude_structured_parses_clean_json(monkeypatch):
+    monkeypatch.setenv("CLAUDE_CLI_MOCK", "true")
+    monkeypatch.setenv(
+        "CLAUDE_CLI_MOCK_RESPONSE", json.dumps({"result": '{"summary": "ok", "score": 5}'})
+    )
+    agent = ConcreteAgent()
+    result = agent.call_claude_structured("test")
+    assert result == {"summary": "ok", "score": 5}
+
+
+def test_call_claude_structured_extracts_json_from_fenced_block_with_preamble(monkeypatch):
+    """The response shape actually seen repeatedly in this codebase: an
+    explanatory sentence before a ```json fenced object."""
+    monkeypatch.setenv("CLAUDE_CLI_MOCK", "true")
+    raw = 'I\'ll do X.\n\n```json\n{"summary": "ok", "file_path": "README.md"}\n```'
+    monkeypatch.setenv("CLAUDE_CLI_MOCK_RESPONSE", json.dumps({"result": raw}))
+
+    agent = ConcreteAgent()
+    result = agent.call_claude_structured("test")
+    assert result == {"summary": "ok", "file_path": "README.md"}
+
+
+def test_call_claude_structured_falls_back_to_summary_when_truly_unparseable(monkeypatch):
+    monkeypatch.setenv("CLAUDE_CLI_MOCK", "true")
+    monkeypatch.setenv("CLAUDE_CLI_MOCK_RESPONSE", json.dumps({"result": "just plain text, no JSON here"}))
+
+    agent = ConcreteAgent()
+    result = agent.call_claude_structured("test")
+    assert result == {"summary": "just plain text, no JSON here"}

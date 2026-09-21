@@ -52,7 +52,12 @@ def run_agent_task(self, task_id: int):
 
         start = time.monotonic()
         try:
-            task_dict = {"id": task.id, "title": task.title, "description": task.description}
+            task_dict = {
+                "id": task.id,
+                "title": task.title,
+                "description": task.description,
+                "task_metadata": task.task_metadata,
+            }
             result = run_agent_for_task(task.agent_type, task_dict, context)
             status = "completed"
             summary = result.get("summary", "Task completed.")

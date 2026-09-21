@@ -12,6 +12,7 @@ _run_llm_turn's internals and settings.llm_provider would change.
 """
 import json
 import os
+import re
 import subprocess
 import tempfile
 import time
@@ -44,15 +45,38 @@ class BasePolsiaAgent:
         """Like call_claude_json, but tolerant of non-JSON responses (real LLM
         output isn't always clean JSON, and the default unit-test mock
         response is a plain string, not JSON) — falls back to wrapping the
-        raw text as a summary instead of raising."""
+        raw text as a summary instead of raising. Also tolerant of a JSON
+        object wrapped in prose and/or a ```json code fence — a real
+        response shape seen repeatedly across agents in this codebase, not
+        a hypothetical edge case — extracted and parsed before giving up."""
         raw = self.call_claude(prompt, **kwargs)
+        parsed = self._extract_json_object(raw)
+        if isinstance(parsed, dict):
+            return parsed
+        return {"summary": raw}
+
+    @staticmethod
+    def _extract_json_object(raw: str) -> dict | None:
         try:
-            parsed = json.loads(raw)
-            if isinstance(parsed, dict):
-                return parsed
-            return {"summary": raw}
+            return json.loads(raw)
         except (json.JSONDecodeError, TypeError):
-            return {"summary": raw}
+            pass
+
+        fence_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", raw, re.DOTALL)
+        if fence_match:
+            try:
+                return json.loads(fence_match.group(1))
+            except json.JSONDecodeError:
+                pass
+
+        brace_match = re.search(r"\{.*\}", raw, re.DOTALL)
+        if brace_match:
+            try:
+                return json.loads(brace_match.group(0))
+            except json.JSONDecodeError:
+                pass
+
+        return None
 
     def _run_llm_turn(self, prompt: str, provider: str | None = None, **kwargs) -> str:
         """Real (non-mock) LLM call. Provider defaults to settings.llm_provider,

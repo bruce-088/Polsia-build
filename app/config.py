@@ -24,6 +24,8 @@ class Settings(BaseSettings):
     imap_port: int = 993
     imap_username: str = ""
     imap_password: str = ""
+    github_token: str = ""
+    github_repo: str = ""
     sandbox_mode: bool = True
     llm_provider: str = "claude"
 

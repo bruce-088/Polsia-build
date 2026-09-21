@@ -12,6 +12,7 @@ router = APIRouter(prefix="/api/v1/agents", tags=["agents"], dependencies=[Depen
 
 class TriggerBody(BaseModel):
     task_title: str | None = None
+    file_path: str | None = None  # code_generation only — targets a real repo file
 
 
 @router.post("/{agent_type}/trigger", status_code=202)
@@ -20,7 +21,10 @@ async def trigger_agent(agent_type: str, body: TriggerBody | None = None, db: As
         raise HTTPException(status_code=422, detail=f"Unknown agent type: {agent_type}")
 
     title = (body.task_title if body else None) or f"Manually triggered {agent_type} run"
-    task = await task_service.create_task(db, title=title, agent_type=agent_type, source="manual")
+    task_metadata = {"file_path": body.file_path} if body and body.file_path else None
+    task = await task_service.create_task(
+        db, title=title, agent_type=agent_type, source="manual", task_metadata=task_metadata
+    )
 
     # Imported here (not at module top) so tests can patch
     # celery_app.tasks.agent_tasks.run_agent_task.delay cleanly.
