@@ -5,6 +5,7 @@ from app.models import (  # noqa: F401
     agent_run,
     approval,
     company,
+    company_os_action,
     competitor,
     email,
     finance,

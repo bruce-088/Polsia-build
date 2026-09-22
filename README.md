@@ -247,3 +247,13 @@ fulfillment and resilience/governance work no longer falls through generic
 customer-support or orchestrator behavior. Their bounded role instructions
 are injected into strict Company OS decision mode. Their normal mode produces
 proposals only; neither agent contains integration or execution capability.
+
+### Auditable action lifecycle
+
+Company OS decisions can be stored as immutable `CompanyOSActionRecord` rows
+containing the original envelope, policy decision, workflow transition,
+approval state, integration state, and initial execution status. Later changes
+are append-only `CompanyOSActionEvent` rows. The service rejects invalid
+lifecycle jumps, authorization without approval, success without execution
+evidence, and failure without details. Recording evidence does not execute an
+action.
