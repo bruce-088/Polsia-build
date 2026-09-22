@@ -17,6 +17,10 @@ RISK_LEVELS = {"GREEN", "YELLOW", "RED"}
 class CompanyOSContractError(ValueError):
     """Raised when an agent does not natively satisfy the decision contract."""
 
+    def __init__(self, message: str, *, raw_output: str | None = None) -> None:
+        super().__init__(message)
+        self.raw_output = raw_output
+
 
 def _require_string(value: Any, field: str, *, allow_empty: bool = False) -> None:
     if not isinstance(value, str) or (not allow_empty and not value.strip()):
@@ -62,5 +66,11 @@ def parse_stage1_decision(raw: str, scenario_id: str) -> dict[str, Any]:
     try:
         payload = json.loads(raw)
     except (json.JSONDecodeError, TypeError) as exc:
-        raise CompanyOSContractError("Stage 1 output must be clean JSON") from exc
-    return validate_stage1_decision(payload, scenario_id)
+        raise CompanyOSContractError(
+            "Stage 1 output must be clean JSON", raw_output=raw
+        ) from exc
+    try:
+        return validate_stage1_decision(payload, scenario_id)
+    except CompanyOSContractError as exc:
+        exc.raw_output = raw
+        raise

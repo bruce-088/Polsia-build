@@ -53,8 +53,9 @@ def test_parse_stage1_decision_accepts_clean_complete_json():
     ],
 )
 def test_parse_stage1_decision_rejects_wrapped_or_malformed_output(raw):
-    with pytest.raises(CompanyOSContractError, match="clean JSON"):
+    with pytest.raises(CompanyOSContractError, match="clean JSON") as captured:
         parse_stage1_decision(raw, "SIM-001")
+    assert captured.value.raw_output == raw
 
 
 def test_validate_stage1_decision_does_not_repair_missing_fields():
@@ -67,6 +68,13 @@ def test_validate_stage1_decision_does_not_repair_missing_fields():
 def test_validate_stage1_decision_rejects_scenario_mismatch():
     with pytest.raises(CompanyOSContractError, match="scenario_id mismatch"):
         validate_stage1_decision(valid_decision(), "SIM-999")
+
+
+def test_parse_preserves_raw_json_when_semantic_validation_fails():
+    raw = json.dumps({**valid_decision(), "scenario_id": "SIM-999"})
+    with pytest.raises(CompanyOSContractError, match="scenario_id mismatch") as captured:
+        parse_stage1_decision(raw, "SIM-001")
+    assert captured.value.raw_output == raw
 
 
 def test_crew_factory_uses_native_contract_mode(monkeypatch):
