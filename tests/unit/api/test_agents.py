@@ -1,6 +1,7 @@
 """Test POST /api/v1/agents/{type}/trigger and GET /api/v1/agents/status."""
-import pytest
 from unittest.mock import patch
+
+import pytest
 
 
 @pytest.mark.asyncio
@@ -38,7 +39,7 @@ async def test_get_agent_status(api_client, auth_headers):
     assert resp.status_code == 200
     data = resp.json()
     assert isinstance(data, list)
-    assert len(data) == 9  # All 9 agent types
+    assert len(data) == 11  # Base agents plus Revenue Operations and Governance
     agent_types = [a["agent_type"] for a in data]
     assert "social_media" in agent_types
     assert "finance" in agent_types
