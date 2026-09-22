@@ -14,6 +14,8 @@ AGENT_MAP: dict[str, tuple[str, str]] = {
     "customer_support": ("app.agents.customer_support.agent", "CustomerSupportAgent"),
     "code_generation": ("app.agents.code_generation.agent", "CodeGenerationAgent"),
     "finance": ("app.agents.finance.agent", "FinanceAgent"),
+    "revenue_ops": ("app.agents.revenue_ops.agent", "RevenueOperationsAgent"),
+    "governance": ("app.agents.governance.agent", "GovernanceAgent"),
 }
 
 
