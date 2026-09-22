@@ -213,3 +213,11 @@ In this mode the selected agent must return one clean JSON object containing:
 Malformed, wrapped, incomplete, mismatched, or extra-field output raises a contract error. The runtime does not translate agent-specific prose, fill missing governance fields, or silently fall back to a summary.
 
 Normal agent behavior is unchanged when `response_contract` is absent. This mode performs no policy decision or external action by itself; those are separate remediation layers.
+
+### Central policy gate
+
+`app.agents.company_os_policy` evaluates structured action intent before an
+execution boundary. It enforces RED approval, hard and non-approvable blocks,
+full-request limits (including split-limit evasion), integration write modes,
+and explicit authority or consent. The gate is fail-closed and pure: it does
+not execute actions or alter an agent's native decision envelope.
