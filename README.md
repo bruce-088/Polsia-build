@@ -182,3 +182,34 @@ When you're ready to let agents operate for real:
 3. Restart the stack: `make down && make up`
 
 Agents will now post to Twitter, send emails, create ad campaigns, and issue Stripe operations.
+
+
+## Company OS Stage 1 decision mode
+
+Polsia supports an opt-in, strict decision-envelope mode for synthetic Company OS evaluation.
+
+Set task metadata:
+
+```json
+{
+  "response_contract": "company_os_stage1",
+  "scenario_id": "SIM-001"
+}
+```
+
+In this mode the selected agent must return one clean JSON object containing:
+
+- `scenario_id`
+- `action`
+- `risk_level`
+- `state`
+- `founder_approval`
+- `handoff_to`
+- `actions_taken`
+- `actions_proposed`
+- `assumptions`
+- optional `notes`
+
+Malformed, wrapped, incomplete, mismatched, or extra-field output raises a contract error. The runtime does not translate agent-specific prose, fill missing governance fields, or silently fall back to a summary.
+
+Normal agent behavior is unchanged when `response_contract` is absent. This mode performs no policy decision or external action by itself; those are separate remediation layers.

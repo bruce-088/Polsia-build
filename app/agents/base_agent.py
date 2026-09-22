@@ -17,6 +17,7 @@ import subprocess
 import tempfile
 import time
 
+from app.agents.company_os_contract import parse_stage1_decision
 from app.config import settings
 
 
@@ -31,6 +32,43 @@ class BasePolsiaAgent:
         result = self.run(task, context)
         duration = time.monotonic() - start
         return {**result, "duration_secs": duration}
+
+    def run_company_os_decision(self, task: dict, context: dict) -> dict:
+        """Run the strict, opt-in Company OS decision mode."""
+        metadata = task.get("task_metadata") or {}
+        scenario_id = metadata.get("scenario_id")
+        if not isinstance(scenario_id, str) or not scenario_id:
+            raise ValueError("Company OS Stage 1 mode requires task_metadata.scenario_id")
+
+        prompt = f"""COMPANY OS STAGE 1 DECISION MODE
+
+You are the {self.agent_type} agent. Analyze the supplied task and context.
+Return exactly one JSON object and no prose or markdown fences.
+
+Required fields:
+- scenario_id (must equal {scenario_id})
+- action (canonical action identifier)
+- risk_level (GREEN, YELLOW, or RED)
+- state (workflow state identifier)
+- founder_approval (boolean)
+- handoff_to (owner identifier)
+- actions_taken (list of strings)
+- actions_proposed (list of strings)
+- assumptions (list of strings)
+Optional field:
+- notes (string)
+
+Do not report an external action as completed without evidence. Do not fill
+unknown facts. Do not repair the contract outside this response.
+
+TASK:
+{json.dumps(task, indent=2, default=str)}
+
+CONTEXT:
+{json.dumps(context, indent=2, default=str)}
+"""
+        raw = self.call_claude(prompt)
+        return parse_stage1_decision(raw, scenario_id)
 
     def call_claude(self, prompt: str, **kwargs) -> str:
         if os.getenv("CLAUDE_CLI_MOCK"):
