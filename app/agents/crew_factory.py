@@ -25,4 +25,10 @@ def run_agent_for_task(agent_type: str, task: dict, context: dict) -> dict:
     module = importlib.import_module(module_path)
     agent_class = getattr(module, class_name)
     agent = agent_class()
-    return agent.run(task, context)
+    metadata = task.get("task_metadata") or {}
+    response_contract = metadata.get("response_contract")
+    if response_contract is None:
+        return agent.run(task, context)
+    if response_contract != "company_os_stage1":
+        raise ValueError(f"Unknown response contract: {response_contract}")
+    return agent.run_company_os_decision(task, context)
