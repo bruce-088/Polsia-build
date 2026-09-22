@@ -230,3 +230,12 @@ transition. It rejects unknown states, nonexistent transitions, risk mismatch,
 ambiguous definitions, and movement from terminal states. The validator
 returns canonical requirements and integration metadata but never repairs an
 agent proposal or executes the transition.
+
+### Integration-state enforcement
+
+`app.agents.company_os_integration` treats `draft`, `propose`, `read`, and
+`execute` as separate capabilities. Execution requires a registered intended
+use, authorized scope, verified integration, a write-capable mode, and an
+explicit external-write capability. Credentials or an `external_writes` flag
+cannot override `disabled`, `documented`, or `read_only` mode. The service
+authorizes capability only; it contains no connector or execution code.
