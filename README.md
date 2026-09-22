@@ -239,3 +239,11 @@ use, authorized scope, verified integration, a write-capable mode, and an
 explicit external-write capability. Credentials or an `external_writes` flag
 cannot override `disabled`, `documented`, or `read_only` mode. The service
 authorizes capability only; it contains no connector or execution code.
+
+### Company OS role routing
+
+The runtime includes explicit `revenue_ops` and `governance` agent types so
+fulfillment and resilience/governance work no longer falls through generic
+customer-support or orchestrator behavior. Their bounded role instructions
+are injected into strict Company OS decision mode. Their normal mode produces
+proposals only; neither agent contains integration or execution capability.

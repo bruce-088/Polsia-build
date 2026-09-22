@@ -23,6 +23,7 @@ from app.config import settings
 
 class BasePolsiaAgent:
     agent_type: str = "base"
+    company_os_instructions: str = "Follow the supplied Company OS and stay within your role."
 
     def run(self, task: dict, context: dict) -> dict:
         raise NotImplementedError(f"{type(self).__name__} must implement run()")
@@ -43,6 +44,9 @@ class BasePolsiaAgent:
         prompt = f"""COMPANY OS STAGE 1 DECISION MODE
 
 You are the {self.agent_type} agent. Analyze the supplied task and context.
+Your bounded role:
+{self.company_os_instructions}
+
 Return exactly one JSON object and no prose or markdown fences.
 
 Required fields:
