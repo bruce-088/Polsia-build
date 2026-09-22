@@ -221,3 +221,12 @@ execution boundary. It enforces RED approval, hard and non-approvable blocks,
 full-request limits (including split-limit evasion), integration write modes,
 and explicit authority or consent. The gate is fail-closed and pure: it does
 not execute actions or alter an agent's native decision envelope.
+
+### Workflow-state validation
+
+`app.agents.company_os_workflow` validates canonical workflow definitions and
+requires an exact registered `(current state, action, proposed state)`
+transition. It rejects unknown states, nonexistent transitions, risk mismatch,
+ambiguous definitions, and movement from terminal states. The validator
+returns canonical requirements and integration metadata but never repairs an
+agent proposal or executes the transition.
