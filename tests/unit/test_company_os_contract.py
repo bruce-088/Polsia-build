@@ -11,8 +11,8 @@ from app.agents.company_os_contract import (
     stage1_json_schema,
     validate_stage1_decision,
 )
-from app.agents.crew_factory import run_agent_for_task
 from app.agents.base_agent import claude_structured_output_available
+from app.agents.crew_factory import run_agent_for_task
 
 
 def valid_decision() -> dict:
