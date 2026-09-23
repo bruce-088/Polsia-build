@@ -10,13 +10,13 @@ so nothing above this class (crew_factory, agent implementations, tests) has
 to change if a second provider (e.g. OpenAI/Codex) is added later — only
 _run_llm_turn's internals and settings.llm_provider would change.
 """
+from functools import lru_cache
 import json
 import os
 import re
 import subprocess
 import tempfile
 import time
-from functools import lru_cache
 
 from app.agents.company_os_contract import (
     CompanyOSContractError,
