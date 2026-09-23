@@ -10,6 +10,7 @@ so nothing above this class (crew_factory, agent implementations, tests) has
 to change if a second provider (e.g. OpenAI/Codex) is added later — only
 _run_llm_turn's internals and settings.llm_provider would change.
 """
+from functools import lru_cache
 import json
 import os
 import re
@@ -17,8 +18,25 @@ import subprocess
 import tempfile
 import time
 
-from app.agents.company_os_contract import parse_stage1_decision
+from app.agents.company_os_contract import (
+    CompanyOSContractError,
+    parse_stage1_decision,
+    stage1_json_schema,
+    validate_stage1_decision,
+)
 from app.config import settings
+
+
+@lru_cache(maxsize=1)
+def claude_structured_output_available() -> bool:
+    """Return whether the installed Claude CLI advertises JSON Schema output."""
+    try:
+        result = subprocess.run(
+            ["claude", "--help"], capture_output=True, text=True, check=False
+        )
+    except OSError:
+        return False
+    return result.returncode == 0 and "--json-schema" in result.stdout
 
 
 class BasePolsiaAgent:
@@ -71,8 +89,54 @@ TASK:
 CONTEXT:
 {json.dumps(context, indent=2, default=str)}
 """
-        raw = self.call_claude(prompt)
-        return parse_stage1_decision(raw, scenario_id)
+        if os.getenv("CLAUDE_CLI_MOCK"):
+            raw = self.call_claude(prompt)
+            return parse_stage1_decision(raw, scenario_id)
+
+        provider = getattr(settings, "llm_provider", "claude")
+        if provider != "claude":
+            raise CompanyOSContractError(
+                f"structured Company OS contract mode is unavailable for provider {provider!r}"
+            )
+        payload, raw_evidence = self._run_claude_structured(
+            prompt, stage1_json_schema(scenario_id)
+        )
+        try:
+            return validate_stage1_decision(payload, scenario_id)
+        except CompanyOSContractError as exc:
+            exc.raw_output = raw_evidence
+            raise
+
+    def _run_claude_structured(self, prompt: str, schema: dict) -> tuple[dict, str]:
+        """Request provider-validated JSON without parsing or repairing free text."""
+        if not claude_structured_output_available():
+            raise CompanyOSContractError(
+                "installed Claude CLI does not support --json-schema"
+            )
+        command = [
+            "claude", "-p", prompt, "--output-format", "json",
+            "--json-schema", json.dumps(schema, separators=(",", ":")),
+        ]
+        try:
+            result = subprocess.run(command, capture_output=True, text=True, check=True)
+        except subprocess.CalledProcessError as exc:
+            evidence = exc.stdout or exc.stderr or ""
+            raise CompanyOSContractError(
+                "Claude structured output failed", raw_output=evidence
+            ) from exc
+        raw_evidence = result.stdout
+        try:
+            envelope = json.loads(raw_evidence)
+        except json.JSONDecodeError as exc:
+            raise CompanyOSContractError(
+                "Claude structured output wrapper was not JSON", raw_output=raw_evidence
+            ) from exc
+        payload = envelope.get("structured_output")
+        if not isinstance(payload, dict):
+            raise CompanyOSContractError(
+                "Claude result did not contain structured_output", raw_output=raw_evidence
+            )
+        return payload, raw_evidence
 
     def call_claude(self, prompt: str, **kwargs) -> str:
         if os.getenv("CLAUDE_CLI_MOCK"):
