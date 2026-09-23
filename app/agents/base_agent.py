@@ -93,11 +93,32 @@ Required fields:
 Optional field:
 - notes (string)
 
-Classify the proposed action, not the seriousness of the topic. Safely refusing
-an unauthorized technical or pricing commitment and routing it to the authorized
-customer contact is GREEN when no commitment is made. Rejecting unsupported or
-fabricated content is GREEN when nothing is published or externally committed.
-RED is reserved for founder-controlled consequential action.
+Classify the primary governed action, not the seriousness of the topic and not
+a harmless wrapper step. Apply these rules in order:
+1. Identify the next governed decision or workflow transition required now.
+2. Classify that primary action from Company OS policy and the workflow declaration.
+3. Acknowledgment, refusal, drafting, evidence requests, and routing mechanics are
+   supporting steps; they do not downgrade the primary governed action.
+4. When an above-bound exception condition is already triggered and a decision is
+   required now, classify the exception decision, even though you safely refrain
+   from executing it before approval.
+5. When the requested act is a hard deny or non-approvable block, the primary
+   action is rejection or blocking. Do not invent a founder-approval path.
+6. When the primary action is an explicit workflow transition, retain that
+   transition's declared risk class.
+
+Safely refusing an unauthorized technical or pricing commitment and routing it
+to the authorized customer contact is GREEN only when no separate governed
+exception decision or bounded transition is currently required. Rejecting
+unsupported or fabricated content is GREEN when nothing is published or
+externally committed. RED is reserved for founder-controlled consequential
+action.
+
+For handoff_to, select the most specific canonical internal owner responsible
+for the next step. Use an external party such as Customer only when that party
+is itself the canonical next owner, not merely the source of missing evidence.
+Do not route domain work to Orchestrator or Revenue Director when a more specific
+canonical owner exists.
 
 Use only these canonical handoff owners when supplied:
 {json.dumps(handoff_owners, default=str)}
