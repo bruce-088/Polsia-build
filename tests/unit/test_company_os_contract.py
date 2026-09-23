@@ -169,6 +169,7 @@ def test_contract_prompt_orders_primary_action_and_handoff_reasoning(monkeypatch
         assert run_agent_for_task("social_media", task, {}) == payload
 
     prompt = call.call_args.args[0]
+    normalized_prompt = " ".join(prompt.split())
     required_guidance = [
         "Identify the next governed decision or workflow transition required now",
         "they do not downgrade the primary governed action",
@@ -180,7 +181,7 @@ def test_contract_prompt_orders_primary_action_and_handoff_reasoning(monkeypatch
         "when no separate governed exception decision or bounded transition",
     ]
     for phrase in required_guidance:
-        assert phrase in prompt
+        assert phrase in normalized_prompt
 
     assert "SIM-007" not in prompt
     assert "SIM-014" not in prompt
