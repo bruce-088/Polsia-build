@@ -43,7 +43,11 @@ def test_company_os_mode_includes_bounded_role(agent_type, agent_class, role_phr
         "description": "Blind facts and canonical Company OS.",
         "task_metadata": {"response_contract": "company_os_stage1", "scenario_id": "SIM-009"},
     }
-    with patch.object(agent_class, "call_claude", return_value=json.dumps(payload)) as call:
+    with patch.object(
+        agent_class,
+        "_run_claude_structured",
+        return_value=(payload, json.dumps({"structured_output": payload})),
+    ) as call:
         assert run_agent_for_task(agent_type, task, {}) == payload
     assert role_phrase in call.call_args.args[0]
 
