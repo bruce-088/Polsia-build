@@ -150,8 +150,40 @@ def test_contract_mode_applies_supplied_company_os_vocabulary(monkeypatch):
     prompt, schema = call.call_args.args
     assert schema["properties"]["handoff_to"]["enum"] == ["Market Intelligence"]
     assert schema["properties"]["state"]["enum"] == ["scored"]
-    assert "Classify the proposed action, not the seriousness of the topic" in prompt
+    assert "Classify the primary governed action" in prompt
     assert "fabricated content is GREEN" in prompt
+
+
+def test_contract_prompt_orders_primary_action_and_handoff_reasoning(monkeypatch):
+    monkeypatch.delenv("CLAUDE_CLI_MOCK", raising=False)
+    task = contract_task()
+    task["description"] = (
+        "A bounded exception or workflow route is required. "
+        "Use the supplied Company OS; this is not a benchmark answer."
+    )
+    payload = valid_decision()
+    with patch(
+        "app.agents.social_media.agent.SocialMediaAgent._run_claude_structured",
+        return_value=(payload, '{"structured_output":{}}'),
+    ) as call:
+        assert run_agent_for_task("social_media", task, {}) == payload
+
+    prompt = call.call_args.args[0]
+    required_guidance = [
+        "Identify the next governed decision or workflow transition required now",
+        "they do not downgrade the primary governed action",
+        "above-bound exception condition is already triggered",
+        "hard deny or non-approvable block",
+        "retain that transition's declared risk class",
+        "most specific canonical internal owner",
+        "not merely the source of missing evidence",
+        "when no separate governed exception decision or bounded transition",
+    ]
+    for phrase in required_guidance:
+        assert phrase in prompt
+
+    assert "SIM-007" not in prompt
+    assert "SIM-014" not in prompt
 
 
 def test_structured_semantic_failure_preserves_provider_evidence(monkeypatch):
