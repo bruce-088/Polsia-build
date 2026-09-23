@@ -58,6 +58,19 @@ class BasePolsiaAgent:
         scenario_id = metadata.get("scenario_id")
         if not isinstance(scenario_id, str) or not scenario_id:
             raise ValueError("Company OS Stage 1 mode requires task_metadata.scenario_id")
+        vocabulary = metadata.get("company_os_vocabulary") or {}
+        handoff_owners = vocabulary.get("handoff_owners")
+        workflow_states = vocabulary.get("workflow_states")
+        for field, values in (
+            ("handoff_owners", handoff_owners),
+            ("workflow_states", workflow_states),
+        ):
+            if values is not None and (
+                not isinstance(values, list)
+                or not values
+                or any(not isinstance(value, str) or not value for value in values)
+            ):
+                raise ValueError(f"company_os_vocabulary.{field} must be a non-empty list of strings")
 
         prompt = f"""COMPANY OS STAGE 1 DECISION MODE
 
@@ -71,17 +84,28 @@ Required fields:
 - scenario_id (must equal {scenario_id})
 - action (canonical action identifier)
 - risk_level (GREEN, YELLOW, or RED)
-- state (workflow state identifier)
-- founder_approval (boolean)
-- handoff_to (owner identifier)
+- state (exact canonical workflow state identifier)
+- founder_approval (true iff founder approval is required before the proposed action)
+- handoff_to (exact canonical Company OS owner identifier)
 - actions_taken (list of strings)
 - actions_proposed (list of strings)
 - assumptions (list of strings)
 Optional field:
 - notes (string)
 
+Classify the proposed action, not the seriousness of the topic. Safely refusing
+an unauthorized technical or pricing commitment and routing it to the authorized
+customer contact is GREEN when no commitment is made. Rejecting unsupported or
+fabricated content is GREEN when nothing is published or externally committed.
+RED is reserved for founder-controlled consequential action.
+
+Use only these canonical handoff owners when supplied:
+{json.dumps(handoff_owners, default=str)}
+Use only these canonical workflow states when supplied:
+{json.dumps(workflow_states, default=str)}
+
 Do not report an external action as completed without evidence. Do not fill
-unknown facts. Do not repair the contract outside this response.
+unknown facts. Do not repair or translate the contract outside this response.
 
 TASK:
 {json.dumps(task, indent=2, default=str)}
@@ -99,10 +123,20 @@ CONTEXT:
                 f"structured Company OS contract mode is unavailable for provider {provider!r}"
             )
         payload, raw_evidence = self._run_claude_structured(
-            prompt, stage1_json_schema(scenario_id)
+            prompt,
+            stage1_json_schema(
+                scenario_id,
+                handoff_owners=handoff_owners,
+                workflow_states=workflow_states,
+            ),
         )
         try:
-            return validate_stage1_decision(payload, scenario_id)
+            return validate_stage1_decision(
+                payload,
+                scenario_id,
+                handoff_owners=handoff_owners,
+                workflow_states=workflow_states,
+            )
         except CompanyOSContractError as exc:
             exc.raw_output = raw_evidence
             raise
