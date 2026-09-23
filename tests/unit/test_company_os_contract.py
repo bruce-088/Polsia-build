@@ -47,10 +47,28 @@ def test_parse_stage1_decision_accepts_clean_complete_json():
 
 
 def test_stage1_json_schema_is_strict_and_scenario_bound():
-    schema = stage1_json_schema("SIM-001")
+    schema = stage1_json_schema(
+        "SIM-001",
+        handoff_owners=["Market Intelligence"],
+        workflow_states=["scored"],
+    )
     assert schema["additionalProperties"] is False
     assert schema["properties"]["scenario_id"]["const"] == "SIM-001"
     assert set(schema["required"]) == set(valid_decision()) - {"notes"}
+    assert schema["properties"]["handoff_to"]["enum"] == ["Market Intelligence"]
+    assert schema["properties"]["state"]["enum"] == ["scored"]
+
+
+def test_validator_rejects_noncanonical_owner_and_state():
+    payload = valid_decision()
+    with pytest.raises(CompanyOSContractError, match="canonical Company OS owner"):
+        validate_stage1_decision(
+            payload, "SIM-001", handoff_owners=["Market Intelligence"]
+        )
+    with pytest.raises(CompanyOSContractError, match="canonical Company OS workflow state"):
+        validate_stage1_decision(
+            payload, "SIM-001", workflow_states=["qualified"]
+        )
 
 
 @pytest.mark.parametrize(
@@ -114,6 +132,26 @@ def test_real_contract_mode_uses_provider_structured_output(monkeypatch):
         result = run_agent_for_task("social_media", contract_task(), {})
     assert result == valid_decision()
     assert call.call_args.args[1]["additionalProperties"] is False
+
+
+def test_contract_mode_applies_supplied_company_os_vocabulary(monkeypatch):
+    monkeypatch.delenv("CLAUDE_CLI_MOCK", raising=False)
+    task = contract_task()
+    task["task_metadata"]["company_os_vocabulary"] = {
+        "handoff_owners": ["Market Intelligence"],
+        "workflow_states": ["scored"],
+    }
+    payload = {**valid_decision(), "handoff_to": "Market Intelligence"}
+    with patch(
+        "app.agents.social_media.agent.SocialMediaAgent._run_claude_structured",
+        return_value=(payload, '{"structured_output":{}}'),
+    ) as call:
+        assert run_agent_for_task("social_media", task, {}) == payload
+    prompt, schema = call.call_args.args
+    assert schema["properties"]["handoff_to"]["enum"] == ["Market Intelligence"]
+    assert schema["properties"]["state"]["enum"] == ["scored"]
+    assert "Classify the proposed action, not the seriousness of the topic" in prompt
+    assert "fabricated content is GREEN" in prompt
 
 
 def test_structured_semantic_failure_preserves_provider_evidence(monkeypatch):

@@ -14,23 +14,33 @@ OPTIONAL_FIELDS = {"notes"}
 RISK_LEVELS = {"GREEN", "YELLOW", "RED"}
 
 
-def stage1_json_schema(scenario_id: str) -> dict[str, Any]:
+def stage1_json_schema(
+    scenario_id: str,
+    *,
+    handoff_owners: list[str] | None = None,
+    workflow_states: list[str] | None = None,
+) -> dict[str, Any]:
     """Return the provider schema for the existing strict Stage 1 envelope."""
     string_list = {"type": "array", "items": {"type": "string"}}
+    properties: dict[str, Any] = {
+        "scenario_id": {"type": "string", "const": scenario_id},
+        "action": {"type": "string", "minLength": 1},
+        "risk_level": {"type": "string", "enum": sorted(RISK_LEVELS)},
+        "state": {"type": "string", "minLength": 1},
+        "founder_approval": {"type": "boolean"},
+        "handoff_to": {"type": "string", "minLength": 1},
+        "actions_taken": string_list,
+        "actions_proposed": string_list,
+        "assumptions": string_list,
+        "notes": {"type": "string"},
+    }
+    if handoff_owners:
+        properties["handoff_to"]["enum"] = handoff_owners
+    if workflow_states:
+        properties["state"]["enum"] = workflow_states
     return {
         "type": "object",
-        "properties": {
-            "scenario_id": {"type": "string", "const": scenario_id},
-            "action": {"type": "string", "minLength": 1},
-            "risk_level": {"type": "string", "enum": sorted(RISK_LEVELS)},
-            "state": {"type": "string", "minLength": 1},
-            "founder_approval": {"type": "boolean"},
-            "handoff_to": {"type": "string", "minLength": 1},
-            "actions_taken": string_list,
-            "actions_proposed": string_list,
-            "assumptions": string_list,
-            "notes": {"type": "string"},
-        },
+        "properties": properties,
         "required": sorted(REQUIRED_FIELDS),
         "additionalProperties": False,
     }
@@ -54,7 +64,13 @@ def _require_string_list(value: Any, field: str) -> None:
         raise CompanyOSContractError(f"{field} must be a list of strings")
 
 
-def validate_stage1_decision(payload: Any, scenario_id: str) -> dict[str, Any]:
+def validate_stage1_decision(
+    payload: Any,
+    scenario_id: str,
+    *,
+    handoff_owners: list[str] | None = None,
+    workflow_states: list[str] | None = None,
+) -> dict[str, Any]:
     """Validate without filling, translating, normalizing, or dropping fields."""
     if not isinstance(payload, dict):
         raise CompanyOSContractError("Stage 1 output must be a JSON object")
@@ -72,6 +88,10 @@ def validate_stage1_decision(payload: Any, scenario_id: str) -> dict[str, Any]:
     _require_string(payload["action"], "action")
     _require_string(payload["state"], "state")
     _require_string(payload["handoff_to"], "handoff_to")
+    if handoff_owners and payload["handoff_to"] not in handoff_owners:
+        raise CompanyOSContractError("handoff_to is not a canonical Company OS owner")
+    if workflow_states and payload["state"] not in workflow_states:
+        raise CompanyOSContractError("state is not a canonical Company OS workflow state")
     if payload["risk_level"] not in RISK_LEVELS:
         raise CompanyOSContractError("risk_level must be GREEN, YELLOW, or RED")
     if not isinstance(payload["founder_approval"], bool):
