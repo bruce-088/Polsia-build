@@ -8,9 +8,11 @@ import pytest
 from app.agents.company_os_contract import (
     CompanyOSContractError,
     parse_stage1_decision,
+    stage1_json_schema,
     validate_stage1_decision,
 )
 from app.agents.crew_factory import run_agent_for_task
+from app.agents.base_agent import claude_structured_output_available
 
 
 def valid_decision() -> dict:
@@ -42,6 +44,13 @@ def contract_task() -> dict:
 def test_parse_stage1_decision_accepts_clean_complete_json():
     payload = valid_decision()
     assert parse_stage1_decision(json.dumps(payload), "SIM-001") == payload
+
+
+def test_stage1_json_schema_is_strict_and_scenario_bound():
+    schema = stage1_json_schema("SIM-001")
+    assert schema["additionalProperties"] is False
+    assert schema["properties"]["scenario_id"]["const"] == "SIM-001"
+    assert set(schema["required"]) == set(valid_decision()) - {"notes"}
 
 
 @pytest.mark.parametrize(
@@ -96,6 +105,36 @@ def test_crew_factory_preserves_normal_agent_path():
             {"company": {"name": "Acqivo"}},
         )
     assert result["summary"] == "native"
+
+
+def test_real_contract_mode_uses_provider_structured_output(monkeypatch):
+    monkeypatch.delenv("CLAUDE_CLI_MOCK", raising=False)
+    with patch("app.agents.social_media.agent.SocialMediaAgent._run_claude_structured") as call:
+        call.return_value = (valid_decision(), '{"structured_output":{}}')
+        result = run_agent_for_task("social_media", contract_task(), {})
+    assert result == valid_decision()
+    assert call.call_args.args[1]["additionalProperties"] is False
+
+
+def test_structured_semantic_failure_preserves_provider_evidence(monkeypatch):
+    monkeypatch.delenv("CLAUDE_CLI_MOCK", raising=False)
+    bad = {**valid_decision(), "scenario_id": "SIM-999"}
+    evidence = '{"structured_output":{"scenario_id":"SIM-999"}}'
+    with patch(
+        "app.agents.social_media.agent.SocialMediaAgent._run_claude_structured",
+        return_value=(bad, evidence),
+    ):
+        with pytest.raises(CompanyOSContractError, match="scenario_id mismatch") as captured:
+            run_agent_for_task("social_media", contract_task(), {})
+    assert captured.value.raw_output == evidence
+
+
+def test_structured_capability_check_is_fail_closed():
+    claude_structured_output_available.cache_clear()
+    completed = type("Completed", (), {"returncode": 0, "stdout": "usage: claude"})()
+    with patch("app.agents.base_agent.subprocess.run", return_value=completed):
+        assert claude_structured_output_available() is False
+    claude_structured_output_available.cache_clear()
 
 
 def test_crew_factory_rejects_unknown_contract():
