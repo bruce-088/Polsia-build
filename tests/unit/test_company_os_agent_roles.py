@@ -36,7 +36,10 @@ def test_explicit_agent_types_are_registered(agent_type):
         ("governance", GovernanceAgent, "Never approve your own RED action"),
     ],
 )
-def test_company_os_mode_includes_bounded_role(agent_type, agent_class, role_phrase):
+def test_company_os_mode_includes_bounded_role(
+    agent_type, agent_class, role_phrase, monkeypatch
+):
+    monkeypatch.delenv("CLAUDE_CLI_MOCK", raising=False)
     payload = decision()
     task = {
         "title": "Company OS scenario",
