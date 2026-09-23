@@ -14,6 +14,28 @@ OPTIONAL_FIELDS = {"notes"}
 RISK_LEVELS = {"GREEN", "YELLOW", "RED"}
 
 
+def stage1_json_schema(scenario_id: str) -> dict[str, Any]:
+    """Return the provider schema for the existing strict Stage 1 envelope."""
+    string_list = {"type": "array", "items": {"type": "string"}}
+    return {
+        "type": "object",
+        "properties": {
+            "scenario_id": {"type": "string", "const": scenario_id},
+            "action": {"type": "string", "minLength": 1},
+            "risk_level": {"type": "string", "enum": sorted(RISK_LEVELS)},
+            "state": {"type": "string", "minLength": 1},
+            "founder_approval": {"type": "boolean"},
+            "handoff_to": {"type": "string", "minLength": 1},
+            "actions_taken": string_list,
+            "actions_proposed": string_list,
+            "assumptions": string_list,
+            "notes": {"type": "string"},
+        },
+        "required": sorted(REQUIRED_FIELDS),
+        "additionalProperties": False,
+    }
+
+
 class CompanyOSContractError(ValueError):
     """Raised when an agent does not natively satisfy the decision contract."""
 
