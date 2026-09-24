@@ -6,6 +6,7 @@ from app.models import (  # noqa: F401
     approval,
     company,
     company_os_action,
+    company_os_sandbox,
     competitor,
     email,
     finance,
