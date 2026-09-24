@@ -367,6 +367,19 @@ async def test_approved_resolution_resumes_once_and_preserves_native_decision(as
 
 
 @pytest.mark.asyncio
+async def test_approved_but_not_resumed_action_cannot_request_approval_again(async_db_session):
+    instance, original, approval, adapter = await pending_approval(async_db_session)
+    await resolve(async_db_session, approval)
+    duplicate = await invoke(async_db_session, instance, original, adapter=adapter, key="second-delivery")
+    assert duplicate.payload["event_type"] == "failure_detected"
+    assert duplicate.payload["result"] == "blocked"
+    assert duplicate.payload["metadata"]["gate"] == "approval"
+    assert duplicate.native_decision == original
+    assert adapter.calls == 0
+    assert await async_db_session.scalar(select(func.count()).select_from(CompanyOSSandboxApproval)) == 1
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("status", ["rejected", "needs_more_evidence", "expired", "cancelled"])
 async def test_non_executable_resolutions_never_resume(async_db_session, status):
     instance, _, approval, adapter = await pending_approval(async_db_session)
