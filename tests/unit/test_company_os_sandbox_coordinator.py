@@ -345,6 +345,7 @@ async def resume(db, approval, adapter=None, **kwargs):
         canonical_handoffs=["governance"], canonical_actions=[
             "score_against_icp", "send_outreach", "pricing_change", "bypass_opt_out",
         ], synthetic_adapters={"sandbox_mail": adapter} if adapter else {},
+        retry=kwargs.pop("retry", False),
     )
 
 
@@ -424,6 +425,41 @@ async def test_modified_hard_deny_cannot_be_founder_overridden(async_db_session)
     assert failure.payload["result"] == "blocked"
     assert instance.current_state == "scored" and adapter.calls == 0
     assert await resume(async_db_session, approval, adapter) is failure
+
+
+@pytest.mark.asyncio
+async def test_timed_out_adapter_retries_with_same_key_without_second_effect(async_db_session):
+    instance, original, approval, _ = await pending_approval(async_db_session)
+    await resolve(async_db_session, approval)
+
+    class TimeoutAfterSyntheticEffect:
+        def __init__(self):
+            self.keys = []
+            self.effects = set()
+
+        async def execute(self, decision, *, idempotency_key):
+            self.keys.append(idempotency_key)
+            if idempotency_key not in self.effects:
+                self.effects.add(idempotency_key)
+                raise TimeoutError("receipt lost after synthetic effect")
+            return "sandbox://mail/stable-receipt"
+
+    adapter = TimeoutAfterSyntheticEffect()
+    failure = await resume(async_db_session, approval, adapter)
+    assert failure.payload["event_type"] == "failure_detected"
+    assert failure.native_decision == original
+    assert instance.current_state == "scored"
+    assert await resume(async_db_session, approval, adapter) is failure
+    assert len(adapter.keys) == 1
+
+    recovered = await resume(async_db_session, approval, adapter, retry=True)
+    assert recovered.payload["event_type"] == "transition_completed"
+    assert recovered.native_decision == original
+    assert instance.current_state == "sent"
+    assert adapter.keys == [f"stage2-approval-resume:{approval.id}"] * 2
+    assert len(adapter.effects) == 1
+    assert approval.failure_attempt_count == 1
+    assert await resume(async_db_session, approval, adapter) is recovered
 
 
 @pytest.mark.asyncio
