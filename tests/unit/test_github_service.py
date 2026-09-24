@@ -16,7 +16,7 @@ def test_get_file_content_raises_when_not_configured():
         with pytest.raises(RuntimeError):
             get_file_content("README.md")
     finally:
-        settings.github_token, settings.github_repo, settings.sandbox_mode = original
+        settings.github_token, settings.github_repo = original
 
 
 def test_open_pr_raises_when_not_configured():
@@ -80,4 +80,4 @@ def test_open_pr_creates_branch_updates_file_and_opens_pr():
             title="Test PR", body="Test body", head="agent/test-123", base="main"
         )
     finally:
-        settings.github_token, settings.github_repo = original
+        settings.github_token, settings.github_repo, settings.sandbox_mode = original
