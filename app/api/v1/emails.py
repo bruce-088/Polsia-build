@@ -16,8 +16,7 @@ class SendEmailRequest(BaseModel):
 
 @router.post("/send")
 def send(request: SendEmailRequest):
-    """The only code path that ever sends a real email — always an explicit,
-    human-triggered call, never invoked automatically by an agent."""
+    """Explicit human-triggered email path; blocked while sandbox mode is enabled."""
     try:
         message_id = send_email(request.to, request.subject, request.body, from_email=request.from_email)
     except RuntimeError as exc:

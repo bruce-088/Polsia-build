@@ -6,6 +6,7 @@ explicit, human-triggered action. A PR is never merged automatically;
 GitHub's own review is the approval gate, same role a human clicking
 /emails/send plays for email."""
 from app.config import settings
+from app.services.external_access import require_production_write_allowed
 
 
 def _get_repo():
@@ -38,6 +39,7 @@ def open_pr(
     """Create a branch off base_branch, update exactly one file on it, and
     open a real PR back to base_branch. Raises RuntimeError if GitHub
     isn't configured. Returns the PR's real URL."""
+    require_production_write_allowed("github.open_pr")
     repo = _get_repo()
 
     base_ref = repo.get_git_ref(f"heads/{base_branch}")

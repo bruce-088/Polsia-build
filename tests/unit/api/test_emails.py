@@ -1,5 +1,4 @@
-"""Test POST /api/v1/emails/send — the sole path that ever sends a real
-email, always explicit/human-triggered, never called by an agent."""
+"""Test the explicit human-triggered POST /api/v1/emails/send path."""
 import pytest
 from unittest.mock import patch
 

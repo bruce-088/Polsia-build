@@ -22,20 +22,22 @@ def test_get_file_content_raises_when_not_configured():
 def test_open_pr_raises_when_not_configured():
     from app.config import settings
 
-    original = (settings.github_token, settings.github_repo)
+    original = (settings.github_token, settings.github_repo, settings.sandbox_mode)
     settings.github_token, settings.github_repo = "", ""
+    settings.sandbox_mode = False
     try:
         with pytest.raises(RuntimeError):
             open_pr("README.md", "new content", "agent/test", "Test PR", "body")
     finally:
-        settings.github_token, settings.github_repo = original
+        settings.github_token, settings.github_repo, settings.sandbox_mode = original
 
 
 def test_open_pr_creates_branch_updates_file_and_opens_pr():
     from app.config import settings
 
-    original = (settings.github_token, settings.github_repo)
+    original = (settings.github_token, settings.github_repo, settings.sandbox_mode)
     settings.github_token, settings.github_repo = "ghp_test", "bruce-088/Polsia-build"
+    settings.sandbox_mode = False
     try:
         mock_repo = MagicMock()
         mock_base_ref = MagicMock()
@@ -78,4 +80,4 @@ def test_open_pr_creates_branch_updates_file_and_opens_pr():
             title="Test PR", body="Test body", head="agent/test-123", base="main"
         )
     finally:
-        settings.github_token, settings.github_repo = original
+        settings.github_token, settings.github_repo, settings.sandbox_mode = original

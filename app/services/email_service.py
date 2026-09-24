@@ -1,16 +1,19 @@
-"""SendGrid email sending. Two callers only: app/api/v1/emails.py's
-POST /send (explicitly human-triggered, any recipient), and
-celery_app/tasks/agent_tasks.py's narrow customer_support auto-reply path
-(only reachable after app/services/auto_send_policy.py's multi-layer gate
-passes — see that module for what "narrow" actually means). email_outreach
-and every other agent-drafted reply still only ever produces a draft."""
+"""SendGrid email sending behind the shared production-write boundary.
+
+Callers are the explicit email API, the narrow customer-support auto-reply
+path, and approved customer replies. Agent drafting paths do not call this
+service. Sandbox mode blocks all callers before the SendGrid client is
+constructed."""
 from app.config import settings
+from app.services.external_access import require_production_write_allowed
 
 
 def send_email(to_email: str, subject: str, body: str, from_email: str | None = None) -> str | None:
     """Send a real email via SendGrid. Raises RuntimeError if SendGrid isn't
     configured, so a misconfigured send fails loudly instead of silently
     no-op-ing. Returns the SendGrid message id on success."""
+    require_production_write_allowed("sendgrid.email")
+
     if not settings.sendgrid_api_key or not settings.sendgrid_from_email:
         raise RuntimeError("SendGrid is not configured (sendgrid_api_key/sendgrid_from_email)")
 

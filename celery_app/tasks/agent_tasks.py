@@ -10,6 +10,20 @@ def _run_sync(coro):
     return asyncio.get_event_loop().run_until_complete(coro)
 
 
+def _send_customer_support_reply(
+    *, to_email: str, subject: str, body: str, from_email: str | None = None
+) -> str | None:
+    """Use the shared external-write boundary for the autonomous reply path."""
+    from app.services.email_service import send_email
+
+    return send_email(
+        to_email=to_email,
+        subject=subject,
+        body=body,
+        from_email=from_email,
+    )
+
+
 @app.task(name="celery_app.tasks.agent_tasks.run_agent_task", bind=True, max_retries=2)
 def run_agent_task(self, task_id: int):
     """Load a Task from DB, build context, run the correct agent, save result."""
@@ -84,12 +98,11 @@ def run_agent_task(self, task_id: int):
                     from app.config import settings
                     from app.services import approval_service
                     from app.services.auto_send_policy import is_safe_to_auto_send
-                    from app.services.email_service import send_email
 
                     reply_subject = task.task_metadata.get("subject", task.title)
                     async with Session() as db:
                         if await is_safe_to_auto_send(db, task.description or "", result):
-                            send_email(
+                            _send_customer_support_reply(
                                 to_email=reply_to,
                                 subject=f"Re: {reply_subject}",
                                 body=result.get("reply_draft", ""),
