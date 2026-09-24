@@ -21,7 +21,7 @@ def test_stage2_approval_migration_on_postgres(postgres_url, monkeypatch):
         try:
             async with engine.connect() as connection:
                 table = await connection.scalar(text("SELECT to_regclass('company_os_sandbox_approvals')"))
-                index = await connection.scalar(text("SELECT to_regclass('uq_company_os_sandbox_approval_pending_action')"))
+                index = await connection.scalar(text("SELECT to_regclass('uq_company_os_sandbox_approval_open_action')"))
                 version = await connection.scalar(text("SELECT version_num FROM alembic_version"))
                 return table, index, version
         finally:
@@ -29,7 +29,7 @@ def test_stage2_approval_migration_on_postgres(postgres_url, monkeypatch):
 
     try:
         assert asyncio.run(check()) == (
-            "company_os_sandbox_approvals", "uq_company_os_sandbox_approval_pending_action", "0005",
+            "company_os_sandbox_approvals", "uq_company_os_sandbox_approval_open_action", "0005",
         )
     finally:
         command.downgrade(config, "base")
