@@ -135,6 +135,7 @@ async def resume_sandbox_approval(
     event_schema: dict[str, Any], canonical_agents: list[str],
     canonical_handoffs: list[str], canonical_actions: list[str],
     synthetic_adapters: dict[str, SyntheticAdapter],
+    retry: bool = False,
 ) -> CompanyOSSandboxEvent:
     """Resume one founder-authorized action using its frozen native evidence.
 
@@ -152,6 +153,8 @@ async def resume_sandbox_approval(
         raise SandboxApprovalError("resolution does not permit execution")
     if approval.resume_event_id is not None:
         return await db.get(CompanyOSSandboxEvent, approval.resume_event_id)
+    if approval.last_failure_event_id is not None and not retry:
+        return await db.get(CompanyOSSandboxEvent, approval.last_failure_event_id)
     if approval.resolution_event_id is None or not approval.founder_id:
         raise SandboxApprovalError("founder resolution is incomplete")
 
@@ -236,7 +239,8 @@ async def resume_sandbox_approval(
     resume_key = f"stage2-approval-resume:{approval.id}"
     if reason is not None:
         event = await _append(
-            db, instance, instance.version, resume_key, event_schema, workflow,
+            db, instance, instance.version,
+            f"{resume_key}:failure:{approval.failure_attempt_count + 1}", event_schema, workflow,
             request.payload["evidence_refs"], original, None,
             event_type="failure_detected", result="blocked", risk="GREEN",
             action=approval.action, agent=request.payload["agent_type"],
@@ -244,7 +248,10 @@ async def resume_sandbox_approval(
             approval={"decision_id": approval.decision_id, "status": approval.status},
             integration=integration, category="approval_resume", error=reason,
             autonomy_class=approval.autonomy_class, founder_minutes=0,
+            metadata_extra={"approval_id": approval.id, "attempt": approval.failure_attempt_count + 1},
         )
+        approval.last_failure_event_id = event.id
+        approval.failure_attempt_count += 1
     else:
         refs = list(dict.fromkeys([*request.payload["evidence_refs"], *(
             [approval.manual_evidence_ref] if approval.manual_evidence_ref else [receipt] if receipt else []
@@ -264,7 +271,7 @@ async def resume_sandbox_approval(
             metadata_extra={"founder_id": approval.founder_id, "approval_request_event_id": request.event_id,
                             **({"founder_corrected_decision": effective} if approval.status == "modified" else {})},
         )
-    approval.resume_event_id = event.id
-    approval.resume_key = resume_key
+        approval.resume_event_id = event.id
+        approval.resume_key = resume_key
     await db.flush()
     return event
