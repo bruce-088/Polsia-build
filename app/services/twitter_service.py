@@ -3,6 +3,7 @@ caller — the only path that reaches this is app/api/v1/social.py's
 POST /posts/publish, a separate, explicitly human-triggered action. The
 social_media agent only ever produces drafts."""
 from app.config import settings
+from app.services.external_access import require_production_write_allowed
 
 
 def post_tweet(content: str) -> str:
@@ -10,6 +11,8 @@ def post_tweet(content: str) -> str:
     Raises RuntimeError if Twitter isn't configured, so a misconfigured
     publish fails loudly instead of silently no-op-ing. Returns the real
     tweet id on success."""
+    require_production_write_allowed("twitter.publish")
+
     if not all([
         settings.twitter_api_key,
         settings.twitter_api_secret,
