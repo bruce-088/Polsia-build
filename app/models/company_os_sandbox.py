@@ -134,10 +134,10 @@ class CompanyOSSandboxApproval(Base):
     __tablename__ = "company_os_sandbox_approvals"
     __table_args__ = (
         Index(
-            "uq_company_os_sandbox_approval_pending_action",
+            "uq_company_os_sandbox_approval_open_action",
             "workflow_instance_id", "action", unique=True,
-            postgresql_where=text("status = 'pending'"),
-            sqlite_where=text("status = 'pending'"),
+            postgresql_where=text("resume_event_id IS NULL AND status IN ('pending', 'approved', 'modified')"),
+            sqlite_where=text("resume_event_id IS NULL AND status IN ('pending', 'approved', 'modified')"),
         ),
         UniqueConstraint("sandbox_run_id", "decision_id", name="uq_company_os_sandbox_approval_decision"),
         UniqueConstraint("request_event_id", name="uq_company_os_sandbox_approval_request_event"),
