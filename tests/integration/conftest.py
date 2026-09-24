@@ -36,32 +36,41 @@ def redis_url():
         pytest.skip("testcontainers not installed")
 
 
-@pytest_asyncio.fixture(scope="session")
+@pytest_asyncio.fixture(scope="function", loop_scope="function")
 async def integration_db(postgres_url):
-    """Create all tables and return async session factory."""
+    """Keep the pool, sessions, tests, and teardown on one function loop.
+
+    Containers remain session-scoped, but asyncpg pooled connections must not
+    cross the function-scoped event loops used by the integration tests.
+    """
     from app.core.database import Base
     import app.models  # noqa — ensure all models registered
 
     engine = create_async_engine(postgres_url, echo=False)
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+    try:
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
 
-    Session = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
-    yield Session
+        Session = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+        try:
+            yield Session
+        finally:
+            async with engine.begin() as conn:
+                await conn.run_sync(Base.metadata.drop_all)
+    finally:
+        await engine.dispose()
 
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.drop_all)
-    await engine.dispose()
 
-
-@pytest_asyncio.fixture
+@pytest_asyncio.fixture(scope="function", loop_scope="function")
 async def db(integration_db):
     async with integration_db() as session:
-        yield session
-        await session.rollback()
+        try:
+            yield session
+        finally:
+            await session.rollback()
 
 
-@pytest_asyncio.fixture
+@pytest_asyncio.fixture(scope="function", loop_scope="function")
 async def int_client(db, redis_url, monkeypatch):
     """FastAPI client connected to real Postgres + Redis."""
     from app.main import app
@@ -74,7 +83,8 @@ async def int_client(db, redis_url, monkeypatch):
     app.dependency_overrides[get_db] = lambda: db
 
     transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://test") as client:
-        yield client
-
-    app.dependency_overrides.clear()
+    try:
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            yield client
+    finally:
+        app.dependency_overrides.pop(get_db, None)
