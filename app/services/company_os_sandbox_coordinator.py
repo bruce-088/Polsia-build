@@ -241,13 +241,14 @@ async def coordinate_sandbox_action(
         if not isinstance(approval_id, str) or not approval_id:
             denial = ("approval", "pending approval requires a decision ID")
         else:
-            pending = await db.scalar(select(CompanyOSSandboxApproval.id).where(
+            outstanding = await db.scalar(select(CompanyOSSandboxApproval.id).where(
                 CompanyOSSandboxApproval.workflow_instance_id == instance.id,
                 CompanyOSSandboxApproval.action == native["action"],
-                CompanyOSSandboxApproval.status == "pending",
+                CompanyOSSandboxApproval.status.in_(("pending", "approved", "modified")),
+                CompanyOSSandboxApproval.resume_event_id.is_(None),
             ))
-            if pending is not None:
-                denial = ("approval", "action already has a pending founder request")
+            if outstanding is not None:
+                denial = ("approval", "action already has an unresolved founder request")
             else:
                 event = await _append(
                 db, instance, expected_version, idempotency_key, event_schema,
