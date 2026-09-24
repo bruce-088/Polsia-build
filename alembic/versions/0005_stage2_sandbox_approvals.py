@@ -46,13 +46,13 @@ def upgrade() -> None:
         sa.CheckConstraint("founder_minutes IS NULL OR founder_minutes >= 0", name="ck_company_os_sandbox_approval_minutes"),
     )
     op.create_index(
-        "uq_company_os_sandbox_approval_pending_action",
+        "uq_company_os_sandbox_approval_open_action",
         "company_os_sandbox_approvals", ["workflow_instance_id", "action"],
-        unique=True, postgresql_where=sa.text("status = 'pending'"),
-        sqlite_where=sa.text("status = 'pending'"),
+        unique=True, postgresql_where=sa.text("resume_event_id IS NULL AND status IN ('pending', 'approved', 'modified')"),
+        sqlite_where=sa.text("resume_event_id IS NULL AND status IN ('pending', 'approved', 'modified')"),
     )
 
 
 def downgrade() -> None:
-    op.drop_index("uq_company_os_sandbox_approval_pending_action", table_name="company_os_sandbox_approvals")
+    op.drop_index("uq_company_os_sandbox_approval_open_action", table_name="company_os_sandbox_approvals")
     op.drop_table("company_os_sandbox_approvals")
