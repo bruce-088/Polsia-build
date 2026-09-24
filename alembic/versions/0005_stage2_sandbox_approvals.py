@@ -39,11 +39,14 @@ def upgrade() -> None:
         sa.Column("resolution_key", sa.String(255)),
         sa.Column("resume_event_id", sa.Integer(), sa.ForeignKey("company_os_sandbox_events.id")),
         sa.Column("resume_key", sa.String(255)),
+        sa.Column("last_failure_event_id", sa.Integer(), sa.ForeignKey("company_os_sandbox_events.id")),
+        sa.Column("failure_attempt_count", sa.Integer(), nullable=False, server_default="0"),
         sa.UniqueConstraint("sandbox_run_id", "decision_id", name="uq_company_os_sandbox_approval_decision"),
         sa.UniqueConstraint("request_event_id", name="uq_company_os_sandbox_approval_request_event"),
         sa.UniqueConstraint("resolution_event_id", name="uq_company_os_sandbox_approval_resolution_event"),
         sa.UniqueConstraint("resume_event_id", name="uq_company_os_sandbox_approval_resume_event"),
         sa.CheckConstraint("founder_minutes IS NULL OR founder_minutes >= 0", name="ck_company_os_sandbox_approval_minutes"),
+        sa.CheckConstraint("failure_attempt_count >= 0", name="ck_company_os_sandbox_approval_failure_count"),
     )
     op.create_index(
         "uq_company_os_sandbox_approval_open_action",
