@@ -144,6 +144,7 @@ class CompanyOSSandboxApproval(Base):
         UniqueConstraint("resolution_event_id", name="uq_company_os_sandbox_approval_resolution_event"),
         UniqueConstraint("resume_event_id", name="uq_company_os_sandbox_approval_resume_event"),
         CheckConstraint("founder_minutes IS NULL OR founder_minutes >= 0", name="ck_company_os_sandbox_approval_minutes"),
+        CheckConstraint("failure_attempt_count >= 0", name="ck_company_os_sandbox_approval_failure_count"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -164,3 +165,5 @@ class CompanyOSSandboxApproval(Base):
     resolution_key: Mapped[str | None] = mapped_column(String(255))
     resume_event_id: Mapped[int | None] = mapped_column(Integer, ForeignKey("company_os_sandbox_events.id"))
     resume_key: Mapped[str | None] = mapped_column(String(255))
+    last_failure_event_id: Mapped[int | None] = mapped_column(Integer, ForeignKey("company_os_sandbox_events.id"))
+    failure_attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
