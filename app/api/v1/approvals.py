@@ -6,6 +6,7 @@ from app.core.database import get_db
 from app.models.approval import ApprovalRequest
 from app.services import approval_service
 from app.services.email_service import send_email
+from app.services.external_access import ExternalAccessBlocked
 
 router = APIRouter(prefix="/api/v1/approvals", tags=["approvals"], dependencies=[Depends(require_api_key)])
 
@@ -55,6 +56,8 @@ async def approve(approval_id: int, db: AsyncSession = Depends(get_db)):
                 body=request.payload["reply_draft"],
                 from_email=request.payload.get("from_email"),
             )
+        except ExternalAccessBlocked as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
         except Exception as exc:
             raise HTTPException(status_code=502, detail=f"Approved, but send failed: {exc}")
 
