@@ -55,7 +55,7 @@ git diff --name-only <base> | grep '\.py$' | xargs .venv/bin/ruff check   # lint
 
 ## Claude ↔ Codex loop roles
 
-When Claude and Codex work together on this repo (claudex-loop), the provider with more usage headroom builds and the other only reviews the plan and inspects the final code. Reviews use the lighter models (Codex `gpt-6-sol`, Claude Sonnet 5); ask before using Astra or Opus. Cap plan review at about 3 rounds, keep work orders short and file-scoped, and never spend paid credits without the founder's approval. A provider never counts as the independent reviewer of code it wrote.
+When Claude and Codex work together on this repo (claudex-loop), the provider with more usage headroom builds and the other only reviews the plan and inspects the final code. Default model split: the lighter model (Codex `gpt-6-sol`, Claude Sonnet 5) for chat/coordination; the coding-tier model (Codex `gpt-6-astra`, Claude Opus 5.5) for actual builds, plan reviews, and code inspections. When either side's usage is genuinely tight, drop to the lighter model for that side even for build/review work, and say so. Cap plan review at about 3 rounds, keep work orders short and file-scoped, and never spend paid credits without the founder's approval. A provider never counts as the independent reviewer of code it wrote.
 
 ## Never
 
