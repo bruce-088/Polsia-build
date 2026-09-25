@@ -193,6 +193,10 @@ async def append_sandbox_event(
         )
 
     changes_state = state_after != state_before
+    compliance = payload.get("compliance") or {}
+    blocked = payload.get("result") == "blocked" or bool(compliance.get("failed_rule_ids"))
+    if blocked and (changes_state or payload.get("event_type") == "terminal_outcome"):
+        raise SandboxPersistenceError("blocked events cannot change state or mark terminal")
     is_terminal = payload.get("event_type") == "terminal_outcome"
     if instance.terminal and (changes_state or is_terminal):
         raise SandboxConflictError("terminal workflow instance cannot transition")

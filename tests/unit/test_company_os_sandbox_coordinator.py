@@ -23,6 +23,8 @@ from app.services.company_os_sandbox_service import (
     create_workflow_instance,
     export_sandbox_event,
 )
+from app.services.company_os_synthetic_adapters import SyntheticAdapter, SyntheticCapabilityError
+from tests.unit.company_os_stage2_facts import MESSAGE, SENDER, eligible_world
 
 WORKFLOW = {
     "id": "prospect_to_meeting",
@@ -44,7 +46,7 @@ REGISTRY = {
     "integrations": {
         "sandbox_mail": {
             "mode": "sandbox", "verified": True, "external_writes": True,
-            "desired_use": ["send_outreach"],
+            "desired_use": ["send_outreach"], "sandbox_sender": deepcopy(SENDER),
         },
     },
 }
@@ -71,7 +73,7 @@ EVENT_SCHEMA = {
         "workflow_id": {"const": "prospect_to_meeting"},
         "entity_type": {"const": "prospect"},
         "entity_id": {"const": "p-1"},
-        "event_type": {"enum": ["decision_produced", "transition_completed", "approval_requested", "approval_resolved", "failure_detected", "terminal_outcome"]},
+        "event_type": {"enum": ["decision_produced", "transition_attempted", "transition_completed", "approval_requested", "approval_resolved", "failure_detected", "terminal_outcome"]},
         "agent_type": {"enum": ["acquisition", "governance"]},
         "action": {"type": "string", "minLength": 1},
         "risk_level": {"enum": ["GREEN", "YELLOW", "RED"]},
@@ -85,22 +87,38 @@ EVENT_SCHEMA = {
         "autonomy": {"type": "object", "required": ["class", "founder_minutes"], "properties": {"class": {"enum": ["A0", "A1", "A2", "A3"]}, "founder_minutes": {"type": "number", "minimum": 0}}, "additionalProperties": False},
         "error": {"type": ["string", "null"]},
         "metadata": {"type": "object"},
+        "compliance": {"type": "object", "required": ["failed_rule_ids", "approvable"],
+                       "properties": {"approvable": {"const": False}, "failed_rule_ids": {"type": "array"}}},
     },
-    "allOf": [{"if": {"properties": {"risk_level": {"const": "RED"}}}, "then": {"properties": {"approval": {"type": "object"}}}}],
+    "allOf": [{
+        "if": {"properties": {"risk_level": {"const": "RED"}}},
+        "then": {"anyOf": [
+            {"properties": {"approval": {"type": "object"}}},
+            {"required": ["compliance"], "properties": {
+                "result": {"const": "blocked"}, "approval": {"type": "null"},
+                "event_type": {"const": "transition_attempted"},
+                "compliance": {"properties": {"failed_rule_ids": {"minItems": 1}}},
+            }},
+        ]},
+    }],
     "additionalProperties": False,
 }
 
 
-class Adapter:
+class Adapter(SyntheticAdapter):
     def __init__(self):
+        super().__init__(eligible_world(), "mail")
         self.calls = 0
 
-    async def execute(self, decision, *, idempotency_key):
+    async def execute(self, decision, *, idempotency_key, run_id, recipient_id):
         self.calls += 1
         return "sandbox://mail/receipt-1"
 
 
 def native(*, action="score_against_icp", state="scored", risk="GREEN", integration=None, **intent):
+    integration = deepcopy(integration)
+    if integration and integration.get("phase") == "execute":
+        integration.setdefault("message", deepcopy(MESSAGE))
     return {
         "action": action,
         "risk_level": risk,
@@ -432,16 +450,19 @@ async def test_timed_out_adapter_retries_with_same_key_without_second_effect(asy
     instance, original, approval, _ = await pending_approval(async_db_session)
     await resolve(async_db_session, approval)
 
-    class TimeoutAfterSyntheticEffect:
+    class TimeoutAfterSyntheticEffect(Adapter):
         def __init__(self):
+            super().__init__()
             self.keys = []
             self.effects = set()
 
-        async def execute(self, decision, *, idempotency_key):
+        async def execute(self, decision, *, idempotency_key, run_id, recipient_id):
             self.keys.append(idempotency_key)
             if idempotency_key not in self.effects:
                 self.effects.add(idempotency_key)
-                raise TimeoutError("receipt lost after synthetic effect")
+                for record in self.world.dispatches.values():
+                    record.update(status="executed", receipt="sandbox://mail/stable-receipt")
+                raise SyntheticCapabilityError("receipt lost after synthetic effect")
             return "sandbox://mail/stable-receipt"
 
     adapter = TimeoutAfterSyntheticEffect()
@@ -456,7 +477,7 @@ async def test_timed_out_adapter_retries_with_same_key_without_second_effect(asy
     assert recovered.payload["event_type"] == "transition_completed"
     assert recovered.native_decision == original
     assert instance.current_state == "sent"
-    assert adapter.keys == [f"stage2-approval-resume:{approval.id}"] * 2
+    assert adapter.keys == [f"stage2-approval-resume:{approval.id}"]
     assert len(adapter.effects) == 1
     assert approval.failure_attempt_count == 1
     assert await resume(async_db_session, approval, adapter) is recovered
@@ -555,12 +576,13 @@ async def test_db_rollback_retry_uses_stable_synthetic_idempotency_key(async_db_
     instance_id = instance.id
     await async_db_session.commit()
 
-    class IdempotentAdapter:
+    class IdempotentAdapter(Adapter):
         def __init__(self):
+            super().__init__()
             self.keys = []
             self.effects = set()
 
-        async def execute(self, decision, *, idempotency_key):
+        async def execute(self, decision, *, idempotency_key, run_id, recipient_id):
             self.keys.append(idempotency_key)
             self.effects.add(idempotency_key)
             return "sandbox://mail/stable-receipt"
@@ -581,8 +603,8 @@ async def test_db_rollback_retry_uses_stable_synthetic_idempotency_key(async_db_
     approval = await async_db_session.get(CompanyOSSandboxApproval, approval_id)
     event = await resume(async_db_session, approval, adapter, workflow=workflow)
     assert event.payload["event_type"] == "terminal_outcome"
-    assert len(adapter.keys) == 2 and len(adapter.effects) == 1
-    assert adapter.keys[0] == adapter.keys[1] == f"stage2-approval-resume:{approval_id}"
+    assert len(adapter.keys) == 1 and len(adapter.effects) == 1
+    assert adapter.keys == [f"stage2-approval-resume:{approval_id}"]
     assert await async_db_session.scalar(select(func.count()).select_from(CompanyOSSandboxEvent).where(
         CompanyOSSandboxEvent.event_type == "terminal_outcome",
     )) == 1

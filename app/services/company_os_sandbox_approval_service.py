@@ -31,13 +31,24 @@ from app.config import settings
 from app.models.company_os_sandbox import (
     CompanyOSSandboxApproval,
     CompanyOSSandboxEvent,
+    CompanyOSSandboxRun,
     CompanyOSWorkflowInstance,
 )
 from app.services.company_os_sandbox_coordinator import (
     SyntheticAdapter,
     _append,
+    _compliance_event,
+    _orphan_event,
+    _reconcile_event,
     _validate_native,
 )
+from app.services.company_os_sandbox_dispatch import (
+    DispatchBlocked,
+    DispatchReviewRequired,
+    execute_dispatch,
+    find_dispatch,
+)
+from app.services.company_os_synthetic_adapters import SyntheticCapabilityError
 
 STATUSES = {
     "approved", "rejected", "modified", "needs_more_evidence", "expired", "cancelled",
@@ -90,7 +101,7 @@ async def resolve_sandbox_approval(
 
     instance = await db.scalar(select(CompanyOSWorkflowInstance).where(
         CompanyOSWorkflowInstance.id == approval.workflow_instance_id,
-    ).with_for_update())
+    ).with_for_update().execution_options(populate_existing=True))
     request = await db.get(CompanyOSSandboxEvent, approval.request_event_id)
     if (instance is None or request is None or request.event_type != "approval_requested" or
         instance.sandbox_run_id != approval.sandbox_run_id or
@@ -160,7 +171,7 @@ async def resume_sandbox_approval(
 
     instance = await db.scalar(select(CompanyOSWorkflowInstance).where(
         CompanyOSWorkflowInstance.id == approval.workflow_instance_id,
-    ).with_for_update())
+    ).with_for_update().execution_options(populate_existing=True))
     request = await db.get(CompanyOSSandboxEvent, approval.request_event_id)
     if (instance is None or request is None or request.native_decision is None or
         instance.sandbox_run_id != approval.sandbox_run_id or
@@ -178,6 +189,33 @@ async def resume_sandbox_approval(
     original = request.native_decision
     effective = approval.corrected_decision if approval.status == "modified" else original
     snapshot = approval.input_snapshot
+    resume_key = f"stage2-approval-resume:{approval.id}"
+    dispatch_metadata = {}
+    compliance_evidence = None
+    try:
+        pending = await find_dispatch(db, instance, synthetic_adapters, approval_id=approval.id)
+    except DispatchReviewRequired as exc:
+        return await _orphan_event(
+            db, instance, instance.version, f"{resume_key}:orphan", event_schema,
+            workflow, request.payload["evidence_refs"], exc,
+        )
+    if pending:
+        effective = deepcopy(pending[1]["consumers"][instance.id]["consumer_decision"])
+        if pending[1]["status"] == "executed":
+            event = await _reconcile_event(
+                db, instance, instance.version, resume_key, event_schema, workflow,
+                request.payload["evidence_refs"], pending[1], snapshot, canonical_agents,
+                canonical_handoffs, canonical_actions,
+                approval={"decision_id": approval.decision_id, "status": approval.status},
+                autonomy_class=approval.autonomy_class, original=original,
+                extra_metadata={"founder_id": approval.founder_id,
+                                "approval_request_event_id": request.event_id,
+                                **({"founder_corrected_decision": effective} if approval.status == "modified" else {})},
+            )
+            approval.resume_event_id = event.id
+            approval.resume_key = resume_key
+            await db.flush()
+            return event
     receipt: str | None = None
     transition = None
     integration = None
@@ -222,19 +260,41 @@ async def resume_sandbox_approval(
             raise SandboxApprovalError("integration transition requires sandbox execution")
         if intent["external_write"] and (integration is None or request_integration["phase"] != "execute"):
             raise SandboxApprovalError("write requires registered sandbox execution")
-        if approval.manual_evidence_ref is None and request_integration is not None and request_integration["phase"] in {"read", "execute"}:
-            if request_integration["name"] not in synthetic_adapters:
-                raise SandboxApprovalError("registered synthetic adapter is missing")
-            try:
-                receipt = await synthetic_adapters[request_integration["name"]].execute(
-                    deepcopy(effective), idempotency_key=f"stage2-approval-resume:{approval.id}",
-                )
-            except Exception as exc:
-                raise SandboxApprovalError(f"synthetic adapter failed: {type(exc).__name__}: {exc}") from exc
-            if not isinstance(receipt, str) or not receipt.startswith("sandbox://"):
-                raise SandboxApprovalError("synthetic adapter did not return sandbox evidence")
     except (SandboxApprovalError, CompanyOSWorkflowError, CompanyOSPolicyError, CompanyOSIntegrationError, KeyError, TypeError, ValueError) as exc:
         reason = str(exc)
+
+    # Deliberately outside validation's broad catch: programming errors must roll back.
+    if reason is None and request_integration is not None and request_integration["phase"] in {"read", "execute"}:
+        adapter = synthetic_adapters.get(request_integration["name"])
+        try:
+            if adapter is None:
+                raise SyntheticCapabilityError("registered synthetic adapter is missing")
+            if request_integration["phase"] == "execute":
+                receipt, compliance_evidence = await execute_dispatch(
+                    db, instance, effective, snapshot, integration_registry, adapter,
+                    dispatch_metadata, existing=pending[1] if pending else None,
+                    approval_id=approval.id, manual_receipt=approval.manual_evidence_ref,
+                )
+            elif approval.manual_evidence_ref is None:
+                run = await db.get(CompanyOSSandboxRun, instance.sandbox_run_id)
+                receipt = await adapter.execute(
+                    deepcopy(effective), idempotency_key=resume_key,
+                    run_id=run.run_id, recipient_id=instance.entity_id,
+                )
+                if not isinstance(receipt, str) or not receipt.startswith("sandbox://"):
+                    raise SyntheticCapabilityError("synthetic adapter did not return sandbox evidence")
+        except DispatchBlocked as exc:
+            event = await _compliance_event(
+                db, instance, instance.version, f"{resume_key}:failure:{approval.failure_attempt_count + 1}",
+                event_schema, workflow, request.payload["evidence_refs"], original,
+                snapshot, integration, exc.result.evidence, dispatch_metadata, override=True,
+            )
+            approval.last_failure_event_id = event.id
+            approval.failure_attempt_count += 1
+            await db.flush()
+            return event
+        except SyntheticCapabilityError as exc:
+            reason = f"synthetic adapter failed: {type(exc).__name__}: {exc}"
 
     resume_key = f"stage2-approval-resume:{approval.id}"
     if reason is not None:
@@ -248,7 +308,7 @@ async def resume_sandbox_approval(
             approval={"decision_id": approval.decision_id, "status": approval.status},
             integration=integration, category="approval_resume", error=reason,
             autonomy_class=approval.autonomy_class, founder_minutes=0,
-            metadata_extra={"approval_id": approval.id, "attempt": approval.failure_attempt_count + 1},
+            metadata_extra={**dispatch_metadata, "approval_id": approval.id, "attempt": approval.failure_attempt_count + 1},
         )
         approval.last_failure_event_id = event.id
         approval.failure_attempt_count += 1
@@ -268,7 +328,8 @@ async def resume_sandbox_approval(
             approval={"decision_id": approval.decision_id, "status": approval.status},
             integration=integration, category="approved_resume", error=None,
             autonomy_class=approval.autonomy_class, founder_minutes=0,
-            metadata_extra={"founder_id": approval.founder_id, "approval_request_event_id": request.event_id,
+            compliance=compliance_evidence,
+            metadata_extra={**dispatch_metadata, "founder_id": approval.founder_id, "approval_request_event_id": request.event_id,
                             **({"founder_corrected_decision": effective} if approval.status == "modified" else {})},
         )
         approval.resume_event_id = event.id

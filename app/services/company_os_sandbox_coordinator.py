@@ -16,8 +16,10 @@ from uuid import uuid4
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.agents.company_os_compliance import EMAIL_USES
 from app.agents.company_os_integration import (
     CompanyOSIntegrationError,
+    IntegrationDecision,
     evaluate_integration_capability,
     validate_integration_registry,
 )
@@ -31,9 +33,18 @@ from app.config import settings
 from app.models.company_os_sandbox import (
     CompanyOSSandboxApproval,
     CompanyOSSandboxEvent,
+    CompanyOSSandboxRun,
     CompanyOSWorkflowInstance,
 )
+from app.services.company_os_sandbox_dispatch import (
+    DispatchBlocked,
+    DispatchReviewRequired,
+    execute_dispatch,
+    find_dispatch,
+    metadata_for,
+)
 from app.services.company_os_sandbox_service import append_sandbox_event
+from app.services.company_os_synthetic_adapters import SyntheticCapabilityError
 
 
 class SyntheticAdapter(Protocol):
@@ -43,7 +54,7 @@ class SyntheticAdapter(Protocol):
     its synthetic side effect, even when the event transaction was rolled back.
     """
 
-    async def execute(self, decision: dict[str, Any], *, idempotency_key: str) -> str:
+    async def execute(self, decision: dict[str, Any], *, idempotency_key: str, run_id: str, recipient_id: str) -> str:
         """Return a nonempty synthetic evidence reference after execution."""
 
 
@@ -105,7 +116,7 @@ async def coordinate_sandbox_action(
     instance = await db.scalar(
         select(CompanyOSWorkflowInstance).where(
             CompanyOSWorkflowInstance.id == workflow_instance_id
-        )
+        ).with_for_update().execution_options(populate_existing=True)
     )
     if instance is None:
         raise SandboxCoordinatorError("workflow instance does not exist")
@@ -126,6 +137,22 @@ async def coordinate_sandbox_action(
     if existing is not None or instance.version != expected_version or instance.terminal:
         raise SandboxCoordinatorError("duplicate, stale, or terminal workflow delivery")
 
+    dispatch_metadata = {}
+    compliance_evidence = None
+    try:
+        pending = await find_dispatch(db, instance, synthetic_adapters)
+    except DispatchReviewRequired as exc:
+        return await _orphan_event(
+            db, instance, expected_version, idempotency_key, event_schema, workflow,
+            evidence_refs, exc,
+        )
+    if pending and pending[1]["status"] == "executed":
+        return await _reconcile_event(
+            db, instance, expected_version, idempotency_key, event_schema, workflow,
+            evidence_refs, pending[1], synthetic_input, canonical_agents,
+            canonical_handoffs, canonical_actions,
+        )
+
     native: dict[str, Any] | None = None
     native_failure: dict[str, Any] | None = None
     transition = None
@@ -135,7 +162,8 @@ async def coordinate_sandbox_action(
     adapter_receipt: str | None = None
 
     try:
-        returned = await decide(deepcopy(synthetic_input))
+        returned = (deepcopy(pending[1]["consumers"][instance.id]["consumer_decision"])
+                    if pending else await decide(deepcopy(synthetic_input)))
     except Exception as exc:
         native_failure = {"type": type(exc).__name__, "message": str(exc)}
         if getattr(exc, "raw_output", None) is not None:
@@ -280,10 +308,26 @@ async def coordinate_sandbox_action(
             denial = ("integration", "registered synthetic adapter is missing")
         else:
             try:
-                adapter_receipt = await adapter.execute(deepcopy(native), idempotency_key=idempotency_key)
+                if native["integration"]["phase"] == "execute":
+                    adapter_receipt, compliance_evidence = await execute_dispatch(
+                        db, instance, native, synthetic_input, integration_registry, adapter,
+                        dispatch_metadata, existing=pending[1] if pending else None,
+                    )
+                else:
+                    run = await db.get(CompanyOSSandboxRun, instance.sandbox_run_id)
+                    adapter_receipt = await adapter.execute(
+                        deepcopy(native), idempotency_key=idempotency_key,
+                        run_id=run.run_id, recipient_id=instance.entity_id,
+                    )
                 if not isinstance(adapter_receipt, str) or not adapter_receipt.startswith("sandbox://"):
                     raise SandboxCoordinatorError("synthetic adapter did not return sandbox evidence")
-            except Exception as exc:
+            except DispatchBlocked as exc:
+                return await _compliance_event(
+                    db, instance, expected_version, idempotency_key, event_schema,
+                    workflow, evidence_refs, native, synthetic_input, integration,
+                    exc.result.evidence, dispatch_metadata,
+                )
+            except (SyntheticCapabilityError, SandboxCoordinatorError) as exc:
                 denial = ("integration", f"synthetic adapter failed: {type(exc).__name__}: {exc}")
 
     if denial is not None:
@@ -299,6 +343,7 @@ async def coordinate_sandbox_action(
             agent=native.get("agent_type", "governance") if native and native.get("agent_type") in canonical_agents else canonical_agents[0],
             classification="failure_recovery", state_after=instance.current_state,
             approval=None, integration=integration, category=category, error=reason,
+            metadata_extra=dispatch_metadata,
         )
 
     # Approval and capability checks have completed. A state change and its
@@ -306,13 +351,16 @@ async def coordinate_sandbox_action(
     return await _append(
         db, instance, expected_version, idempotency_key, event_schema, workflow,
         [*evidence_refs, *([adapter_receipt] if adapter_receipt else [])],
-        native, None, event_type="transition_completed" if transition else "decision_produced",
+        native, None, event_type=(
+            "terminal_outcome" if transition and native["state_after"] in workflow.get("terminal_states", [])
+            else "transition_completed" if transition else "decision_produced"),
         result="executed_in_sandbox" if transition or adapter_receipt else "observed",
         risk=transition.risk_level if transition else native["risk_level"],
         action=native["action"], agent=native["agent_type"],
         classification=synthetic_input["primary_classification"],
         state_after=native["state_after"], approval=None,
         integration=integration, category="allow", error=None,
+        metadata_extra=dispatch_metadata, compliance=compliance_evidence,
     )
 
 
@@ -338,6 +386,21 @@ def _validate_native(
             not isinstance(request.get("phase"), str) or
             request["phase"] not in {"draft", "propose", "read", "execute"}):
             raise SandboxCoordinatorError("native integration request is invalid")
+        if set(request) - {"name", "phase", "use", "scope", "message"}:
+            raise SandboxCoordinatorError("native integration has unexpected fields")
+        if any(key in request and not isinstance(request[key], str) for key in ("use", "scope")):
+            raise SandboxCoordinatorError("integration use and scope must be strings")
+        if "message" in request:
+            message = request["message"]
+            if (request["phase"] != "execute" or not isinstance(message, dict)
+                    or set(message) != {"template_id", "fills"}
+                    or not isinstance(message["template_id"], str) or not message["template_id"]
+                    or not isinstance(message["fills"], dict)
+                    or any(not isinstance(k, str) or not isinstance(v, str)
+                           for k, v in message["fills"].items())):
+                raise SandboxCoordinatorError("native integration message is invalid")
+        if request["phase"] == "execute" and request.get("use") in EMAIL_USES and "message" not in request:
+            raise SandboxCoordinatorError("email execution requires template_id and fills")
 
 
 async def _append(
@@ -349,6 +412,7 @@ async def _append(
     approval: dict[str, Any] | None, integration: Any, category: str,
     error: str | None, autonomy_class: str | None = None,
     founder_minutes: float = 0, metadata_extra: dict[str, Any] | None = None,
+    compliance: dict[str, Any] | None = None,
 ) -> CompanyOSSandboxEvent:
     payload = {
         "schema_version": "0.1.0", "event_id": str(uuid4()),
@@ -367,9 +431,71 @@ async def _append(
         "autonomy": {"class": autonomy_class or ("A1" if approval else "A0"), "founder_minutes": founder_minutes},
         "error": error, "metadata": {"gate": category, **(metadata_extra or {})},
     }
+    if compliance is not None:
+        payload["compliance"] = compliance
     return await append_sandbox_event(
         db, workflow_instance_id=instance.id, expected_version=expected_version,
         idempotency_key=idempotency_key, event_payload=payload,
         event_schema=schema, workflow_definition=workflow,
         native_decision=native, native_failure=failure,
+    )
+
+
+async def _compliance_event(
+    db, instance, version, key, schema, workflow, refs, native, snapshot, integration,
+    compliance, metadata, *, override=False,
+):
+    return await _append(
+        db, instance, version, key, schema, workflow, refs, native, None,
+        event_type="transition_attempted", result="blocked", risk="RED",
+        action=native["action"], agent=native["agent_type"],
+        classification=snapshot["primary_classification"], state_after=instance.current_state,
+        approval=None, integration=integration, category="compliance",
+        error=", ".join(compliance["reason_codes"]), compliance=compliance,
+        metadata_extra={**metadata, **({"override_attempt": True} if override else {})},
+    )
+
+
+async def _orphan_event(db, instance, version, key, schema, workflow, refs, error):
+    if error.reported:
+        raise SandboxCoordinatorError("orphan dispatch already reported; review required")
+    record = error.dispatch
+    native = record["consumers"][instance.id]["consumer_decision"]
+    return await _append(
+        db, instance, version, key, schema, workflow, refs, native, None,
+        event_type="failure_detected", result="failed", risk="GREEN",
+        action=native["action"], agent=native["agent_type"], classification="failure_recovery",
+        state_after=instance.current_state, approval=None, integration=None,
+        category="dispatch_review", error=str(error),
+        metadata_extra={**metadata_for(record), "orphan_dispatch_id": record["dispatch_id"]},
+    )
+
+
+async def _reconcile_event(
+    db, instance, version, key, schema, workflow, refs, record, snapshot,
+    agents, handoffs, actions, *, approval=None, autonomy_class=None,
+    original=None, extra_metadata=None,
+):
+    native = deepcopy(record["consumers"][instance.id]["consumer_decision"])
+    _validate_native(native, instance, workflow, agents, handoffs, actions)
+    transition = require_valid_transition(
+        workflow, current_state=instance.current_state, action=native["action"],
+        proposed_state=native["state_after"], proposed_risk=native["risk_level"],
+    )
+    receipt = record["receipt"]
+    if not isinstance(receipt, str) or not receipt.startswith("sandbox://"):
+        raise SandboxCoordinatorError("executed dispatch has no valid receipt")
+    request = native["integration"]
+    integration = IntegrationDecision(request["name"], request["phase"], "sandbox", True, True,
+                                      "receipt-only reconciliation")
+    return await _append(
+        db, instance, version, key, schema, workflow, list(dict.fromkeys([*refs, receipt])),
+        original or native, None,
+        event_type="terminal_outcome" if native["state_after"] in workflow.get("terminal_states", []) else "transition_completed",
+        result="executed_in_sandbox", risk=transition.risk_level,
+        action=native["action"], agent=native["agent_type"],
+        classification=snapshot["primary_classification"], state_after=native["state_after"],
+        approval=approval, integration=integration, category="reconciliation", error=None,
+        autonomy_class=autonomy_class,
+        metadata_extra={**metadata_for(record), "reconciled": True, **(extra_metadata or {})},
     )
