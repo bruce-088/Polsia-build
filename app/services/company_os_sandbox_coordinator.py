@@ -28,12 +28,20 @@ from app.agents.company_os_workflow import (
     validate_workflow_definition,
 )
 from app.config import settings
-from app.models.company_os_sandbox import CompanyOSSandboxEvent, CompanyOSWorkflowInstance
+from app.models.company_os_sandbox import (
+    CompanyOSSandboxApproval,
+    CompanyOSSandboxEvent,
+    CompanyOSWorkflowInstance,
+)
 from app.services.company_os_sandbox_service import append_sandbox_event
 
 
 class SyntheticAdapter(Protocol):
-    """A registered sandbox-only executor; it must never call production services."""
+    """A registered sandbox-only executor; it must never call production services.
+
+    A repeated idempotency key must return the same receipt without repeating
+    its synthetic side effect, even when the event transaction was rolled back.
+    """
 
     async def execute(self, decision: dict[str, Any], *, idempotency_key: str) -> str:
         """Return a nonempty synthetic evidence reference after execution."""
@@ -73,6 +81,10 @@ async def coordinate_sandbox_action(
         raise SandboxCoordinatorError("Stage 2 requires sandbox_mode")
     if not idempotency_key or not isinstance(synthetic_input, dict):
         raise SandboxCoordinatorError("idempotency_key and synthetic input are required")
+    try:
+        json.dumps(synthetic_input, allow_nan=False)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise SandboxCoordinatorError("synthetic input must be JSON compatible") from exc
     evidence_refs = synthetic_input.get("evidence_refs")
     if not isinstance(evidence_refs, list) or not evidence_refs or any(
         not isinstance(ref, str) or not ref.startswith("sandbox://") for ref in evidence_refs
@@ -229,7 +241,16 @@ async def coordinate_sandbox_action(
         if not isinstance(approval_id, str) or not approval_id:
             denial = ("approval", "pending approval requires a decision ID")
         else:
-            return await _append(
+            outstanding = await db.scalar(select(CompanyOSSandboxApproval.id).where(
+                CompanyOSSandboxApproval.workflow_instance_id == instance.id,
+                CompanyOSSandboxApproval.action == native["action"],
+                CompanyOSSandboxApproval.status.in_(("pending", "approved", "modified")),
+                CompanyOSSandboxApproval.resume_event_id.is_(None),
+            ))
+            if outstanding is not None:
+                denial = ("approval", "action already has an unresolved founder request")
+            else:
+                event = await _append(
                 db, instance, expected_version, idempotency_key, event_schema,
                 workflow, evidence_refs, native, native_failure,
                 event_type="approval_requested", result="escalated",
@@ -237,7 +258,19 @@ async def coordinate_sandbox_action(
                 classification="approval_queue", state_after=instance.current_state,
                 approval={"decision_id": approval_id, "status": "pending"},
                 integration=integration, category="approval", error=None,
-            )
+                metadata_extra={"workflow_version": instance.version},
+                )
+                db.add(CompanyOSSandboxApproval(
+                    sandbox_run_id=instance.sandbox_run_id,
+                    workflow_instance_id=instance.id,
+                    request_event_id=event.id,
+                    decision_id=approval_id,
+                    action=native["action"],
+                    input_snapshot=deepcopy(synthetic_input),
+                    status="pending",
+                ))
+                await db.flush()
+                return event
 
     if (denial is None and native is not None and native["integration"] is not None
         and native["integration"]["phase"] in {"read", "execute"}):
@@ -314,7 +347,8 @@ async def _append(
     *, event_type: str, result: str, risk: str, action: str, agent: str,
     classification: str, state_after: str | None,
     approval: dict[str, Any] | None, integration: Any, category: str,
-    error: str | None,
+    error: str | None, autonomy_class: str | None = None,
+    founder_minutes: float = 0, metadata_extra: dict[str, Any] | None = None,
 ) -> CompanyOSSandboxEvent:
     payload = {
         "schema_version": "0.1.0", "event_id": str(uuid4()),
@@ -330,8 +364,8 @@ async def _append(
                          "attempted_write": integration.phase == "execute", "target": "sandbox" if integration.phase == "execute" else "none"}
                         if integration and integration.mode not in {"unregistered", "live"} else None),
         "evidence_refs": refs,
-        "autonomy": {"class": "A1" if approval else "A0", "founder_minutes": 0},
-        "error": error, "metadata": {"gate": category},
+        "autonomy": {"class": autonomy_class or ("A1" if approval else "A0"), "founder_minutes": founder_minutes},
+        "error": error, "metadata": {"gate": category, **(metadata_extra or {})},
     }
     return await append_sandbox_event(
         db, workflow_instance_id=instance.id, expected_version=expected_version,

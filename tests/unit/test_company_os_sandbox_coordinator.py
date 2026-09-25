@@ -6,7 +6,13 @@ import pytest
 from jsonschema import Draft202012Validator
 from sqlalchemy import func, select
 
-from app.models.company_os_sandbox import CompanyOSSandboxEvent
+import app.services.company_os_sandbox_approval_service as approval_module
+from app.models.company_os_sandbox import CompanyOSSandboxApproval, CompanyOSSandboxEvent
+from app.services.company_os_sandbox_approval_service import (
+    SandboxApprovalError,
+    resolve_sandbox_approval,
+    resume_sandbox_approval,
+)
 from app.services.company_os_sandbox_coordinator import (
     SandboxCoordinatorError,
     coordinate_sandbox_action,
@@ -65,7 +71,7 @@ EVENT_SCHEMA = {
         "workflow_id": {"const": "prospect_to_meeting"},
         "entity_type": {"const": "prospect"},
         "entity_id": {"const": "p-1"},
-        "event_type": {"enum": ["decision_produced", "transition_completed", "approval_requested", "failure_detected"]},
+        "event_type": {"enum": ["decision_produced", "transition_completed", "approval_requested", "approval_resolved", "failure_detected", "terminal_outcome"]},
         "agent_type": {"enum": ["acquisition", "governance"]},
         "action": {"type": "string", "minLength": 1},
         "risk_level": {"enum": ["GREEN", "YELLOW", "RED"]},
@@ -73,10 +79,10 @@ EVENT_SCHEMA = {
         "state_after": {"type": ["string", "null"]},
         "result": {"enum": ["observed", "executed_in_sandbox", "escalated", "blocked", "failed"]},
         "external_side_effect": {"const": False},
-        "approval": {"oneOf": [{"type": "null"}, {"type": "object", "required": ["decision_id", "status"], "properties": {"decision_id": {"type": "string"}, "status": {"const": "pending"}}, "additionalProperties": False}]},
+        "approval": {"oneOf": [{"type": "null"}, {"type": "object", "required": ["decision_id", "status"], "properties": {"decision_id": {"type": "string"}, "status": {"enum": ["pending", "approved", "rejected", "modified", "needs_more_evidence", "expired", "cancelled"]}}, "additionalProperties": False}]},
         "integration": {"oneOf": [{"type": "null"}, {"type": "object", "required": ["name", "mode", "attempted_write", "target"], "properties": {"name": {"type": "string"}, "mode": {"enum": ["sandbox", "disabled", "documented", "read_only", "write_limited"]}, "attempted_write": {"type": "boolean"}, "target": {"enum": ["sandbox", "none"]}}, "additionalProperties": False}]},
         "evidence_refs": {"type": "array", "minItems": 1, "items": {"type": "string"}},
-        "autonomy": {"type": "object", "required": ["class", "founder_minutes"], "properties": {"class": {"enum": ["A0", "A1"]}, "founder_minutes": {"type": "number", "minimum": 0}}, "additionalProperties": False},
+        "autonomy": {"type": "object", "required": ["class", "founder_minutes"], "properties": {"class": {"enum": ["A0", "A1", "A2", "A3"]}, "founder_minutes": {"type": "number", "minimum": 0}}, "additionalProperties": False},
         "error": {"type": ["string", "null"]},
         "metadata": {"type": "object"},
     },
@@ -304,3 +310,280 @@ async def test_invalid_event_schema_rolls_back_state_change(async_db_session):
         await invoke(async_db_session, instance, native(), schema=schema)
     assert (instance.current_state, instance.version) == ("research", 0)
     assert await async_db_session.scalar(select(func.count()).select_from(CompanyOSSandboxEvent).where(CompanyOSSandboxEvent.sandbox_run_id == run.id)) == 0
+
+
+async def pending_approval(db, *, initial_state="scored", total=20, workflow=WORKFLOW):
+    _, instance = await setup(db, initial_state=initial_state)
+    adapter = Adapter()
+    output = native(
+        action="send_outreach", state="sent", risk="YELLOW",
+        integration={"name": "sandbox_mail", "phase": "execute", "use": "send_outreach"},
+        limit_name="max_discount_percent", requested_total=total,
+    )
+    requested = await invoke(db, instance, output, adapter=adapter, workflow=workflow)
+    approval = await db.scalar(select(CompanyOSSandboxApproval).where(
+        CompanyOSSandboxApproval.request_event_id == requested.id,
+    ))
+    assert requested.payload["event_type"] == "approval_requested"
+    assert approval.status == "pending" and adapter.calls == 0
+    return instance, output, approval, adapter
+
+
+async def resolve(db, approval, status="approved", **kwargs):
+    return await resolve_sandbox_approval(
+        db, approval_id=approval.id, status=status, founder_id="founder-1",
+        founder_minutes=2.5, resolution_key="resolve-1", event_schema=EVENT_SCHEMA,
+        workflow=WORKFLOW, **kwargs,
+    )
+
+
+async def resume(db, approval, adapter=None, **kwargs):
+    return await resume_sandbox_approval(
+        db, approval_id=approval.id, workflow=kwargs.pop("workflow", WORKFLOW),
+        policy=kwargs.pop("policy", POLICY), integration_registry=kwargs.pop("registry", REGISTRY),
+        event_schema=EVENT_SCHEMA, canonical_agents=["acquisition", "governance"],
+        canonical_handoffs=["governance"], canonical_actions=[
+            "score_against_icp", "send_outreach", "pricing_change", "bypass_opt_out",
+        ], synthetic_adapters={"sandbox_mail": adapter} if adapter else {},
+        retry=kwargs.pop("retry", False),
+    )
+
+
+@pytest.mark.asyncio
+async def test_approved_resolution_resumes_once_and_preserves_native_decision(async_db_session):
+    instance, original, approval, adapter = await pending_approval(async_db_session)
+    resolution = await resolve(async_db_session, approval)
+    assert resolution.payload["autonomy"] == {"class": "A1", "founder_minutes": 2.5}
+    assert resolution.payload["metadata"]["founder_id"] == "founder-1"
+    assert resolution.native_decision == original
+    assert await resolve(async_db_session, approval) is resolution
+    resumed = await resume(async_db_session, approval, adapter)
+    assert resumed.payload["approval"] == {"decision_id": "APR-1", "status": "approved"}
+    assert resumed.native_decision == original
+    assert resumed.payload["event_type"] == "transition_completed"
+    assert (instance.current_state, instance.version, adapter.calls) == ("sent", 1, 1)
+    assert await resume(async_db_session, approval, adapter) is resumed
+    assert adapter.calls == 1
+    Draft202012Validator(EVENT_SCHEMA).validate(export_sandbox_event(resumed))
+
+
+@pytest.mark.asyncio
+async def test_approved_but_not_resumed_action_cannot_request_approval_again(async_db_session):
+    instance, original, approval, adapter = await pending_approval(async_db_session)
+    await resolve(async_db_session, approval)
+    duplicate = await invoke(async_db_session, instance, original, adapter=adapter, key="second-delivery")
+    assert duplicate.payload["event_type"] == "failure_detected"
+    assert duplicate.payload["result"] == "blocked"
+    assert duplicate.payload["metadata"]["gate"] == "approval"
+    assert duplicate.native_decision == original
+    assert adapter.calls == 0
+    assert await async_db_session.scalar(select(func.count()).select_from(CompanyOSSandboxApproval)) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["rejected", "needs_more_evidence", "expired", "cancelled"])
+async def test_non_executable_resolutions_never_resume(async_db_session, status):
+    instance, _, approval, adapter = await pending_approval(async_db_session)
+    event = await resolve(async_db_session, approval, status)
+    assert event.payload["approval"]["status"] == status
+    assert event.payload["result"] == "blocked"
+    with pytest.raises(SandboxApprovalError, match="does not permit execution"):
+        await resume(async_db_session, approval, adapter)
+    assert adapter.calls == 0 and instance.current_state == "scored"
+    with pytest.raises(SandboxApprovalError, match="only pending"):
+        await resolve_sandbox_approval(
+            async_db_session, approval_id=approval.id, status="approved",
+            founder_id="founder-2", founder_minutes=1,
+            resolution_key="different", event_schema=EVENT_SCHEMA, workflow=WORKFLOW,
+        )
+
+
+@pytest.mark.asyncio
+async def test_founder_correction_is_separate_from_original_and_rechecked(async_db_session):
+    instance, original, approval, adapter = await pending_approval(async_db_session)
+    corrected = deepcopy(original)
+    corrected["policy_intent"]["requested_total"] = 5
+    resolution = await resolve(async_db_session, approval, "modified", corrected_decision=corrected)
+    assert resolution.native_decision == original
+    assert resolution.payload["autonomy"]["class"] == "A2"
+    assert resolution.payload["metadata"]["corrected_decision"] == corrected
+    resumed = await resume(async_db_session, approval, adapter)
+    assert resumed.native_decision == original
+    assert resumed.payload["metadata"]["founder_corrected_decision"] == corrected
+    assert resumed.payload["autonomy"]["class"] == "A2"
+    assert adapter.calls == 1 and instance.current_state == "sent"
+
+
+@pytest.mark.asyncio
+async def test_modified_hard_deny_cannot_be_founder_overridden(async_db_session):
+    instance, original, approval, adapter = await pending_approval(async_db_session)
+    corrected = native(action="bypass_opt_out", state="scored", risk="GREEN")
+    await resolve(async_db_session, approval, "modified", corrected_decision=corrected)
+    failure = await resume(async_db_session, approval, adapter)
+    assert failure.payload["event_type"] == "failure_detected"
+    assert failure.native_decision == original
+    assert failure.payload["result"] == "blocked"
+    assert instance.current_state == "scored" and adapter.calls == 0
+    assert await resume(async_db_session, approval, adapter) is failure
+
+
+@pytest.mark.asyncio
+async def test_timed_out_adapter_retries_with_same_key_without_second_effect(async_db_session):
+    instance, original, approval, _ = await pending_approval(async_db_session)
+    await resolve(async_db_session, approval)
+
+    class TimeoutAfterSyntheticEffect:
+        def __init__(self):
+            self.keys = []
+            self.effects = set()
+
+        async def execute(self, decision, *, idempotency_key):
+            self.keys.append(idempotency_key)
+            if idempotency_key not in self.effects:
+                self.effects.add(idempotency_key)
+                raise TimeoutError("receipt lost after synthetic effect")
+            return "sandbox://mail/stable-receipt"
+
+    adapter = TimeoutAfterSyntheticEffect()
+    failure = await resume(async_db_session, approval, adapter)
+    assert failure.payload["event_type"] == "failure_detected"
+    assert failure.native_decision == original
+    assert instance.current_state == "scored"
+    assert await resume(async_db_session, approval, adapter) is failure
+    assert len(adapter.keys) == 1
+
+    recovered = await resume(async_db_session, approval, adapter, retry=True)
+    assert recovered.payload["event_type"] == "transition_completed"
+    assert recovered.native_decision == original
+    assert instance.current_state == "sent"
+    assert adapter.keys == [f"stage2-approval-resume:{approval.id}"] * 2
+    assert len(adapter.effects) == 1
+    assert approval.failure_attempt_count == 1
+    assert await resume(async_db_session, approval, adapter) is recovered
+
+
+@pytest.mark.asyncio
+async def test_manual_execution_is_explicit_a3_with_synthetic_evidence(async_db_session):
+    _, original, approval, adapter = await pending_approval(async_db_session)
+    await resolve(async_db_session, approval, manual_evidence_ref="sandbox://founder/manual-1")
+    event = await resume(async_db_session, approval, adapter)
+    assert event.payload["autonomy"]["class"] == "A3"
+    assert "sandbox://founder/manual-1" in event.payload["evidence_refs"]
+    assert event.native_decision == original
+    assert adapter.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_approval_cannot_resume_on_stale_workflow(async_db_session):
+    instance, _, approval, adapter = await pending_approval(async_db_session)
+    await resolve(async_db_session, approval)
+    instance.version += 1
+    with pytest.raises(SandboxApprovalError, match="workflow changed"):
+        await resume(async_db_session, approval, adapter)
+    assert adapter.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_resume_rechecks_registry_after_founder_approval(async_db_session):
+    instance, original, approval, adapter = await pending_approval(async_db_session)
+    await resolve(async_db_session, approval)
+    registry = deepcopy(REGISTRY)
+    registry["integrations"]["sandbox_mail"]["mode"] = "live"
+    failure = await resume(async_db_session, approval, adapter, registry=registry)
+    assert failure.payload["result"] == "blocked"
+    assert failure.native_decision == original
+    assert adapter.calls == 0 and instance.current_state == "scored"
+
+
+@pytest.mark.asyncio
+async def test_modified_claimed_authority_does_not_replace_input_evidence(async_db_session):
+    instance, original, approval, adapter = await pending_approval(async_db_session)
+    corrected = deepcopy(original)
+    corrected["policy_intent"].update(
+        requested_total=5, requires_authority=True, authority_verified=True,
+    )
+    await resolve(async_db_session, approval, "modified", corrected_decision=corrected)
+    failure = await resume(async_db_session, approval, adapter)
+    assert failure.payload["result"] == "blocked"
+    assert failure.native_decision == original
+    assert adapter.calls == 0 and instance.current_state == "scored"
+
+
+@pytest.mark.asyncio
+async def test_founder_identity_minutes_and_correction_are_required(async_db_session):
+    _, _, approval, _ = await pending_approval(async_db_session)
+    with pytest.raises(SandboxApprovalError, match="founder minutes"):
+        await resolve_sandbox_approval(
+            async_db_session, approval_id=approval.id, status="approved",
+            founder_id="founder-1", founder_minutes=float("nan"),
+            resolution_key="invalid", event_schema=EVENT_SCHEMA, workflow=WORKFLOW,
+        )
+    with pytest.raises(SandboxApprovalError, match="modified status"):
+        await resolve(async_db_session, approval, "modified")
+    assert approval.status == "pending"
+
+
+@pytest.mark.asyncio
+async def test_terminal_action_emits_once_and_blocks_second_transition(async_db_session):
+    workflow = deepcopy(WORKFLOW)
+    workflow["terminal_states"] = ["sent"]
+    instance, _, approval, adapter = await pending_approval(async_db_session, workflow=workflow)
+    await resolve_sandbox_approval(
+        async_db_session, approval_id=approval.id, status="approved", founder_id="founder-1",
+        founder_minutes=2.5, resolution_key="resolve-1", event_schema=EVENT_SCHEMA, workflow=workflow,
+    )
+    event = await resume(async_db_session, approval, adapter, workflow=workflow)
+    assert event.payload["event_type"] == "terminal_outcome"
+    assert instance.terminal and instance.current_state == "sent"
+    assert await resume(async_db_session, approval, adapter, workflow=workflow) is event
+    assert adapter.calls == 1
+    assert await async_db_session.scalar(select(func.count()).select_from(CompanyOSSandboxEvent).where(
+        CompanyOSSandboxEvent.event_type == "terminal_outcome",
+    )) == 1
+
+
+@pytest.mark.asyncio
+async def test_db_rollback_retry_uses_stable_synthetic_idempotency_key(async_db_session, monkeypatch):
+    workflow = deepcopy(WORKFLOW)
+    workflow["terminal_states"] = ["sent"]
+    instance, _, approval, _ = await pending_approval(async_db_session, workflow=workflow)
+    await resolve_sandbox_approval(
+        async_db_session, approval_id=approval.id, status="approved", founder_id="founder-1",
+        founder_minutes=2.5, resolution_key="resolve-1", event_schema=EVENT_SCHEMA, workflow=workflow,
+    )
+    approval_id = approval.id
+    instance_id = instance.id
+    await async_db_session.commit()
+
+    class IdempotentAdapter:
+        def __init__(self):
+            self.keys = []
+            self.effects = set()
+
+        async def execute(self, decision, *, idempotency_key):
+            self.keys.append(idempotency_key)
+            self.effects.add(idempotency_key)
+            return "sandbox://mail/stable-receipt"
+
+    adapter = IdempotentAdapter()
+    original_append = approval_module._append
+
+    async def fail_after_append(*args, **kwargs):
+        await original_append(*args, **kwargs)
+        raise SandboxPersistenceError("simulated database failure after adapter execution")
+
+    monkeypatch.setattr(approval_module, "_append", fail_after_append)
+    with pytest.raises(SandboxPersistenceError, match="simulated database failure"):
+        await resume(async_db_session, approval, adapter, workflow=workflow)
+    await async_db_session.rollback()
+    monkeypatch.setattr(approval_module, "_append", original_append)
+
+    approval = await async_db_session.get(CompanyOSSandboxApproval, approval_id)
+    event = await resume(async_db_session, approval, adapter, workflow=workflow)
+    assert event.payload["event_type"] == "terminal_outcome"
+    assert len(adapter.keys) == 2 and len(adapter.effects) == 1
+    assert adapter.keys[0] == adapter.keys[1] == f"stage2-approval-resume:{approval_id}"
+    assert await async_db_session.scalar(select(func.count()).select_from(CompanyOSSandboxEvent).where(
+        CompanyOSSandboxEvent.event_type == "terminal_outcome",
+    )) == 1
+    assert (await async_db_session.get(type(instance), instance_id)).terminal

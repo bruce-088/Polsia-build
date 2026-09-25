@@ -8,10 +8,12 @@ from sqlalchemy import (
     CheckConstraint,
     DateTime,
     ForeignKey,
+    Index,
     Integer,
     String,
     UniqueConstraint,
     func,
+    text,
 )
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -124,3 +126,44 @@ class CompanyOSSandboxEvent(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
+
+
+class CompanyOSSandboxApproval(Base):
+    """One founder decision bound to an immutable request event and workflow."""
+
+    __tablename__ = "company_os_sandbox_approvals"
+    __table_args__ = (
+        Index(
+            "uq_company_os_sandbox_approval_open_action",
+            "workflow_instance_id", "action", unique=True,
+            postgresql_where=text("resume_event_id IS NULL AND status IN ('pending', 'approved', 'modified')"),
+            sqlite_where=text("resume_event_id IS NULL AND status IN ('pending', 'approved', 'modified')"),
+        ),
+        UniqueConstraint("sandbox_run_id", "decision_id", name="uq_company_os_sandbox_approval_decision"),
+        UniqueConstraint("request_event_id", name="uq_company_os_sandbox_approval_request_event"),
+        UniqueConstraint("resolution_event_id", name="uq_company_os_sandbox_approval_resolution_event"),
+        UniqueConstraint("resume_event_id", name="uq_company_os_sandbox_approval_resume_event"),
+        CheckConstraint("founder_minutes IS NULL OR founder_minutes >= 0", name="ck_company_os_sandbox_approval_minutes"),
+        CheckConstraint("failure_attempt_count >= 0", name="ck_company_os_sandbox_approval_failure_count"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    sandbox_run_id: Mapped[int] = mapped_column(Integer, ForeignKey("company_os_sandbox_runs.id", ondelete="CASCADE"), nullable=False)
+    workflow_instance_id: Mapped[int] = mapped_column(Integer, ForeignKey("company_os_workflow_instances.id", ondelete="CASCADE"), nullable=False)
+    request_event_id: Mapped[int] = mapped_column(Integer, ForeignKey("company_os_sandbox_events.id"), nullable=False)
+    decision_id: Mapped[str] = mapped_column(String(160), nullable=False)
+    action: Mapped[str] = mapped_column(String(160), nullable=False)
+    input_snapshot: Mapped[dict] = mapped_column(JSON(), nullable=False)
+    status: Mapped[str] = mapped_column(String(50), nullable=False, default="pending")
+    founder_id: Mapped[str | None] = mapped_column(String(160))
+    founder_minutes: Mapped[float | None] = mapped_column()
+    autonomy_class: Mapped[str | None] = mapped_column(String(2))
+    corrected_decision: Mapped[dict | None] = mapped_column(JSON(none_as_null=True))
+    manual_evidence_ref: Mapped[str | None] = mapped_column(String(512))
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    resolution_event_id: Mapped[int | None] = mapped_column(Integer, ForeignKey("company_os_sandbox_events.id"))
+    resolution_key: Mapped[str | None] = mapped_column(String(255))
+    resume_event_id: Mapped[int | None] = mapped_column(Integer, ForeignKey("company_os_sandbox_events.id"))
+    resume_key: Mapped[str | None] = mapped_column(String(255))
+    last_failure_event_id: Mapped[int | None] = mapped_column(Integer, ForeignKey("company_os_sandbox_events.id"))
+    failure_attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
