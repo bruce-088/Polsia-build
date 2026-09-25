@@ -53,6 +53,10 @@ git diff --name-only <base> | grep '\.py$' | xargs .venv/bin/ruff check   # lint
 
 `tests/fixtures/company_os/acqivo/` holds byte-for-byte copies from `acqivo-company-os`; `MANIFEST.json` pins the source commit and SHA-256 per file, and a test checks them. To update: `git -C <acqivo checkout> show <commit>:<path>` for each file, then update `source_commit` and hashes. Never edit vendored files by hand, and never patch canonical inputs inside tests.
 
+## Claude ↔ Codex loop roles
+
+When Claude and Codex work together on this repo (claudex-loop), the provider with more usage headroom builds and the other only reviews the plan and inspects the final code. Reviews use the lighter models (Codex `gpt-6-sol`, Claude Sonnet 5); ask before using Astra or Opus. Cap plan review at about 3 rounds, keep work orders short and file-scoped, and never spend paid credits without the founder's approval. A provider never counts as the independent reviewer of code it wrote.
+
 ## Never
 
 - Call production services or real providers in Stage 2 code or tests.
