@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -32,6 +33,8 @@ class SyntheticWorld:
 
     run_id: str
     frozen_at: datetime
+    input_cases: dict[str, dict[str, Any]] = field(default_factory=dict)
+    action_failures: dict[tuple[str, str, str], bool] = field(default_factory=dict)
     contacts: dict[str, dict[str, Any]] = field(default_factory=dict)
     customers: dict[str, dict[str, Any]] = field(default_factory=dict)
     leads: dict[str, dict[str, Any]] = field(default_factory=dict)
@@ -120,6 +123,7 @@ class SyntheticWorld:
         origin_state_before: str, origin_workflow_version: int,
         frozen_native_decision: dict[str, Any], rendered_payload: dict[str, Any],
         consumers: dict[int, dict[str, Any]],
+        origin_workflow_id: str | None = None, origin_entity_id: str | None = None,
     ) -> dict[str, Any]:
         """Snapshot execution evidence; callers validate each consumer's decision.
 
@@ -132,6 +136,7 @@ class SyntheticWorld:
             "recipient_id": recipient_id, "adapter_kind": adapter_kind,
             "adapter_idempotency_key": adapter_idempotency_key,
             "origin_workflow_instance_id": origin_workflow_instance_id,
+            "origin_workflow_id": origin_workflow_id, "origin_entity_id": origin_entity_id,
             "origin_state_before": origin_state_before,
             "origin_workflow_version": origin_workflow_version,
             "frozen_native_decision": frozen_native_decision,
@@ -164,21 +169,42 @@ class SyntheticWorld:
         opt_out = channel == "opt_out" or (channel in {"reply", "mail"} and (
             facts.get("opt_out") is True or facts.get("unsubscribe") is True
             or facts.get("unsubscribe_marker") is True
-            or str(facts.get("body", "")).strip().lower() in {"stop", "unsubscribe"}))
+            or has_opt_out_phrase(facts.get("body", ""))
+            or has_opt_out_phrase(facts.get("text", ""))))
         if not isinstance(entity_id, str) or not entity_id:
             if not opt_out:
                 raise SyntheticCapabilityError("inbound entity ID required")
             entity_id = normalize_address(facts.get("address") or facts.get("number") or facts.get("phone"))
         if channel == "queued_message":
             if (not all(isinstance(facts.get(k), str) and facts[k] for k in
-                        ("item_id", "recipient_id", "original_action", "original_adapter_key"))
+                        ("item_id", "recipient_id", "original_action"))
                     or facts["recipient_id"] not in self.contacts):
                 raise SyntheticCapabilityError("evidence_missing_or_scope_unknown")
             if entity_id in self.queue or any(item["item_id"] == facts["item_id"] for item in self.queue.values()):
                 raise SyntheticCapabilityError("queue item already bound")
-            self.queue[entity_id] = {k: deepcopy(facts[k]) for k in
-                                     ("item_id", "recipient_id", "original_action", "original_adapter_key")}
+            if "original_adapter_key" in facts and not (
+                isinstance(facts["original_adapter_key"], str) and facts["original_adapter_key"]
+            ):
+                raise SyntheticCapabilityError("invalid original adapter key")
+            matches = [r for r in self.dispatches.values()
+                       if r["status"] != "blocked"
+                       and facts.get("origin_workflow_id") is not None
+                       and facts.get("origin_entity_id") is not None
+                       and r.get("origin_workflow_id") == facts["origin_workflow_id"]
+                       and r.get("origin_entity_id") == facts["origin_entity_id"]
+                       and r["frozen_native_decision"]["action"] == facts["original_action"]]
+            if len(matches) > 1 or (matches and matches[0]["recipient_id"] != facts["recipient_id"]):
+                raise SyntheticCapabilityError("ambiguous or contradictory originating dispatch")
+            self.queue[entity_id] = deepcopy(facts)
+            # Before dispatch no provider key exists; the runtime records the actual key.
+            self.queue[entity_id].setdefault("original_adapter_key", None)
             self.queue[entity_id].update(status="queued", receipt=None, captured_at=self.frozen_at.isoformat())
+            if matches:
+                record = matches[0]
+                self.queue[entity_id].update(
+                    dispatch_id=record["dispatch_id"], original_adapter_key=record["adapter_idempotency_key"],
+                    status="sent" if record["status"] == "executed" else "queued", receipt=record["receipt"],
+                )
         elif channel == "contact":
             self.set_contact(entity_id, facts)
         elif channel == "authority":
@@ -206,6 +232,15 @@ class SyntheticWorld:
         self._guard()
         target = (adapter, idempotency_key)
         (self._after_effect_once if after_effect else self._fail_once).add(target)
+
+    def arm_action_failure(self, workflow_id: str, entity_id: str, action: str,
+                           adapter_kind: str, adapter_key: str) -> None:
+        """Resolve a fixture's action identity only after the runtime derives its key."""
+        self._guard()
+        identity = (workflow_id, entity_id, action)
+        if identity in self.action_failures:
+            self.inject_failure(adapter_kind, adapter_key,
+                                after_effect=self.action_failures.pop(identity))
 
 
 class SyntheticAdapter:
@@ -286,11 +321,12 @@ class SyntheticAdapter:
             "external_side_effect": False,
         }
         for record in self.world.dispatches.values():
-            if (record["adapter_kind"] == self.kind and record["recipient_id"] == recipient_id
+            if (record["status"] == "prepared"
+                    and record["adapter_kind"] == self.kind and record["recipient_id"] == recipient_id
                     and record["adapter_idempotency_key"] == idempotency_key):
                 record.update(status="executed", receipt=receipt)
                 for item in self.world.queue.values():
-                    if item["item_id"] == record["message_key"]:
+                    if item.get("dispatch_id") == record["dispatch_id"] or item["item_id"] == record["message_key"]:
                         item.update(status="sent", receipt=receipt, original_adapter_key=idempotency_key)
         if slot in self.world._after_effect_once:
             self.world._after_effect_once.remove(slot)
@@ -308,3 +344,11 @@ def _fingerprint(value: dict[str, Any]) -> str:
 
 def normalize_address(value: Any) -> str:
     return value.strip().lower() if isinstance(value, str) else ""
+
+
+def has_opt_out_phrase(value: Any) -> bool:
+    """Match refusal tokens and embedded phrases without punctuation or case sensitivity."""
+    if not isinstance(value, str):
+        return False
+    words = " ".join(re.findall(r"[^\W_]+", value.casefold()))
+    return re.search(r"\b(?:stop|unsubscribe|opt out|optout|remove me|cancel)\b", words) is not None

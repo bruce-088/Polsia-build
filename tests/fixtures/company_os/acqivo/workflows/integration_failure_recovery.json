@@ -1,0 +1,93 @@
+{
+  "id": "integration_failure_recovery",
+  "version": "0.2.2",
+  "purpose": "Stop safely, preserve work, and expose provider failures without inventing success or switching to an unapproved integration.",
+  "entity_type": "integration_operation",
+  "owner_agent": "orchestrator",
+  "states": [
+    "attempting",
+    "retry_wait",
+    "blocked",
+    "recovery_review",
+    "ready_to_resume",
+    "completed",
+    "cancelled"
+  ],
+  "terminal_states": [
+    "completed",
+    "cancelled"
+  ],
+  "transitions": [
+    {
+      "from": "attempting",
+      "to": "retry_wait",
+      "action": "retry_within_safe_limit",
+      "risk_level": "GREEN",
+      "requirements": [
+        "retry policy permits another attempt",
+        "idempotency is preserved"
+      ]
+    },
+    {
+      "from": "attempting",
+      "to": "blocked",
+      "action": "stop_retries_after_safe_limit_log_failure_and_preserve_queue",
+      "risk_level": "GREEN",
+      "requirements": [
+        "safe retry limit reached or repeated provider errors",
+        "unsent records remain durable"
+      ]
+    },
+    {
+      "from": "retry_wait",
+      "to": "blocked",
+      "action": "stop_retries_after_safe_limit_log_failure_and_preserve_queue",
+      "risk_level": "GREEN",
+      "requirements": [
+        "provider errors continue",
+        "unsent records remain durable"
+      ]
+    },
+    {
+      "from": "blocked",
+      "to": "recovery_review",
+      "action": "review_provider_recovery",
+      "risk_level": "GREEN"
+    },
+    {
+      "from": "recovery_review",
+      "to": "ready_to_resume",
+      "action": "approve_resume_on_same_verified_provider",
+      "risk_level": "YELLOW",
+      "requirements": [
+        "provider health verified",
+        "original approval remains valid",
+        "queue integrity verified"
+      ]
+    },
+    {
+      "from": "ready_to_resume",
+      "to": "completed",
+      "action": "resume_preserved_queue_within_original_approval",
+      "risk_level": "YELLOW",
+      "requirements": [
+        "verified writable integration",
+        "no scope expansion"
+      ],
+      "integration": "sendgrid"
+    },
+    {
+      "from": "blocked",
+      "to": "cancelled",
+      "action": "cancel_and_preserve_audit_record",
+      "risk_level": "GREEN"
+    }
+  ],
+  "invariants": [
+    "Never claim an external write succeeded without provider evidence.",
+    "Never switch to an unapproved provider.",
+    "Never discard unsent records silently.",
+    "Retries must be bounded and idempotent.",
+    "A recovery action may not expand the scope of the original approval."
+  ]
+}

@@ -16,6 +16,7 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.agents.company_os_compliance import is_email_execute, is_email_integration
 from app.agents.company_os_integration import (
     CompanyOSIntegrationError,
     evaluate_integration_capability,
@@ -38,17 +39,21 @@ from app.services.company_os_sandbox_coordinator import (
     SyntheticAdapter,
     _append,
     _compliance_event,
-    _orphan_event,
     _reconcile_event,
+    _review_event,
     _validate_native,
 )
 from app.services.company_os_sandbox_dispatch import (
     DispatchBlocked,
-    DispatchReviewRequired,
+    RecipientReviewBlocked,
     execute_dispatch,
     find_dispatch,
+    refusal_evidence,
 )
-from app.services.company_os_synthetic_adapters import SyntheticCapabilityError
+from app.services.company_os_synthetic_adapters import (
+    SyntheticCapabilityError,
+    SyntheticComplianceBlock,
+)
 
 STATUSES = {
     "approved", "rejected", "modified", "needs_more_evidence", "expired", "cancelled",
@@ -188,18 +193,51 @@ async def resume_sandbox_approval(
 
     original = request.native_decision
     effective = approval.corrected_decision if approval.status == "modified" else original
+    email_execute = is_email_execute(effective.get("integration"), integration_registry)
+    if approval.manual_evidence_ref is not None and email_execute:
+        raise SandboxApprovalError("manual evidence is not permitted for email execute")
     snapshot = approval.input_snapshot
     resume_key = f"stage2-approval-resume:{approval.id}"
     dispatch_metadata = {}
     compliance_evidence = None
-    try:
-        pending = await find_dispatch(db, instance, synthetic_adapters, approval_id=approval.id)
-    except DispatchReviewRequired as exc:
-        return await _orphan_event(
-            db, instance, instance.version, f"{resume_key}:orphan", event_schema,
-            workflow, request.payload["evidence_refs"], exc,
+    async def _record_review(reason):
+        event = await _review_event(
+            db, instance, instance.version, f"{resume_key}:failure:{approval.failure_attempt_count + 1}",
+            event_schema, workflow, request.payload["evidence_refs"], reason, native=original,
+            agent=request.payload["agent_type"],
+            approval={"decision_id": approval.decision_id, "status": approval.status},
+            autonomy_class=approval.autonomy_class,
+            metadata={"approval_id": approval.id, "attempt": approval.failure_attempt_count + 1},
         )
+        approval.last_failure_event_id = event.id
+        approval.failure_attempt_count += 1
+        await db.flush()
+        return event
+
+    try:
+        pending = await find_dispatch(db, instance, synthetic_adapters, approval_id=approval.id, snapshot=snapshot, registry=integration_registry)
+    except DispatchBlocked as exc:
+        event = await _compliance_event(
+            db, instance, instance.version, f"{resume_key}:failure:{approval.failure_attempt_count + 1}",
+            event_schema, workflow, request.payload["evidence_refs"], original, snapshot, None,
+            exc.result.evidence, exc.metadata,
+            override={"decision_id": approval.decision_id, "status": approval.status},
+        )
+        approval.last_failure_event_id = event.id
+        approval.failure_attempt_count += 1
+        await db.flush()
+        return event
+    except SyntheticCapabilityError as exc:
+        return await _record_review(str(exc))
     if pending:
+        frozen = pending[1]["consumers"][instance.id]["consumer_decision"]
+        frozen_integration = frozen.get("integration") or {}
+        approved_integration = effective.get("integration") or {}
+        if (any(frozen.get(k) != effective.get(k) for k in ("action", "state_after"))
+                or not isinstance(approved_integration, dict)
+                or any(frozen_integration.get(k) != approved_integration.get(k) for k in ("name", "phase", "use"))):
+            pending[0].world.review_blocked_recipients.add(pending[1]["recipient_id"])
+            return await _record_review("unfinished dispatch differs from approved action; recipient requires review")
         effective = deepcopy(pending[1]["consumers"][instance.id]["consumer_decision"])
         if pending[1]["status"] == "executed":
             event = await _reconcile_event(
@@ -220,6 +258,7 @@ async def resume_sandbox_approval(
     transition = None
     integration = None
     reason: str | None = None
+    failure_category = "approval_resume"
     try:
         _validate_native(effective, instance, workflow, canonical_agents, canonical_handoffs, canonical_actions)
         if effective["state_after"] != instance.current_state:
@@ -269,30 +308,41 @@ async def resume_sandbox_approval(
         try:
             if adapter is None:
                 raise SyntheticCapabilityError("registered synthetic adapter is missing")
-            if request_integration["phase"] == "execute":
+            if email_execute:
                 receipt, compliance_evidence = await execute_dispatch(
                     db, instance, effective, snapshot, integration_registry, adapter,
                     dispatch_metadata, existing=pending[1] if pending else None,
-                    approval_id=approval.id, manual_receipt=approval.manual_evidence_ref,
+                    approval_id=approval.id,
                 )
+            elif is_email_integration(request_integration, integration_registry):
+                raise SyntheticCapabilityError("email integration permits only a governed execute")
+            elif request_integration["phase"] == "execute":
+                raise RecipientReviewBlocked("non-email execute blocked: durable dispatch ledger is required")
             elif approval.manual_evidence_ref is None:
                 run = await db.get(CompanyOSSandboxRun, instance.sandbox_run_id)
+                dispatch_metadata.update(recipient_id=instance.entity_id, dispatch_attempted=True)
                 receipt = await adapter.execute(
                     deepcopy(effective), idempotency_key=resume_key,
                     run_id=run.run_id, recipient_id=instance.entity_id,
                 )
                 if not isinstance(receipt, str) or not receipt.startswith("sandbox://"):
                     raise SyntheticCapabilityError("synthetic adapter did not return sandbox evidence")
-        except DispatchBlocked as exc:
+        except SyntheticComplianceBlock as exc:
+            evidence = (exc.result.evidence if isinstance(exc, DispatchBlocked) else
+                        refusal_evidence(adapter, instance, effective, integration_registry, dispatch_metadata))
             event = await _compliance_event(
                 db, instance, instance.version, f"{resume_key}:failure:{approval.failure_attempt_count + 1}",
                 event_schema, workflow, request.payload["evidence_refs"], original,
-                snapshot, integration, exc.result.evidence, dispatch_metadata, override=True,
+                snapshot, integration, evidence, dispatch_metadata,
+                override={"decision_id": approval.decision_id, "status": approval.status},
             )
             approval.last_failure_event_id = event.id
             approval.failure_attempt_count += 1
             await db.flush()
             return event
+        except RecipientReviewBlocked as exc:
+            failure_category = "dispatch_review" if "orphan" in str(exc) else "unsupported_execute"
+            reason = str(exc)
         except SyntheticCapabilityError as exc:
             reason = f"synthetic adapter failed: {type(exc).__name__}: {exc}"
 
@@ -306,7 +356,7 @@ async def resume_sandbox_approval(
             action=approval.action, agent=request.payload["agent_type"],
             classification="failure_recovery", state_after=instance.current_state,
             approval={"decision_id": approval.decision_id, "status": approval.status},
-            integration=integration, category="approval_resume", error=reason,
+            integration=integration, category=failure_category, error=reason,
             autonomy_class=approval.autonomy_class, founder_minutes=0,
             metadata_extra={**dispatch_metadata, "approval_id": approval.id, "attempt": approval.failure_attempt_count + 1},
         )

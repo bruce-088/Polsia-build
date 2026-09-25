@@ -16,7 +16,7 @@ from uuid import uuid4
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.agents.company_os_compliance import EMAIL_USES
+from app.agents.company_os_compliance import EMAIL_USES, is_email_execute, is_email_integration
 from app.agents.company_os_integration import (
     CompanyOSIntegrationError,
     IntegrationDecision,
@@ -38,13 +38,17 @@ from app.models.company_os_sandbox import (
 )
 from app.services.company_os_sandbox_dispatch import (
     DispatchBlocked,
-    DispatchReviewRequired,
+    RecipientReviewBlocked,
     execute_dispatch,
     find_dispatch,
     metadata_for,
+    refusal_evidence,
 )
 from app.services.company_os_sandbox_service import append_sandbox_event
-from app.services.company_os_synthetic_adapters import SyntheticCapabilityError
+from app.services.company_os_synthetic_adapters import (
+    SyntheticCapabilityError,
+    SyntheticComplianceBlock,
+)
 
 
 class SyntheticAdapter(Protocol):
@@ -140,13 +144,19 @@ async def coordinate_sandbox_action(
     dispatch_metadata = {}
     compliance_evidence = None
     try:
-        pending = await find_dispatch(db, instance, synthetic_adapters)
-    except DispatchReviewRequired as exc:
-        return await _orphan_event(
+        pending = await find_dispatch(db, instance, synthetic_adapters, snapshot=synthetic_input, registry=integration_registry)
+    except DispatchBlocked as exc:
+        return await _compliance_event(
             db, instance, expected_version, idempotency_key, event_schema, workflow,
-            evidence_refs, exc,
+            evidence_refs, exc.native, synthetic_input, None, exc.result.evidence, exc.metadata,
         )
-    if pending and pending[1]["status"] == "executed":
+    except SyntheticCapabilityError as exc:
+        return await _review_event(
+            db, instance, expected_version, idempotency_key, event_schema, workflow,
+            evidence_refs, str(exc), agent=canonical_agents[0],
+        )
+    awaiting_resume = bool(pending) and await _awaiting_resume(db, instance, pending[1])
+    if pending and pending[1]["status"] == "executed" and not awaiting_resume:
         return await _reconcile_event(
             db, instance, expected_version, idempotency_key, event_schema, workflow,
             evidence_refs, pending[1], synthetic_input, canonical_agents,
@@ -264,6 +274,10 @@ async def coordinate_sandbox_action(
             ):
                 denial = ("integration", "write requires registered sandbox execution")
 
+    if (denial is None and native is not None and isinstance(native.get("action"), str)
+            and await _has_unresumed_approval(db, instance, native["action"])):
+        denial = ("approval", "approved action requires approval resume; direct execution rejected")
+
     if denial is None and decision is not None and decision.disposition == "requires_founder":
         approval_id = synthetic_input.get("approval_decision_id")
         if not isinstance(approval_id, str) or not approval_id:
@@ -308,13 +322,18 @@ async def coordinate_sandbox_action(
             denial = ("integration", "registered synthetic adapter is missing")
         else:
             try:
-                if native["integration"]["phase"] == "execute":
+                if is_email_execute(native["integration"], integration_registry):
                     adapter_receipt, compliance_evidence = await execute_dispatch(
                         db, instance, native, synthetic_input, integration_registry, adapter,
                         dispatch_metadata, existing=pending[1] if pending else None,
                     )
+                elif is_email_integration(native["integration"], integration_registry):
+                    raise SyntheticCapabilityError("email integration permits only a governed execute")
+                elif native["integration"]["phase"] == "execute":
+                    raise RecipientReviewBlocked("non-email execute blocked: durable dispatch ledger is required")
                 else:
                     run = await db.get(CompanyOSSandboxRun, instance.sandbox_run_id)
+                    dispatch_metadata.update(recipient_id=instance.entity_id, dispatch_attempted=True)
                     adapter_receipt = await adapter.execute(
                         deepcopy(native), idempotency_key=idempotency_key,
                         run_id=run.run_id, recipient_id=instance.entity_id,
@@ -327,6 +346,14 @@ async def coordinate_sandbox_action(
                     workflow, evidence_refs, native, synthetic_input, integration,
                     exc.result.evidence, dispatch_metadata,
                 )
+            except SyntheticComplianceBlock:
+                return await _compliance_event(
+                    db, instance, expected_version, idempotency_key, event_schema, workflow,
+                    evidence_refs, native, synthetic_input, integration,
+                    refusal_evidence(adapter, instance, native, integration_registry, dispatch_metadata), dispatch_metadata,
+                )
+            except RecipientReviewBlocked as exc:
+                denial = ("dispatch_review" if "orphan" in str(exc) else "unsupported_execute", str(exc))
             except (SyntheticCapabilityError, SandboxCoordinatorError) as exc:
                 denial = ("integration", f"synthetic adapter failed: {type(exc).__name__}: {exc}")
 
@@ -445,6 +472,8 @@ async def _compliance_event(
     db, instance, version, key, schema, workflow, refs, native, snapshot, integration,
     compliance, metadata, *, override=False,
 ):
+    if override:
+        compliance = {**compliance, "override_attempt": override}
     return await _append(
         db, instance, version, key, schema, workflow, refs, native, None,
         event_type="transition_attempted", result="blocked", risk="RED",
@@ -456,18 +485,18 @@ async def _compliance_event(
     )
 
 
-async def _orphan_event(db, instance, version, key, schema, workflow, refs, error):
-    if error.reported:
-        raise SandboxCoordinatorError("orphan dispatch already reported; review required")
-    record = error.dispatch
-    native = record["consumers"][instance.id]["consumer_decision"]
+async def _review_event(db, instance, version, key, schema, workflow, refs, reason, *,
+                        native=None, agent, metadata=None, approval=None, autonomy_class=None):
+    """Record a dispatch condition that needs review; nothing is sent and state is unchanged."""
+    failure = None if native else {"type": "dispatch_review", "message": reason}
     return await _append(
-        db, instance, version, key, schema, workflow, refs, native, None,
-        event_type="failure_detected", result="failed", risk="GREEN",
-        action=native["action"], agent=native["agent_type"], classification="failure_recovery",
-        state_after=instance.current_state, approval=None, integration=None,
-        category="dispatch_review", error=str(error),
-        metadata_extra={**metadata_for(record), "orphan_dispatch_id": record["dispatch_id"]},
+        db, instance, version, key, schema, workflow, refs, native, failure,
+        event_type="failure_detected", result="blocked", risk="GREEN",
+        action=native["action"] if native else "record_failure",
+        agent=native["agent_type"] if native else agent, classification="failure_recovery",
+        state_after=instance.current_state, approval=approval, integration=None,
+        category="dispatch_review", error=reason, metadata_extra=metadata or {},
+        autonomy_class=autonomy_class,
     )
 
 
@@ -499,3 +528,24 @@ async def _reconcile_event(
         autonomy_class=autonomy_class,
         metadata_extra={**metadata_for(record), "reconciled": True, **(extra_metadata or {})},
     )
+
+
+async def _awaiting_resume(db, instance, record) -> bool:
+    """A dispatch bound to an approval stays with approval resume, even if a correction changed its action."""
+    consumer = record["consumers"][instance.id]
+    approval_id = consumer.get("approval_id")
+    if approval_id is not None:
+        approval = await db.get(CompanyOSSandboxApproval, approval_id)
+        if approval is not None and approval.status in ("approved", "modified") and approval.resume_event_id is None:
+            return True
+    return await _has_unresumed_approval(db, instance, consumer["consumer_decision"]["action"])
+
+
+async def _has_unresumed_approval(db, instance, action) -> bool:
+    approval = await db.scalar(select(CompanyOSSandboxApproval.id).where(
+        CompanyOSSandboxApproval.workflow_instance_id == instance.id,
+        CompanyOSSandboxApproval.action == action,
+        CompanyOSSandboxApproval.status.in_(("approved", "modified")),
+        CompanyOSSandboxApproval.resume_event_id.is_(None),
+    ))
+    return approval is not None

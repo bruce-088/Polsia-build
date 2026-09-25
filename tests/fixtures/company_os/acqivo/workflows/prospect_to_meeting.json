@@ -1,0 +1,140 @@
+{
+  "id": "prospect_to_meeting",
+  "version": "0.2.1",
+  "purpose": "Move an ICP-qualified HVAC prospect from research to an approved sales conversation without unsupported claims or unapproved sending.",
+  "entity_type": "prospect",
+  "owner_agent": "email_outreach",
+  "states": [
+    "research",
+    "scored",
+    "qualified",
+    "outreach_drafted",
+    "approval_pending",
+    "ready_to_send",
+    "sent",
+    "replied",
+    "meeting_ready",
+    "booked",
+    "nurture",
+    "opted_out",
+    "closed_lost"
+  ],
+  "terminal_states": [
+    "booked",
+    "opted_out",
+    "closed_lost"
+  ],
+  "transitions": [
+    {
+      "from": "research",
+      "to": "scored",
+      "action": "score_against_icp",
+      "risk_level": "GREEN",
+      "requirements": [
+        "public evidence preserved"
+      ]
+    },
+    {
+      "from": "scored",
+      "to": "qualified",
+      "action": "qualify_if_score_7_plus",
+      "risk_level": "GREEN",
+      "requirements": [
+        "score and confidence recorded"
+      ]
+    },
+    {
+      "from": "scored",
+      "to": "nurture",
+      "action": "deprioritize_prospect",
+      "risk_level": "GREEN",
+      "requirements": [
+        "score below qualification threshold",
+        "score and reason recorded"
+      ]
+    },
+    {
+      "from": "qualified",
+      "to": "outreach_drafted",
+      "action": "draft_personalized_outreach",
+      "risk_level": "GREEN",
+      "requirements": [
+        "personalization supported by evidence"
+      ]
+    },
+    {
+      "from": "outreach_drafted",
+      "to": "approval_pending",
+      "action": "request_first_campaign_approval",
+      "risk_level": "RED",
+      "requirements": [
+        "first live batch or unapproved sequence"
+      ]
+    },
+    {
+      "from": "outreach_drafted",
+      "to": "ready_to_send",
+      "action": "apply_existing_approved_sequence",
+      "risk_level": "YELLOW",
+      "requirements": [
+        "within daily send and follow-up limits",
+        "sending identity approved"
+      ]
+    },
+    {
+      "from": "approval_pending",
+      "to": "ready_to_send",
+      "action": "founder_approves",
+      "risk_level": "RED"
+    },
+    {
+      "from": "ready_to_send",
+      "to": "sent",
+      "action": "send_outreach",
+      "risk_level": "YELLOW",
+      "integration": "sendgrid",
+      "requirements": [
+        "integration mode permits write",
+        "opt-out handling enabled"
+      ]
+    },
+    {
+      "from": "sent",
+      "to": "replied",
+      "action": "classify_reply",
+      "risk_level": "GREEN"
+    },
+    {
+      "from": "replied",
+      "to": "meeting_ready",
+      "action": "qualify_positive_reply",
+      "risk_level": "GREEN"
+    },
+    {
+      "from": "meeting_ready",
+      "to": "booked",
+      "action": "book_or_handoff_meeting",
+      "risk_level": "YELLOW",
+      "requirements": [
+        "authoritative calendar or human handoff"
+      ]
+    },
+    {
+      "from": "sent",
+      "to": "opted_out",
+      "action": "record_opt_out",
+      "risk_level": "GREEN"
+    },
+    {
+      "from": "sent",
+      "to": "nurture",
+      "action": "pause_after_sequence",
+      "risk_level": "GREEN"
+    }
+  ],
+  "invariants": [
+    "Never claim a prospect has a problem that was not observed.",
+    "Never continue after opt-out.",
+    "Never mark booked without calendar/human confirmation."
+  ]
+}

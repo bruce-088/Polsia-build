@@ -1,28 +1,20 @@
 """Integration test conftest — real Postgres + Redis via testcontainers."""
 import json
-import os
+
 import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
-from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+
+from tests import postgres
+
+postgres_url = postgres.postgres_url
 
 
 @pytest.fixture(autouse=True)
 def mock_claude_cli(monkeypatch):
     monkeypatch.setenv("CLAUDE_CLI_MOCK", "true")
     monkeypatch.setenv("CLAUDE_CLI_MOCK_RESPONSE", json.dumps({"result": "integration mock"}))
-
-
-@pytest.fixture(scope="session")
-def postgres_url():
-    """Spin up a real Postgres container for the test session."""
-    try:
-        from testcontainers.postgres import PostgresContainer
-        with PostgresContainer("postgres:16-alpine") as pg:
-            url = pg.get_connection_url().replace("postgresql+psycopg2://", "postgresql+asyncpg://")
-            yield url
-    except ImportError:
-        pytest.skip("testcontainers not installed")
 
 
 @pytest.fixture(scope="session")
@@ -43,8 +35,8 @@ async def integration_db(postgres_url):
     Containers remain session-scoped, but asyncpg pooled connections must not
     cross the function-scoped event loops used by the integration tests.
     """
-    from app.core.database import Base
     import app.models  # noqa — ensure all models registered
+    from app.core.database import Base
 
     engine = create_async_engine(postgres_url, echo=False)
     try:
@@ -73,9 +65,9 @@ async def db(integration_db):
 @pytest_asyncio.fixture(scope="function", loop_scope="function")
 async def int_client(db, redis_url, monkeypatch):
     """FastAPI client connected to real Postgres + Redis."""
-    from app.main import app
-    from app.core.database import get_db
     from app.config import settings
+    from app.core.database import get_db
+    from app.main import app
 
     monkeypatch.setattr(settings, "redis_url", redis_url)
     monkeypatch.setattr(settings, "api_key", "int-test-key")

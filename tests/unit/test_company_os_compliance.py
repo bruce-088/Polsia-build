@@ -118,3 +118,53 @@ def test_template_format_expressions_cannot_read_attributes():
     template["body_template"] = "{name.__class__}"
     with pytest.raises(ComplianceContentError):
         render_message(MESSAGE, template, SENDER, {})
+
+
+@pytest.mark.parametrize("field,value", [
+    ("recipient_id", "different"), ("contact_email", "different@example.test"),
+    ("method", "manual"), ("recipient_id", None), ("contact_email", None), ("method", None),
+])
+def test_consent_must_match_recipient_address_and_method(field, value):
+    c = context()
+    if value is None:
+        del c["consent"][field]
+    else:
+        c["consent"][field] = value
+    result = evaluate_outbound_eligibility(c)
+    assert not result.eligible
+    assert result.evidence["failed_rule_ids"] == ["BASE-01"]
+
+
+def test_consent_address_comparison_is_normalized():
+    c = context()
+    c["consent"]["contact_email"] = "  P-1@EXAMPLE.TEST  "
+    assert evaluate_outbound_eligibility(c).eligible
+
+
+@pytest.mark.parametrize("record,field,value", [
+    ("contact", "recipient_time_zone", 5),
+    ("contact", "recipient_time_zone", "Not/AZone"),
+    ("contact", "recipient_time_zone", "america/new_york"),
+    ("contact", "recipient_time_zone", "posixrules"),
+    ("suppression", "checked_at", "2026-09-25 00:00:00+00:00"),
+    ("contact", "recipient_location", {"country": "US", "state": ""}),
+    ("contact", "recipient_location", "Florida"),
+    ("sender", "dispatch_method", ""),
+    ("sender", "sender_id", 7),
+    ("suppression", "version", ""),
+    ("suppression", "checked_at", "yesterday"),
+    (None, "evaluated_at", 12),
+    (None, "policy_sha256", "not-a-hash"),
+])
+def test_malformed_facts_still_produce_a_schema_valid_block(record, field, value):
+    import json
+    from pathlib import Path
+
+    from jsonschema import Draft202012Validator, FormatChecker
+
+    schema = json.loads(Path("tests/fixtures/company_os/acqivo/schemas/sandbox_event.schema.json").read_text())
+    ctx = context()
+    (ctx if record is None else ctx[record])[field] = value
+    result = evaluate_outbound_eligibility(ctx)
+    assert not result.eligible and "BASE-01" in result.evidence["failed_rule_ids"]
+    Draft202012Validator(schema["properties"]["compliance"], format_checker=FormatChecker()).validate(result.evidence)

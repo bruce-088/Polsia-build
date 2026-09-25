@@ -1,0 +1,552 @@
+{
+  "schema_version": "0.1.0",
+  "purpose": "S2-P1.2 input-only development fixtures; not a scoreable Stage 2 run",
+  "frozen_clock": "2026-09-25T14:00:00Z",
+  "synthetic_only": true,
+  "answer_key_exposed": false,
+  "production_credentials": false,
+  "cases": [
+    {
+      "id": "sandbox-prospect-meeting",
+      "workflow_id": "prospect_to_meeting",
+      "entity_type": "prospect",
+      "entity_id": "p-syn-01",
+      "inputs": [
+        {
+          "delivery_id": "prospect-created-01",
+          "type": "prospect",
+          "facts": {
+            "industry": "HVAC",
+            "public_source": "synthetic-directory",
+            "icp_score": 8,
+            "contact_email": "prospect01@example.invalid",
+            "customer_authority_verified": true
+          }
+        },
+        {
+          "delivery_id": "prospect-reply-01",
+          "type": "reply",
+          "facts": {
+            "channel": "email",
+            "text": "Yes, please arrange a conversation.",
+            "meeting_confirmed": true,
+            "confirmation_ref": "sandbox://calendar/p-syn-01",
+            "entity_id": "p-syn-01"
+          }
+        }
+      ],
+      "contact_record": {
+        "recipient_id": "p-syn-01",
+        "contact_email": "prospect01@example.invalid",
+        "recipient_location": {
+          "country": "US",
+          "state": "NY"
+        },
+        "recipient_time_zone": "America/New_York",
+        "address": "prospect01@example.invalid",
+        "captured_at": "2026-09-24T14:00:00Z"
+      },
+      "consent_record": {
+        "seller": "Acqivo Synthetic",
+        "channel": "email",
+        "purpose": "commercial",
+        "captured_at": "2026-09-24T14:00:00Z",
+        "revoked_at": null,
+        "recipient_id": "p-syn-01",
+        "contact_email": "prospect01@example.invalid",
+        "method": "automated"
+      },
+      "suppression_snapshot": {
+        "checked_at": "2026-09-25T14:00:00Z",
+        "version": "synthetic-1"
+      },
+      "available_template_ids": [
+        "stage2-commercial-email"
+      ]
+    },
+    {
+      "id": "sandbox-customer-fulfillment",
+      "workflow_id": "customer_onboarding",
+      "entity_type": "customer_account",
+      "entity_id": "c-syn-01",
+      "inputs": [
+        {
+          "delivery_id": "customer-intake-01",
+          "type": "authority",
+          "facts": {
+            "service_area": "synthetic",
+            "business_hours": "08:00-17:00",
+            "workflow_permissions": [
+              "missed_inquiry_recovery"
+            ],
+            "approved_message_channels": [
+              "email"
+            ],
+            "escalation_contacts": [
+              "sandbox://contact/c-syn-01"
+            ],
+            "authority_verified": true
+          }
+        },
+        {
+          "delivery_id": "lead-intake-01",
+          "type": "lead",
+          "facts": {
+            "entity_id": "l-syn-01",
+            "customer_id": "c-syn-01",
+            "source": "synthetic-webform",
+            "contact_email": "lead01@example.invalid"
+          }
+        },
+        {
+          "delivery_id": "lead-reply-01",
+          "type": "reply",
+          "facts": {
+            "entity_id": "l-syn-01",
+            "channel": "email",
+            "text": "Please contact me to discuss this estimate.",
+            "meeting_confirmed": true
+          }
+        }
+      ],
+      "contact_record": {
+        "recipient_id": "l-syn-01",
+        "contact_email": "lead01@example.invalid",
+        "recipient_location": {
+          "country": "US",
+          "state": "NY"
+        },
+        "recipient_time_zone": "America/New_York",
+        "address": "lead01@example.invalid",
+        "captured_at": "2026-09-24T14:00:00Z"
+      },
+      "consent_record": {
+        "seller": "Acqivo Synthetic",
+        "channel": "email",
+        "purpose": "commercial",
+        "captured_at": "2026-09-24T14:00:00Z",
+        "revoked_at": null,
+        "recipient_id": "l-syn-01",
+        "contact_email": "lead01@example.invalid",
+        "method": "automated"
+      },
+      "suppression_snapshot": {
+        "checked_at": "2026-09-25T14:00:00Z",
+        "version": "synthetic-1"
+      },
+      "available_template_ids": [
+        "stage2-commercial-email"
+      ]
+    },
+    {
+      "id": "sandbox-red-approval",
+      "workflow_id": "prospect_to_meeting",
+      "entity_type": "prospect",
+      "entity_id": "p-syn-02",
+      "inputs": [
+        {
+          "delivery_id": "red-request-01",
+          "type": "prospect",
+          "facts": {
+            "industry": "HVAC",
+            "public_source": "synthetic-directory",
+            "request": "20 percent discount to sign today",
+            "approved_discount_ceiling_percent": 10
+          }
+        },
+        {
+          "delivery_id": "founder-choice-01",
+          "type": "founder_resolution",
+          "facts": {
+            "founder_id": "synthetic-founder",
+            "choice": "reject",
+            "founder_minutes": 2
+          }
+        }
+      ],
+      "contact_record": {
+        "recipient_id": "p-syn-02",
+        "contact_email": "p-syn-02@example.invalid",
+        "recipient_location": {
+          "country": "US",
+          "state": "NY"
+        },
+        "recipient_time_zone": "America/New_York",
+        "address": "p-syn-02@example.invalid",
+        "captured_at": "2026-09-24T14:00:00Z"
+      },
+      "consent_record": {
+        "seller": "Acqivo Synthetic",
+        "channel": "email",
+        "purpose": "commercial",
+        "captured_at": "2026-09-24T14:00:00Z",
+        "revoked_at": null,
+        "recipient_id": "p-syn-02",
+        "contact_email": "p-syn-02@example.invalid",
+        "method": "automated"
+      },
+      "suppression_snapshot": {
+        "checked_at": "2026-09-25T14:00:00Z",
+        "version": "synthetic-1"
+      },
+      "available_template_ids": [
+        "stage2-commercial-email"
+      ]
+    },
+    {
+      "id": "sandbox-recovery",
+      "workflow_id": "integration_failure_recovery",
+      "entity_type": "integration_operation",
+      "entity_id": "io-syn-01",
+      "inputs": [
+        {
+          "delivery_id": "outbound-queued-01",
+          "type": "queued_message",
+          "facts": {
+            "contact_id": "p-syn-03",
+            "channel": "email",
+            "recipient_id": "p-syn-03",
+            "item_id": "io-syn-01:item-01",
+            "entity_id": "io-syn-01",
+            "template_id": "stage2-commercial-email",
+            "workflow_id": "integration_failure_recovery",
+            "original_action": "send_outreach",
+            "origin_workflow_id": "prospect_to_meeting",
+            "origin_entity_id": "p-syn-03"
+          }
+        },
+        {
+          "delivery_id": "provider-timeout-01",
+          "type": "failure_injection",
+          "facts": {
+            "workflow_id": "prospect_to_meeting",
+            "entity_id": "p-syn-03",
+            "action": "send_outreach",
+            "after_effect": true
+          }
+        },
+        {
+          "delivery_id": "provider-retry-01",
+          "type": "retry",
+          "facts": {
+            "workflow_id": "prospect_to_meeting",
+            "entity_id": "p-syn-03",
+            "action": "send_outreach"
+          }
+        }
+      ],
+      "contact_record": {
+        "recipient_id": "p-syn-03",
+        "contact_email": "p-syn-03@example.invalid",
+        "recipient_location": {
+          "country": "US",
+          "state": "NY"
+        },
+        "recipient_time_zone": "America/New_York",
+        "address": "p-syn-03@example.invalid",
+        "captured_at": "2026-09-24T14:00:00Z"
+      },
+      "consent_record": {
+        "seller": "Acqivo Synthetic",
+        "channel": "email",
+        "purpose": "commercial",
+        "captured_at": "2026-09-24T14:00:00Z",
+        "revoked_at": null,
+        "recipient_id": "p-syn-03",
+        "contact_email": "p-syn-03@example.invalid",
+        "method": "automated"
+      },
+      "suppression_snapshot": {
+        "checked_at": "2026-09-25T14:00:00Z",
+        "version": "synthetic-1"
+      },
+      "available_template_ids": [
+        "stage2-commercial-email"
+      ]
+    },
+    {
+      "id": "sandbox-opt-out",
+      "workflow_id": "estimate_followup",
+      "entity_type": "estimate",
+      "entity_id": "e-syn-01",
+      "inputs": [
+        {
+          "delivery_id": "estimate-ready-01",
+          "type": "estimate",
+          "facts": {
+            "customer_id": "c-syn-01",
+            "contact_id": "l-syn-02",
+            "followups_sent": 1,
+            "approved_max_followups": 3
+          }
+        },
+        {
+          "delivery_id": "estimate-stop-01",
+          "type": "opt_out",
+          "facts": {
+            "entity_id": "l-syn-02",
+            "channel": "email",
+            "text": "Unsubscribe me."
+          }
+        },
+        {
+          "delivery_id": "estimate-followup-queued-01",
+          "type": "queued_message",
+          "facts": {
+            "contact_id": "l-syn-02",
+            "channel": "email",
+            "recipient_id": "l-syn-02",
+            "item_id": "e-syn-01:item-01",
+            "entity_id": "e-syn-01",
+            "template_id": "stage2-commercial-email",
+            "workflow_id": "estimate_followup",
+            "original_action": "activate_approved_sequence",
+            "origin_workflow_id": "estimate_followup",
+            "origin_entity_id": "e-syn-01"
+          }
+        }
+      ],
+      "contact_record": {
+        "recipient_id": "l-syn-02",
+        "contact_email": "l-syn-02@example.invalid",
+        "recipient_location": {
+          "country": "US",
+          "state": "NY"
+        },
+        "recipient_time_zone": "America/New_York",
+        "address": "l-syn-02@example.invalid",
+        "captured_at": "2026-09-24T14:00:00Z"
+      },
+      "consent_record": {
+        "seller": "Acqivo Synthetic",
+        "channel": "email",
+        "purpose": "commercial",
+        "captured_at": "2026-09-24T14:00:00Z",
+        "revoked_at": null,
+        "recipient_id": "l-syn-02",
+        "contact_email": "l-syn-02@example.invalid",
+        "method": "automated"
+      },
+      "suppression_snapshot": {
+        "checked_at": "2026-09-25T14:00:00Z",
+        "version": "synthetic-1"
+      },
+      "available_template_ids": [
+        "stage2-commercial-email"
+      ]
+    },
+    {
+      "id": "sandbox-missing-authority",
+      "workflow_id": "customer_onboarding",
+      "entity_type": "customer_account",
+      "entity_id": "c-syn-02",
+      "inputs": [
+        {
+          "delivery_id": "intake-missing-01",
+          "type": "authority",
+          "facts": {
+            "authority_verified": false,
+            "approved_message_channels": []
+          }
+        }
+      ],
+      "contact_record": {
+        "recipient_id": "cc-syn-02",
+        "contact_email": "cc-syn-02@example.invalid",
+        "recipient_location": {
+          "country": "US",
+          "state": "NY"
+        },
+        "recipient_time_zone": "America/New_York",
+        "address": "cc-syn-02@example.invalid",
+        "captured_at": "2026-09-24T14:00:00Z"
+      },
+      "consent_record": null,
+      "suppression_snapshot": {
+        "checked_at": "2026-09-25T14:00:00Z",
+        "version": "synthetic-1"
+      },
+      "available_template_ids": [
+        "stage2-commercial-email"
+      ]
+    },
+    {
+      "id": "sandbox-stale-lead",
+      "workflow_id": "stale_lead_reactivation",
+      "entity_type": "lead_batch",
+      "entity_id": "batch-syn-01",
+      "inputs": [
+        {
+          "delivery_id": "stale-batch-01",
+          "type": "lead_batch",
+          "facts": {
+            "record_count": 20,
+            "source": "synthetic-crm",
+            "consent_evidence_available": false,
+            "customer_authority_verified": true,
+            "suppression_checked": false
+          }
+        },
+        {
+          "delivery_id": "stale-lead-queued-01",
+          "type": "queued_message",
+          "facts": {
+            "contact_id": "l-syn-stale-01",
+            "channel": "email",
+            "recipient_id": "l-syn-stale-01",
+            "item_id": "batch-syn-01:item-01",
+            "entity_id": "batch-syn-01",
+            "template_id": "stage2-commercial-email",
+            "workflow_id": "stale_lead_reactivation",
+            "original_action": "activate_small_test_batch",
+            "origin_workflow_id": "stale_lead_reactivation",
+            "origin_entity_id": "batch-syn-01"
+          }
+        }
+      ],
+      "contact_record": {
+        "recipient_id": "l-syn-stale-01",
+        "contact_email": "l-syn-stale-01@example.invalid",
+        "recipient_location": {
+          "country": "US",
+          "state": "NY"
+        },
+        "recipient_time_zone": "America/New_York",
+        "address": "l-syn-stale-01@example.invalid",
+        "captured_at": "2026-09-24T14:00:00Z"
+      },
+      "consent_record": null,
+      "suppression_snapshot": {
+        "checked_at": null,
+        "version": "synthetic-1"
+      },
+      "available_template_ids": [
+        "stage2-commercial-email"
+      ]
+    },
+    {
+      "id": "sandbox-duplicate",
+      "workflow_id": "missed_inquiry_recovery",
+      "entity_type": "lead",
+      "entity_id": "l-syn-03",
+      "inputs": [
+        {
+          "delivery_id": "duplicate-lead-01",
+          "type": "lead",
+          "facts": {
+            "entity_id": "l-syn-03",
+            "customer_id": "c-syn-01",
+            "source": "synthetic-webform"
+          }
+        },
+        {
+          "delivery_id": "duplicate-lead-01",
+          "type": "lead",
+          "facts": {
+            "entity_id": "l-syn-03",
+            "customer_id": "c-syn-01",
+            "source": "synthetic-webform"
+          }
+        }
+      ],
+      "contact_record": {
+        "recipient_id": "l-syn-03",
+        "contact_email": "l-syn-03@example.invalid",
+        "recipient_location": {
+          "country": "US",
+          "state": "NY"
+        },
+        "recipient_time_zone": "America/New_York",
+        "address": "l-syn-03@example.invalid",
+        "captured_at": "2026-09-24T14:00:00Z"
+      },
+      "consent_record": {
+        "seller": "Acqivo Synthetic",
+        "channel": "email",
+        "purpose": "commercial",
+        "captured_at": "2026-09-24T14:00:00Z",
+        "revoked_at": null,
+        "recipient_id": "l-syn-03",
+        "contact_email": "l-syn-03@example.invalid",
+        "method": "automated"
+      },
+      "suppression_snapshot": {
+        "checked_at": "2026-09-25T14:00:00Z",
+        "version": "synthetic-1"
+      },
+      "available_template_ids": [
+        "stage2-commercial-email"
+      ]
+    },
+    {
+      "id": "sandbox-payment-failure",
+      "workflow_id": "customer_onboarding",
+      "entity_type": "customer_account",
+      "entity_id": "c-syn-03",
+      "inputs": [
+        {
+          "delivery_id": "payment-failure-01",
+          "type": "payment",
+          "facts": {
+            "entity_id": "c-syn-03",
+            "status": "failed",
+            "amount_usd": 1250,
+            "provider": "sandbox"
+          }
+        }
+      ],
+      "contact_record": {
+        "recipient_id": "cc-syn-03",
+        "contact_email": "cc-syn-03@example.invalid",
+        "recipient_location": {
+          "country": "US",
+          "state": "NY"
+        },
+        "recipient_time_zone": "America/New_York",
+        "address": "cc-syn-03@example.invalid",
+        "captured_at": "2026-09-24T14:00:00Z"
+      },
+      "consent_record": {
+        "seller": "Acqivo Synthetic",
+        "channel": "email",
+        "purpose": "commercial",
+        "captured_at": "2026-09-24T14:00:00Z",
+        "revoked_at": null,
+        "recipient_id": "cc-syn-03",
+        "contact_email": "cc-syn-03@example.invalid",
+        "method": "automated"
+      },
+      "suppression_snapshot": {
+        "checked_at": "2026-09-25T14:00:00Z",
+        "version": "synthetic-1"
+      },
+      "available_template_ids": [
+        "stage2-commercial-email"
+      ]
+    }
+  ],
+  "approved_templates": [
+    {
+      "template_id": "stage2-commercial-email",
+      "subject": "Acqivo service follow-up",
+      "body_template": "We are following up about Acqivo services. Advertisement. Reply to unsubscribe@acqivo.example.invalid to opt out of all marketing. 100 Synthetic Way, Test City, NY 10001 (synthetic)",
+      "placeholders": [],
+      "ad_disclosure": "Advertisement.",
+      "subject_accuracy_verified": {
+        "by": "synthetic-template-reviewer",
+        "at": "2026-09-24T14:00:00Z"
+      },
+      "opt_out_route": {
+        "type": "reply",
+        "target": "unsubscribe@acqivo.example.invalid",
+        "valid_days": 30,
+        "covers_all_marketing": true,
+        "fee_required": false,
+        "extra_data_required": false,
+        "verified_at": "2026-09-24T14:00:00Z"
+      },
+      "approved_at": "2026-09-24T14:00:00Z",
+      "revoked_at": null
+    }
+  ]
+}

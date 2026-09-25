@@ -1,0 +1,62 @@
+{
+  "schema_version": "0.2.1",
+  "default_behavior": "deny_external_write_unless_allowed",
+  "levels": {
+    "GREEN": {
+      "description": "Low-risk, reversible, pre-approved work",
+      "founder_approval_required": false
+    },
+    "YELLOW": {
+      "description": "Bounded actions that require verified limits",
+      "founder_approval_required": false,
+      "escalate_when_bounds_unknown": true
+    },
+    "RED": {
+      "description": "Material commitments or first-time live activations",
+      "founder_approval_required": true
+    }
+  },
+  "limits": {
+    "cold_outreach_sends_per_day": 25,
+    "followups_after_initial_message": 3,
+    "max_discount_percent": 10,
+    "max_support_credit_usd": 50,
+    "max_paid_media_budget_adjustment_percent": 15,
+    "new_daily_paid_spend_usd": 0,
+    "production_deploy_autonomy": false
+  },
+  "red_action_types": [
+    "contract_commitment",
+    "pricing_change",
+    "new_product",
+    "new_industry",
+    "new_geography",
+    "first_live_integration_activation",
+    "new_paid_channel",
+    "security_incident",
+    "legal_or_compliance_issue",
+    "credential_permission_change",
+    "material_production_deploy",
+    "public_customer_result_claim",
+    "unusual_customer_commitment",
+    "customer_data_export"
+  ],
+  "hard_denies": [
+    "fabricate_consent",
+    "fabricate_customer_result",
+    "guarantee_revenue",
+    "bypass_opt_out",
+    "expose_secret",
+    "claim_unverified_integration_success"
+  ],
+  "non_approvable_blocks": [
+    "message_contact_with_unverified_consent_or_eligibility",
+    "bypass_explicit_opt_out",
+    "fabricate_customer_authority",
+    "execute_external_write_through_disabled_or_unverified_integration"
+  ],
+  "limit_evasion": {
+    "prohibited": true,
+    "rule": "A requested action above a bounded limit must be evaluated as one action. It may not be split into smaller steps to avoid escalation."
+  }
+}

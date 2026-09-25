@@ -1,0 +1,100 @@
+{
+  "id": "customer_onboarding",
+  "version": "0.2.0",
+  "purpose": "Convert a sold Acqivo account into a safely configured, measurable customer environment.",
+  "entity_type": "customer_account",
+  "owner_agent": "customer_support",
+  "states": [
+    "sold",
+    "intake_requested",
+    "intake_received",
+    "scope_confirmed",
+    "permissions_review",
+    "integrations_pending",
+    "baseline_pending",
+    "ready_for_activation",
+    "active",
+    "blocked",
+    "cancelled"
+  ],
+  "terminal_states": [
+    "active",
+    "cancelled"
+  ],
+  "transitions": [
+    {
+      "from": "sold",
+      "to": "intake_requested",
+      "action": "send_or_prepare_intake",
+      "risk_level": "GREEN"
+    },
+    {
+      "from": "intake_requested",
+      "to": "intake_received",
+      "action": "record_customer_inputs",
+      "risk_level": "GREEN"
+    },
+    {
+      "from": "intake_received",
+      "to": "scope_confirmed",
+      "action": "confirm_offer_scope",
+      "risk_level": "GREEN"
+    },
+    {
+      "from": "scope_confirmed",
+      "to": "permissions_review",
+      "action": "review_channels_workflows_and_authority",
+      "risk_level": "YELLOW"
+    },
+    {
+      "from": "permissions_review",
+      "to": "integrations_pending",
+      "action": "collect_required_connection_status",
+      "risk_level": "YELLOW"
+    },
+    {
+      "from": "integrations_pending",
+      "to": "baseline_pending",
+      "action": "verify_integrations",
+      "risk_level": "RED",
+      "requirements": [
+        "first production activation requires founder approval"
+      ]
+    },
+    {
+      "from": "baseline_pending",
+      "to": "ready_for_activation",
+      "action": "capture_baseline_metrics",
+      "risk_level": "GREEN"
+    },
+    {
+      "from": "ready_for_activation",
+      "to": "active",
+      "action": "activate_approved_workflows",
+      "risk_level": "RED",
+      "requirements": [
+        "scope approved",
+        "customer permissions recorded",
+        "integration registry verified"
+      ]
+    },
+    {
+      "from": "permissions_review",
+      "to": "blocked",
+      "action": "block_missing_authority",
+      "risk_level": "GREEN"
+    }
+  ],
+  "required_customer_facts": [
+    "service_area",
+    "business_hours",
+    "workflow_permissions",
+    "approved_message_channels",
+    "escalation_contacts"
+  ],
+  "invariants": [
+    "No workflow activates from technical access alone.",
+    "Customer messaging authority must be recorded.",
+    "Baseline metrics must distinguish known values from unavailable data."
+  ]
+}

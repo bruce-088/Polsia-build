@@ -34,6 +34,7 @@ def eligible_world(run_id="s2-test", recipient="p-1"):
         "recipient_time_zone": "America/New_York",
     })
     world.consents[recipient] = {
+        "recipient_id": recipient, "contact_email": f"{recipient}@example.test", "method": "automated",
         "seller": "Synthetic Seller", "channel": "email", "purpose": "commercial",
         "captured_at": AT, "revoked_at": None,
     }

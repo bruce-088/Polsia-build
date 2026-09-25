@@ -46,7 +46,7 @@ REGISTRY = {
     "integrations": {
         "sandbox_mail": {
             "mode": "sandbox", "verified": True, "external_writes": True,
-            "desired_use": ["send_outreach"], "sandbox_sender": deepcopy(SENDER),
+            "desired_use": ["acquisition_email"], "sandbox_sender": deepcopy(SENDER),
         },
     },
 }
@@ -209,7 +209,7 @@ async def test_model_claimed_founder_approval_cannot_authorize_red(async_db_sess
 async def test_yellow_bound_stops_and_sandbox_adapter_executes_only_when_allowed(async_db_session):
     _, instance = await setup(async_db_session, initial_state="scored")
     adapter = Adapter()
-    request = {"name": "sandbox_mail", "phase": "execute", "use": "send_outreach"}
+    request = {"name": "sandbox_mail", "phase": "execute", "use": "acquisition_email"}
     over = native(action="send_outreach", state="sent", risk="YELLOW", integration=request, limit_name="max_discount_percent", requested_total=20)
     escalated = await invoke(async_db_session, instance, over, adapter=adapter)
     assert escalated.payload["result"] == "escalated"
@@ -229,7 +229,7 @@ async def test_disabled_live_and_unverified_integration_cannot_execute(async_db_
     adapter = Adapter()
     registry = deepcopy(REGISTRY)
     registry["integrations"]["sandbox_mail"].update(mode=mode, verified=verified)
-    output = native(action="send_outreach", state="sent", risk="YELLOW", integration={"name": "sandbox_mail", "phase": "execute", "use": "send_outreach"})
+    output = native(action="send_outreach", state="sent", risk="YELLOW", integration={"name": "sandbox_mail", "phase": "execute", "use": "acquisition_email"})
     output["policy_intent"]["integration_mode"] = mode
     event = await invoke(async_db_session, instance, output, adapter=adapter, registry=registry)
     assert event.payload["result"] in {"failed", "blocked"}
@@ -278,7 +278,7 @@ async def test_production_read_cannot_reach_stage2_adapter(async_db_session):
     adapter = Adapter()
     registry = deepcopy(REGISTRY)
     registry["integrations"]["sandbox_mail"]["mode"] = "read_only"
-    output = native(state="research", integration={"name": "sandbox_mail", "phase": "read", "use": "send_outreach"})
+    output = native(state="research", integration={"name": "sandbox_mail", "phase": "read", "use": "acquisition_email"})
     output["policy_intent"]["external_write"] = False
     event = await invoke(async_db_session, instance, output, adapter=adapter, registry=registry)
     assert event.payload["metadata"]["gate"] == "integration"
@@ -288,7 +288,7 @@ async def test_production_read_cannot_reach_stage2_adapter(async_db_session):
 @pytest.mark.asyncio
 async def test_missing_adapter_fails_with_native_decision_preserved(async_db_session):
     _, instance = await setup(async_db_session, initial_state="scored")
-    output = native(action="send_outreach", state="sent", risk="YELLOW", integration={"name": "sandbox_mail", "phase": "execute", "use": "send_outreach"})
+    output = native(action="send_outreach", state="sent", risk="YELLOW", integration={"name": "sandbox_mail", "phase": "execute", "use": "acquisition_email"})
     event = await invoke(async_db_session, instance, output)
     assert event.payload["metadata"]["gate"] == "integration"
     assert event.native_decision == output
@@ -310,7 +310,7 @@ async def test_authority_claim_in_model_output_cannot_supply_missing_input_evide
     adapter = Adapter()
     output = native(
         action="send_outreach", state="sent", risk="YELLOW",
-        integration={"name": "sandbox_mail", "phase": "execute", "use": "send_outreach"},
+        integration={"name": "sandbox_mail", "phase": "execute", "use": "acquisition_email"},
         requires_authority=True, authority_verified=True,
     )
     event = await invoke(async_db_session, instance, output, adapter=adapter)
@@ -335,7 +335,7 @@ async def pending_approval(db, *, initial_state="scored", total=20, workflow=WOR
     adapter = Adapter()
     output = native(
         action="send_outreach", state="sent", risk="YELLOW",
-        integration={"name": "sandbox_mail", "phase": "execute", "use": "send_outreach"},
+        integration={"name": "sandbox_mail", "phase": "execute", "use": "acquisition_email"},
         limit_name="max_discount_percent", requested_total=total,
     )
     requested = await invoke(db, instance, output, adapter=adapter, workflow=workflow)
@@ -484,14 +484,15 @@ async def test_timed_out_adapter_retries_with_same_key_without_second_effect(asy
 
 
 @pytest.mark.asyncio
-async def test_manual_execution_is_explicit_a3_with_synthetic_evidence(async_db_session):
-    _, original, approval, adapter = await pending_approval(async_db_session)
+async def test_manual_evidence_is_rejected_for_email_execute(async_db_session):
+    instance, _, approval, adapter = await pending_approval(async_db_session)
     await resolve(async_db_session, approval, manual_evidence_ref="sandbox://founder/manual-1")
-    event = await resume(async_db_session, approval, adapter)
-    assert event.payload["autonomy"]["class"] == "A3"
-    assert "sandbox://founder/manual-1" in event.payload["evidence_refs"]
-    assert event.native_decision == original
-    assert adapter.calls == 0
+    before = await async_db_session.scalar(select(func.count()).select_from(CompanyOSSandboxEvent))
+    with pytest.raises(SandboxApprovalError, match="manual evidence is not permitted for email execute"):
+        await resume(async_db_session, approval, adapter)
+    assert adapter.calls == 0 and not adapter.world.dispatches
+    assert instance.current_state == "scored" and approval.resume_event_id is None
+    assert await async_db_session.scalar(select(func.count()).select_from(CompanyOSSandboxEvent)) == before
 
 
 @pytest.mark.asyncio

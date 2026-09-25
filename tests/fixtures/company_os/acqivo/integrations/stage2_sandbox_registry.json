@@ -1,0 +1,96 @@
+{
+  "schema_version": "0.2.0",
+  "modes": [
+    "disabled",
+    "documented",
+    "sandbox",
+    "read_only",
+    "write_limited",
+    "live"
+  ],
+  "integrations": {
+    "sendgrid": {
+      "desired_use": [
+        "acquisition_email",
+        "transactional_email"
+      ],
+      "mode": "sandbox",
+      "verified": true,
+      "external_writes": true,
+      "note": "synthetic adapter registered for Stage 2 only; external_writes enables in-process synthetic dispatch only",
+      "sandbox_sender": {
+        "sender_id": "stage2-acqivo",
+        "from_address": "hello@acqivo.example.invalid",
+        "reply_to": "unsubscribe@acqivo.example.invalid",
+        "sending_domain": "acqivo.example.invalid",
+        "postal_address": "100 Synthetic Way, Test City, NY 10001 (synthetic)",
+        "seller_name": "Acqivo Synthetic",
+        "dispatch_method": "automated",
+        "captured_at": "2026-09-24T14:00:00Z"
+      }
+    },
+    "imap": {
+      "desired_use": [
+        "reply_ingestion",
+        "support_inbox"
+      ],
+      "mode": "sandbox",
+      "verified": true,
+      "external_writes": false,
+      "note": "Inbound synthetic mail only; no production mailbox access"
+    },
+    "stripe": {
+      "desired_use": [
+        "billing",
+        "mrr",
+        "failed_payment_visibility"
+      ],
+      "mode": "disabled",
+      "verified": false,
+      "external_writes": false
+    },
+    "tavily": {
+      "desired_use": [
+        "prospect_research",
+        "market_intelligence"
+      ],
+      "mode": "disabled",
+      "verified": false,
+      "external_writes": false
+    },
+    "google_ads": {
+      "desired_use": [
+        "future_paid_acquisition"
+      ],
+      "mode": "disabled",
+      "verified": false,
+      "external_writes": false
+    },
+    "meta_ads": {
+      "desired_use": [
+        "future_paid_acquisition"
+      ],
+      "mode": "disabled",
+      "verified": false,
+      "external_writes": false
+    },
+    "github": {
+      "desired_use": [
+        "product_engineering",
+        "pull_requests"
+      ],
+      "mode": "disabled",
+      "verified": false,
+      "external_writes": false,
+      "scope": "acqivo-company-os only"
+    },
+    "x": {
+      "desired_use": [
+        "brand_distribution"
+      ],
+      "mode": "disabled",
+      "verified": false,
+      "external_writes": false
+    }
+  }
+}

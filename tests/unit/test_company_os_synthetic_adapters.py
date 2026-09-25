@@ -122,7 +122,7 @@ async def test_coordinator_uses_concrete_adapter_and_blocks_opted_out_contact(as
     async def decide(_):
         return native(
             action="send_outreach", state="sent", risk="YELLOW",
-            integration={"name": "sandbox_mail", "phase": "execute", "use": "send_outreach"},
+            integration={"name": "sandbox_mail", "phase": "execute", "use": "acquisition_email"},
         )
 
     async def invoke(entity_id, key):
@@ -246,3 +246,21 @@ def test_queue_and_dispatch_preserve_message_and_consumer_identity():
     assert "completed" not in record
     assert record["dispatch_id"] == state.dispatch_id("message-1")
     assert record["dispatch_id"] != SyntheticWorld("other", state.frozen_at).dispatch_id("message-1")
+
+
+@pytest.mark.parametrize("body", ["STOP.", "Stop emailing me", "please unsubscribe me",
+                                  "Please OPT-OUT!", "optout now", "Please remove me.", "CANCEL this"])
+@pytest.mark.parametrize("channel", ["reply", "mail"])
+@pytest.mark.parametrize("known", [True, False])
+def test_opt_out_phrases_keep_known_and_unknown_contacts_suppressed(body, channel, known):
+    from tests.unit.company_os_stage2_facts import eligible_world
+    state = eligible_world()
+    facts = state.contacts["p-1"].copy()
+    if not known:
+        del state.contacts["p-1"]
+    state.receive(channel, "stop-phrase", {"entity_id": "p-1", "body": body})
+    assert "entity:p-1" in state.pending_opt_outs
+    if not known:
+        state.set_contact("p-1", facts)
+    assert state.is_suppressed("p-1")
+    assert state.contacts["p-1"]["address"] in state.suppressed_recipients

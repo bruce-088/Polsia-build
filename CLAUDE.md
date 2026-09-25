@@ -1,5 +1,11 @@
 # CLAUDE.md — Polsia AI Business Agent
 
+## Stage 2 / Company OS sandbox work
+
+Read `AGENTS.md` first — it maps the Stage 2 modules, the rules that must hold, and the test commands.
+
+@AGENTS.md
+
 ## What this project is
 
 Polsia is a self-hosted, autonomous AI platform that runs a company's operations 24/7. Ten specialized agents (Orchestrator, Business Planning, Competitor Research, Social Media, Ads, Email Outreach, Customer Support, Code Generation, Finance, Deployment) run on a Celery + Redis task queue with a FastAPI backend and Next.js dashboard. Agents call the Claude Code CLI as a subprocess — no Anthropic API key is used.

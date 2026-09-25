@@ -32,11 +32,8 @@ class DispatchBlocked(SyntheticComplianceBlock):
         self.result = result
 
 
-class DispatchReviewRequired(SyntheticCapabilityError):
-    def __init__(self, dispatch: dict, reported: bool):
-        super().__init__("orphan dispatch requires review before further sends")
-        self.dispatch = dispatch
-        self.reported = reported
+class RecipientReviewBlocked(SyntheticCapabilityError):
+    """Outbound dispatch is permanently blocked for this recipient in the run."""
 
 
 def is_completion(event: CompanyOSSandboxEvent, dispatch_id: str) -> bool:
@@ -52,7 +49,7 @@ async def consumer_events(db, instance) -> list[CompanyOSSandboxEvent]:
     )))
 
 
-async def find_dispatch(db, instance, adapters, *, approval_id=None):
+async def find_dispatch(db, instance, adapters, *, approval_id=None, snapshot=None, registry=None):
     events = await consumer_events(db, instance)
     run = await db.get(CompanyOSSandboxRun, instance.sandbox_run_id)
     candidates = []
@@ -63,17 +60,27 @@ async def find_dispatch(db, instance, adapters, *, approval_id=None):
             continue
         seen.add(id(world))
         for record in world.dispatches.values():
+            if record["status"] == "blocked":
+                continue
             consumer = record["consumers"].get(instance.id)
             if not consumer or any(is_completion(e, record["dispatch_id"]) for e in events):
                 continue
             if (consumer["expected_state_before"] != instance.current_state
                     or consumer["expected_version"] != instance.version):
                 world.review_blocked_recipients.add(record["recipient_id"])
-                reported = any(e.payload.get("metadata", {}).get("orphan_dispatch_id")
-                               == record["dispatch_id"] for e in events)
-                raise DispatchReviewRequired(record, reported)
-            if consumer.get("approval_id") != approval_id:
                 continue
+            if snapshot is not None and "item_id" in snapshot:
+                try:
+                    _, item = resolve_recipient(world, instance, snapshot, consumer["consumer_decision"]["action"])
+                    if item is None or (item.get("dispatch_id") or world.dispatch_id(item["item_id"])) != record["dispatch_id"]:
+                        raise SyntheticComplianceBlock("evidence_missing_or_scope_unknown")
+                except SyntheticComplianceBlock as exc:
+                    blocked = DispatchBlocked(evaluate_outbound_eligibility(compliance_context(
+                        world, record["recipient_id"], consumer["consumer_decision"], registry, {}, scope_valid=False,
+                    )))
+                    blocked.native = consumer["consumer_decision"]
+                    blocked.metadata = metadata_for(record)
+                    raise blocked from exc
             matching = [a for a in adapters.values()
                         if getattr(a, "world", None) is world and getattr(a, "kind", None) == record["adapter_kind"]]
             if not matching:
@@ -85,23 +92,42 @@ async def find_dispatch(db, instance, adapters, *, approval_id=None):
 
 
 def resolve_recipient(world, instance, snapshot, action):
-    """Only a bound recovery queue permits a recipient distinct from the entity."""
+    """Person workflows address their entity; aggregate workflows require a bound queue."""
     item_id = snapshot.get("item_id")
     item = None
-    if instance.workflow_id == "integration_failure_recovery":
+    entity_types = {"prospect_to_meeting": "prospect", "missed_inquiry_recovery": "lead",
+                    "integration_failure_recovery": "integration_operation",
+                    "estimate_followup": "estimate", "stale_lead_reactivation": "lead_batch"}
+    if entity_types.get(instance.workflow_id) != instance.entity_type:
+        raise SyntheticComplianceBlock("evidence_missing_or_scope_unknown")
+    person_workflow = instance.workflow_id in {"prospect_to_meeting", "missed_inquiry_recovery"}
+    aggregate_workflow = instance.workflow_id in {
+        "integration_failure_recovery", "estimate_followup", "stale_lead_reactivation",
+    }
+    if not person_workflow and not aggregate_workflow:
+        raise SyntheticComplianceBlock("evidence_missing_or_scope_unknown")
+    if aggregate_workflow:
         item = world.queue.get(instance.entity_id)
-        if ("recipient_id" in snapshot or not item or item_id != item["item_id"]):
+        if ("recipient_id" in snapshot or not item
+                or item.get("workflow_id") != instance.workflow_id
+                or item.get("entity_id") != instance.entity_id
+                or ("item_id" in snapshot and item_id != item["item_id"])):
             raise SyntheticComplianceBlock("evidence_missing_or_scope_unknown")
         recipient = item["recipient_id"]
     else:
         recipient = instance.entity_id
         if "recipient_id" in snapshot and snapshot["recipient_id"] != recipient:
             raise SyntheticComplianceBlock("evidence_missing_or_scope_unknown")
-        if item_id is not None:
-            items = [q for q in world.queue.values() if q["item_id"] == item_id]
-            if len(items) != 1 or items[0]["recipient_id"] != recipient or items[0]["original_action"] != action:
-                raise SyntheticComplianceBlock("evidence_missing_or_scope_unknown")
-            item = items[0]
+        items = [q for q in world.queue.values()
+                 if q.get("origin_workflow_id") == instance.workflow_id
+                 and q.get("origin_entity_id") == instance.entity_id
+                 and q["original_action"] == action]
+        if len(items) > 1:
+            raise SyntheticComplianceBlock("evidence_missing_or_scope_unknown")
+        item = items[0] if items else None
+        if ((item and item["recipient_id"] != recipient)
+                or ("item_id" in snapshot and (not item or item_id != item["item_id"]))):
+            raise SyntheticComplianceBlock("evidence_missing_or_scope_unknown")
     if not isinstance(recipient, str) or recipient not in world.contacts:
         raise SyntheticComplianceBlock("evidence_missing_or_scope_unknown")
     return recipient, item
@@ -148,7 +174,7 @@ def register_consumer(record, instance, decision, *, approval_id=None):
 
 async def execute_dispatch(
     db, instance, native, snapshot, registry, adapter, metadata: dict[str, Any],
-    *, existing=None, approval_id=None, manual_receipt=None,
+    *, existing=None, approval_id=None,
 ):
     """Prepare, evaluate freshly, and execute without an intervening await.
 
@@ -176,11 +202,21 @@ async def execute_dispatch(
         raise DispatchBlocked(evaluate_outbound_eligibility(
             compliance_context(world, recipient, native, registry, {}, scope_valid=False),
         ))
+    if item and item["status"] == "blocked":
+        raise DispatchBlocked(evaluate_outbound_eligibility(
+            compliance_context(world, recipient, native, registry, {}, scope_valid=False),
+        ))
     if recipient in world.review_blocked_recipients:
-        raise SyntheticCapabilityError("recipient has an orphan dispatch requiring review")
+        events = await consumer_events(db, instance)
+        for orphan in world.dispatches.values():
+            if (orphan["recipient_id"] == recipient and instance.id in orphan["consumers"]
+                    and not any(e.payload.get("metadata", {}).get("orphan_dispatch_id") == orphan["dispatch_id"] for e in events)):
+                metadata["orphan_dispatch_id"] = orphan["dispatch_id"]
+                break
+        raise RecipientReviewBlocked("orphan dispatch: outbound sends to recipient blocked for the rest of this run")
 
     if record is None and item:
-        record = world.dispatches.get(world.dispatch_id(item["item_id"]))
+        record = world.dispatches.get(item.get("dispatch_id") or world.dispatch_id(item["item_id"]))
         if record:
             if record["recipient_id"] != recipient or record["adapter_kind"] != adapter.kind:
                 raise SyntheticCapabilityError("queued dispatch identity differs")
@@ -210,15 +246,28 @@ async def execute_dispatch(
                f"{native['action']}:{recipient}:{n}")
         message_key = item["item_id"] if item else (
             f"{instance.id}:{instance.current_state}:{instance.version}:{native['action']}")
+        if not item:
+            message_key += f":approval:{approval_id}" if approval_id is not None else ":direct"
+            base_message_key = message_key
+            attempt = 0
+            # A blocked attempt sent nothing. Preserve its evidence but permit a fresh decision.
+            while (previous := world.dispatches.get(world.dispatch_id(message_key))) is not None:
+                if previous["status"] != "blocked":
+                    break
+                attempt += 1
+                message_key = f"{base_message_key}:attempt:{attempt}"
         record = world.prepare_dispatch(
             message_key=message_key, recipient_id=recipient, adapter_kind=adapter.kind,
             adapter_idempotency_key=key, origin_workflow_instance_id=instance.id,
             origin_state_before=instance.current_state, origin_workflow_version=instance.version,
             frozen_native_decision=native, rendered_payload=payload, consumers={},
+            origin_workflow_id=item.get("origin_workflow_id") if item else instance.workflow_id,
+            origin_entity_id=item.get("origin_entity_id") if item else instance.entity_id,
         )
         register_consumer(record, instance, native, approval_id=approval_id)
         metadata.update(metadata_for(record))
     if item:
+        item["dispatch_id"] = record["dispatch_id"]
         item["original_adapter_key"] = record["adapter_idempotency_key"]
     context = compliance_context(world, recipient, record["frozen_native_decision"], registry, payload,
                                  scope_valid=record["status"] != "blocked" and (not item or item["status"] != "blocked"))
@@ -228,16 +277,15 @@ async def execute_dispatch(
         if item:
             item["status"] = "blocked"
         raise DispatchBlocked(result)
+    world.arm_action_failure(instance.workflow_id, instance.entity_id, native["action"],
+                             adapter.kind, record["adapter_idempotency_key"])
     try:
-        if manual_receipt:
-            receipt = manual_receipt
-        else:
-            metadata["dispatch_attempted"] = True
-            receipt = await adapter.execute(
-                {**deepcopy(record["frozen_native_decision"]), "rendered_payload": deepcopy(payload)},
-                idempotency_key=record["adapter_idempotency_key"], run_id=run.run_id,
-                recipient_id=recipient,
-            )
+        metadata["dispatch_attempted"] = True
+        receipt = await adapter.execute(
+            {**deepcopy(record["frozen_native_decision"]), "rendered_payload": deepcopy(payload)},
+            idempotency_key=record["adapter_idempotency_key"], run_id=run.run_id,
+            recipient_id=recipient,
+        )
     except SyntheticComplianceBlock as exc:
         record["status"] = "blocked"
         if item:
@@ -253,3 +301,13 @@ async def execute_dispatch(
     if item:
         item.update(status="sent", receipt=receipt)
     return receipt, result.evidence
+
+
+def refusal_evidence(adapter, instance, native, registry, metadata):
+    world = getattr(adapter, "world", None)
+    if not isinstance(world, SyntheticWorld):
+        return evaluate_outbound_eligibility({}).evidence
+    recipient = metadata.get("recipient_id", instance.entity_id)
+    return evaluate_outbound_eligibility(compliance_context(
+        world, recipient, native, registry, {}, scope_valid=False,
+    )).evidence

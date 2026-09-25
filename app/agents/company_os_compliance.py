@@ -10,9 +10,9 @@ from dataclasses import dataclass
 from datetime import datetime
 from string import Formatter
 from typing import Any
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError, available_timezones
 
-EMAIL_USES = {"acquisition_email", "transactional_email", "send_outreach"}
+EMAIL_USES = {"acquisition_email", "transactional_email"}
 REASONS = {
     "BASE-01": "evidence_missing_or_scope_unknown",
     "EMAIL-01": "email_header_or_subject_invalid",
@@ -40,9 +40,22 @@ def evidence_hash(record: Any) -> str:
 
 def registered_channel(config: dict[str, Any], requested_use: str | None) -> str | None:
     """Only an explicitly registered email use establishes email scope."""
-    if requested_use in config.get("desired_use", []) and requested_use in EMAIL_USES:
+    if isinstance(requested_use, str) and requested_use in config.get("desired_use", []) and requested_use in EMAIL_USES:
         return "email"
     return None
+
+
+def is_email_integration(request: Any, registry: dict[str, Any]) -> bool:
+    """True for any request naming an integration registered for an email use, in any phase."""
+    if not isinstance(request, dict) or not isinstance(request.get("name"), str):
+        return False
+    config = registry["integrations"].get(request["name"], {})
+    return any(use in EMAIL_USES for use in config.get("desired_use", []))
+
+
+def is_email_execute(request: Any, registry: dict[str, Any]) -> bool:
+    """Classify by registered capability, never let a requested use bypass the gate."""
+    return is_email_integration(request, registry) and request.get("phase") == "execute"
 
 
 def render_message(message: dict, template: dict, sender: dict, contact: dict) -> dict:
@@ -86,9 +99,14 @@ def _text(value: Any) -> bool:
     return isinstance(value, str) and bool(value.strip())
 
 
+RFC3339 = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})")
+CANONICAL_ZONES = frozenset(available_timezones())
+
+
 def _time(value: Any) -> datetime | None:
     try:
-        parsed = datetime.fromisoformat(value) if isinstance(value, str) else None
+        parsed = (datetime.fromisoformat(value)
+                  if isinstance(value, str) and RFC3339.fullmatch(value) else None)
         return parsed if parsed is not None and parsed.tzinfo is not None else None
     except ValueError:
         return None
@@ -102,17 +120,25 @@ def evaluate_outbound_eligibility(context: dict[str, Any]) -> ComplianceResult:
     template, payload = c.get("template") or {}, c.get("rendered_payload") or {}
     now = _time(c.get("evaluated_at"))
     zone = contact.get("recipient_time_zone")
-    local_time = None
     try:
-        if now and _text(zone):
-            local_time = now.astimezone(ZoneInfo(zone)).isoformat()
+        zone_info = ZoneInfo(zone) if isinstance(zone, str) and zone in CANONICAL_ZONES else None
     except (ZoneInfoNotFoundError, ValueError):
-        zone = None
+        zone_info = None
+    zone = zone if zone_info is not None else None
+    local_time = now.astimezone(zone_info).isoformat() if now and zone_info else None
     location = contact.get("recipient_location") or {}
+    location = location if isinstance(location, dict) else {}
     def timestamp(value):
         parsed = _time(value)
         return now is not None and parsed is not None and parsed <= now
 
+    consent_matches = (
+        _text(c.get("recipient_id")) and consent.get("recipient_id") == c.get("recipient_id")
+        and _text(consent.get("contact_email")) and _text(contact.get("address"))
+        and consent["contact_email"].strip().casefold() == contact["address"].strip().casefold()
+        and consent.get("method") in {"manual", "automated"}
+        and consent["method"] == sender.get("dispatch_method")
+    )
     suppressed = suppression.get("suppressed") is not False
     trusted = (
         c.get("channel") == "email" and c.get("purpose") == "commercial"
@@ -123,7 +149,7 @@ def evaluate_outbound_eligibility(context: dict[str, Any]) -> ComplianceResult:
         and _text(c.get("recipient_id")) and contact.get("recipient_id") == c.get("recipient_id")
         and _text(contact.get("address")) and "@" in contact["address"]
         and all(_text(location.get(k)) for k in ("country", "state")) and local_time is not None
-        and consent.get("seller") == sender.get("seller_name")
+        and consent_matches and consent.get("seller") == sender.get("seller_name")
         and consent.get("channel") == "email" and consent.get("purpose") == "commercial"
         and timestamp(consent.get("captured_at")) and "revoked_at" in consent
         and consent["revoked_at"] is None and contact.get("consent_verified") is True
@@ -176,14 +202,26 @@ def evaluate_outbound_eligibility(context: dict[str, Any]) -> ComplianceResult:
         "sender": sender, "recipient": contact, "consent": consent,
         "suppression": suppression, "template": template, "rendered_payload": payload,
     }
+    # Evidence must always be recordable: malformed facts become null, and BASE-01 already fails for them.
+    def text_or_none(value):
+        return value if _text(value) else None
+
+    def time_or_none(value):
+        return value if _time(value) is not None else None
+
+    sha = c.get("policy_sha256")
     evidence = {
-        "policy_version": c.get("policy_version"), "policy_sha256": c.get("policy_sha256"),
-        "channel": c.get("channel"), "method": sender.get("dispatch_method"),
-        "purpose": c.get("purpose"), "recipient_ref": c.get("recipient_id"),
-        "sender_ref": sender.get("sender_id"), "suppression_version": suppression.get("version"),
-        "jurisdiction": {k: location.get(k) for k in ("country", "state")},
+        "policy_version": text_or_none(c.get("policy_version")),
+        "policy_sha256": sha if isinstance(sha, str) and re.fullmatch(r"[0-9a-fA-F]{64}", sha) else None,
+        "channel": text_or_none(c.get("channel")), "method": text_or_none(sender.get("dispatch_method")),
+        "purpose": text_or_none(c.get("purpose")), "recipient_ref": text_or_none(c.get("recipient_id")),
+        "sender_ref": text_or_none(sender.get("sender_id")),
+        "suppression_version": text_or_none(suppression.get("version")),
+        "jurisdiction": {k: text_or_none(location.get(k)) if isinstance(location, dict) else None
+                         for k in ("country", "state")},
         "recipient_time_zone": zone, "recipient_local_time": local_time,
-        "evaluated_at": c.get("evaluated_at"), "suppression_checked_at": suppression.get("checked_at"),
+        "evaluated_at": time_or_none(c.get("evaluated_at")),
+        "suppression_checked_at": time_or_none(suppression.get("checked_at")),
         "evidence_hashes": [
             {"record_type": kind, "record_id": kind + ":" + str(c.get("recipient_id")),
              "sha256": evidence_hash(record) if record else None}

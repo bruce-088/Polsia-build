@@ -1,0 +1,99 @@
+{
+  "id": "missed_inquiry_recovery",
+  "version": "0.2.1",
+  "purpose": "Recover an inbound inquiry that did not receive a timely response, using only customer-approved channels and routing rules.",
+  "entity_type": "lead",
+  "owner_agent": "revenue_ops",
+  "states": [
+    "received",
+    "eligibility_check",
+    "ineligible",
+    "response_drafted",
+    "ready_to_send",
+    "sent",
+    "engaged",
+    "qualified",
+    "routed",
+    "closed",
+    "opted_out",
+    "exception"
+  ],
+  "terminal_states": [
+    "ineligible",
+    "routed",
+    "closed",
+    "opted_out"
+  ],
+  "transitions": [
+    {
+      "from": "received",
+      "to": "eligibility_check",
+      "action": "verify_source_channel_and_customer_policy",
+      "risk_level": "GREEN"
+    },
+    {
+      "from": "eligibility_check",
+      "to": "ineligible",
+      "action": "block_ineligible_contact",
+      "risk_level": "GREEN"
+    },
+    {
+      "from": "eligibility_check",
+      "to": "response_drafted",
+      "action": "draft_recovery_response",
+      "risk_level": "GREEN"
+    },
+    {
+      "from": "response_drafted",
+      "to": "ready_to_send",
+      "action": "verify_approved_template_and_channel",
+      "risk_level": "YELLOW"
+    },
+    {
+      "from": "ready_to_send",
+      "to": "sent",
+      "action": "send_recovery_message",
+      "risk_level": "YELLOW",
+      "requirements": [
+        "approved customer workflow",
+        "verified writable integration"
+      ],
+      "integration": "sendgrid"
+    },
+    {
+      "from": "sent",
+      "to": "engaged",
+      "action": "record_reply",
+      "risk_level": "GREEN"
+    },
+    {
+      "from": "engaged",
+      "to": "qualified",
+      "action": "qualify_using_customer_rules",
+      "risk_level": "GREEN"
+    },
+    {
+      "from": "qualified",
+      "to": "routed",
+      "action": "route_to_authoritative_next_step",
+      "risk_level": "YELLOW"
+    },
+    {
+      "from": "sent",
+      "to": "opted_out",
+      "action": "record_opt_out",
+      "risk_level": "GREEN"
+    },
+    {
+      "from": "engaged",
+      "to": "exception",
+      "action": "escalate_unknown_or_sensitive_request",
+      "risk_level": "YELLOW"
+    }
+  ],
+  "invariants": [
+    "Do not invent appointment availability.",
+    "Do not quote service pricing without explicit customer authority.",
+    "Do not claim a job is booked until the authoritative system confirms it."
+  ]
+}

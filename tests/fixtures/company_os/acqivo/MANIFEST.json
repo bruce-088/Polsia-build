@@ -1,0 +1,44 @@
+{
+  "source_repo": "/Users/brucelove/.openclaw/workspace/.openclaw/tmp/acqivo-company-os",
+  "compliance_policy_version": "0.1.0",
+  "files": {
+    "workflows/prospect_to_meeting.json": {
+      "source_path": "/Users/brucelove/.openclaw/workspace/.openclaw/tmp/acqivo-company-os/workflows/prospect_to_meeting.json",
+      "sha256": "4dce58174b25f97020200481d2bd21c1ac9cb9b6d248a65cba2b9788dcc6262c"
+    },
+    "workflows/customer_onboarding.json": {
+      "source_path": "/Users/brucelove/.openclaw/workspace/.openclaw/tmp/acqivo-company-os/workflows/customer_onboarding.json",
+      "sha256": "51539ae26b44efd4d5ed3e75341478215952d6e737cd736ce50bfb82d2c4c88f"
+    },
+    "workflows/missed_inquiry_recovery.json": {
+      "source_path": "/Users/brucelove/.openclaw/workspace/.openclaw/tmp/acqivo-company-os/workflows/missed_inquiry_recovery.json",
+      "sha256": "1f42751e31523de50fce3c1083d77fe22809e11353a7eee7369fdd814757b6b2"
+    },
+    "workflows/integration_failure_recovery.json": {
+      "source_path": "/Users/brucelove/.openclaw/workspace/.openclaw/tmp/acqivo-company-os/workflows/integration_failure_recovery.json",
+      "sha256": "b6ade7bb19a0442b76a2fc48347c32f6c475702bb6181bc584bd0c3dd59fef79"
+    },
+    "policy/approval_policy.json": {
+      "source_path": "/Users/brucelove/.openclaw/workspace/.openclaw/tmp/acqivo-company-os/policy/approval_policy.json",
+      "sha256": "25df73120cd83112a664ef67484e5a487e360071837f7eed730e3fc7bcb01921"
+    },
+    "integrations/stage2_sandbox_registry.json": {
+      "source_path": "/Users/brucelove/.openclaw/workspace/.openclaw/tmp/acqivo-company-os/integrations/stage2_sandbox_registry.json",
+      "sha256": "71eaf8b005316297affb4bbc9a63a34ae97b99ed693295122cb3b8e0f673ebc4"
+    },
+    "schemas/sandbox_event.schema.json": {
+      "source_path": "/Users/brucelove/.openclaw/workspace/.openclaw/tmp/acqivo-company-os/schemas/sandbox_event.schema.json",
+      "sha256": "4b2ebb3337717dee778247c81eb2bb877d02c7d57d43b8230a96672b04e4ccb3"
+    },
+    "simulations/stage2_synthetic_input_fixtures.json": {
+      "source_path": "/Users/brucelove/.openclaw/workspace/.openclaw/tmp/acqivo-company-os/simulations/stage2_synthetic_input_fixtures.json",
+      "sha256": "b9f89b431ceeb8193dd6bc9573c9a5257d8f95424d809f01680692dcc5b5e6ed"
+    },
+    "COMPLIANCE_POLICY.md": {
+      "source_path": "/Users/brucelove/.openclaw/workspace/.openclaw/tmp/acqivo-company-os/COMPLIANCE_POLICY.md",
+      "sha256": "c9115ec08aa74db8bbef8093845830559fb695b3ac781d32d5051409933b7bcc"
+    }
+  },
+  "compliance_policy_sha256": "c9115ec08aa74db8bbef8093845830559fb695b3ac781d32d5051409933b7bcc",
+  "source_commit": "7eafeeb63e6291f85e7660447740658a3771ace5"
+}
