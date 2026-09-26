@@ -24,7 +24,11 @@ from app.models.company_os_sandbox import (
     CompanyOSSandboxRun,
     CompanyOSWorkflowInstance,
 )
-from app.services.company_os_stage2_harness_runner import HarnessDefect, HarnessReport, run_stage2_fixture_pack
+from app.services.company_os_stage2_harness_runner import (
+    HarnessDefect,
+    HarnessReport,
+    run_stage2_fixture_pack,
+)
 from app.services.company_os_stage2_inputs import build_stage2_snapshot
 from app.services.company_os_synthetic_adapters import SyntheticAdapter
 
@@ -63,9 +67,9 @@ async def export(args) -> int:
     if not settings.sandbox_mode:
         raise ValueError("SANDBOX_MODE must be enabled")
     paths = [Path(p).resolve() for p in (args.events, args.native_evidence, args.service_rejections, args.database)]
-    report_path = Path(str(paths[0]) + ".driver_report.json")
-    defect_path = Path(str(paths[0]) + ".harness_defect.json")
-    environment_path = Path(str(paths[0]) + ".environment_failure.json")
+    report_path = Path(str(paths[0]) + "_driver_report.json")
+    defect_path = Path(str(paths[0]) + "_harness_defect.json")
+    environment_path = Path(str(paths[0]) + "_environment_failure.json")
     all_paths = [*paths, report_path, defect_path, environment_path]
     if len(set(all_paths)) != len(all_paths) or any(p.exists() for p in all_paths):
         raise ValueError("output paths must be distinct and unoccupied")
@@ -96,6 +100,7 @@ async def export(args) -> int:
                     async for payload, evidence in run_stage2_fixture_pack(
                         db, fixture_pack=pack, run_id=args.run_id, decide=provider, world=world,
                         founder_resolutions=corrections, report=report, synthetic_adapters=adapters,
+                        driver_controls=read_json(args.driver_controls) if args.driver_controls else {},
                         **{k: runtime[k] for k in ("workflows", "policy", "integration_registry", "event_schema",
                                                   "canonical_agents", "canonical_handoffs", "canonical_actions")},
                     ):
@@ -135,6 +140,7 @@ def parser():
     for name in ("fixture-pack", "runtime-inputs", "run-id", "events", "native-evidence", "service-rejections", "database", "mock-decisions"):
         result.add_argument("--" + name, required=True)
     result.add_argument("--founder-resolutions")
+    result.add_argument("--driver-controls")
     result.add_argument("--provider", choices=["deterministic_mock", "stage2_structured"], required=True)
     result.add_argument("--infrastructure-only", action="store_true")
     return result

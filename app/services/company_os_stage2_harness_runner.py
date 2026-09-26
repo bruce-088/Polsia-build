@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from collections.abc import AsyncIterator
 from copy import deepcopy
 from dataclasses import dataclass, field
@@ -18,6 +19,7 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.agents.company_os_compliance import is_email_execute
 from app.agents.company_os_stage2_provider import ScriptedProviderTimeout
 from app.config import settings
 from app.models.company_os_sandbox import CompanyOSSandboxApproval, CompanyOSSandboxEvent
@@ -66,6 +68,7 @@ class HarnessReport:
     harness_defect: dict | None = None
     environment_failure: dict | None = None
     pending: dict = field(default_factory=dict)
+    failures: list = field(default_factory=list)
 
 
 def classify_outcome(payload: dict) -> str:
@@ -155,14 +158,25 @@ def validate_pack(pack: dict, workflows: dict, corrections: list, registry: dict
             ):
                 raise FixtureAuthoringError("undeclared or unknown scripted failure type")
         for attempt in case.get("attempts", []):
-            if attempt.get("replay_of") not in refs | {None}:
-                raise FixtureAuthoringError("unknown replay attempt")
+            if attempt.get("replay_of") is not None:
+                earlier = {a["ref"] for a in case["attempts"] if a["ordinal"] < attempt["ordinal"]}
+                if attempt["replay_of"] not in earlier:
+                    raise FixtureAuthoringError("replay must reference an earlier attempt")
         local_decisions = {a["decision_id"] for a in case.get("attempts", []) if a.get("decision_id")}
+        rejection = case.get("expected_service_rejection")
+        if rejection is not None and (
+            set(rejection) != {"call", "exception_type", "expects"}
+            or rejection["call"] not in {"coordinate_sandbox_action", "resolve_sandbox_approval", "resume_sandbox_approval"}
+            or rejection["exception_type"] != ("SandboxCoordinatorError" if rejection["call"] == "coordinate_sandbox_action" else "SandboxApprovalError")
+            or not isinstance(rejection["expects"], str) or not rejection["expects"]
+        ):
+            raise FixtureAuthoringError("service rejection requires exact call, exception type and message")
         commands = case.get("control_commands", [])
         command_ids = [c["id"] for c in commands]
         if len(command_ids) != len(set(command_ids)):
             raise FixtureAuthoringError("duplicate command identity")
         resolution_targets = set()
+        retry_targets = set()
         for command in commands:
             pre = command["precondition"]
             if command["command_type"] == "founder_resolution":
@@ -176,6 +190,10 @@ def validate_pack(pack: dict, workflows: dict, corrections: list, registry: dict
                 if len(matches) != 1:
                     raise FixtureAuthoringError("resolution requires exactly one corrections lookup")
             elif command["command_type"] == "retry":
+                target_key = json.dumps(pre, sort_keys=True)
+                if target_key in retry_targets:
+                    raise FixtureAuthoringError("one retry command per failed attempt")
+                retry_targets.add(target_key)
                 if pre["type"] != "failed_attempt_persisted":
                     raise FixtureAuthoringError("invalid retry precondition")
                 if "decision_id" in pre:
@@ -204,14 +222,10 @@ def validate_pack(pack: dict, workflows: dict, corrections: list, registry: dict
                     raise FixtureAuthoringError("unknown milestone case")
                 target = cases[parts[1]]
                 transitions = workflows[target["workflow_id"]]["transitions"]
-                integrations = registry["integrations"]
-                if not any(t["action"] == parts[2] and t.get("integration") in integrations and
-                           integrations[t["integration"]].get("channel") == "email" for t in transitions):
-                    # Registry uses desired_use rather than channel for the frozen SendGrid overlay.
-                    if not any(t["action"] == parts[2] and t.get("integration") in integrations and
-                               set(integrations[t["integration"]].get("desired_use", [])) &
-                               {"acquisition_email", "transactional_email", "commercial_email"} for t in transitions):
-                        raise FixtureAuthoringError("milestone target is not a governed email transition")
+                if not any(t["action"] == parts[2] and is_email_execute(
+                    {"name": t.get("integration"), "phase": "execute"}, registry,
+                ) for t in transitions):
+                    raise FixtureAuthoringError("milestone target is not a governed email transition")
             else:
                 raise FixtureAuthoringError("ambiguous dependency: expected signal: or milestone:")
     visiting, done = set(), set()
@@ -234,6 +248,16 @@ def validate_pack(pack: dict, workflows: dict, corrections: list, registry: dict
         if key in correction_keys or key[0] not in cases or row["status"] not in STATUSES:
             raise FixtureAuthoringError("invalid or duplicate founder correction")
         correction_keys.add(key)
+        if key[1] not in {a.get("decision_id") for a in cases[key[0]].get("attempts", [])}:
+            raise FixtureAuthoringError("correction references an undeclared decision")
+        minutes = row.get("founder_minutes")
+        if (not isinstance(row.get("founder_id"), str) or not row["founder_id"] or
+            type(minutes) not in (int, float) or not math.isfinite(minutes) or minutes < 0):
+            raise FixtureAuthoringError("founder identity and finite nonnegative minutes are required")
+        manual = row.get("manual_evidence_ref")
+        if manual is not None and (row["status"] not in EXECUTABLE or
+                                   not isinstance(manual, str) or not manual.startswith("sandbox://")):
+            raise FixtureAuthoringError("manual evidence requires an executable status and sandbox reference")
         if (row["status"] == "modified") != (row.get("corrected_decision") is not None):
             raise FixtureAuthoringError("only modified resolution carries corrected_decision")
         if row.get("corrected_decision") is not None and set(row["corrected_decision"]) != {
@@ -259,7 +283,7 @@ def evidence_context(case: dict, consumed: list, world: SyntheticWorld) -> dict:
     if isinstance(facts.get("icp_score"), (int, float)) and facts.get("confidence") is not None:
         requirements.add("score and confidence recorded")
     if facts.get("meeting_confirmed") is True and str(facts.get("confirmation_ref", "")).startswith("sandbox://"):
-        requirements.add("calendar or human confirmation")
+        requirements.update({"calendar or human confirmation", "authoritative calendar or human handoff"})
     refs = [f"sandbox://fixture/{case['id']}/snapshot"]
     refs.extend(f"sandbox://delivery/{s['delivery_id']}" for s in consumed)
     return {"facts": facts, "signals": deepcopy([s for s in consumed if s["type"] != "failure_injection"]),
@@ -267,6 +291,8 @@ def evidence_context(case: dict, consumed: list, world: SyntheticWorld) -> dict:
             "consent_record": deepcopy(world.consents.get(entity, {})),
             "suppression_snapshot": deepcopy(world.suppression_snapshots.get(entity, {})),
             "available_template_ids": deepcopy(case.get("available_template_ids", [])),
+            "approved_templates": {key: deepcopy(world.templates[key])
+                                   for key in case.get("available_template_ids", []) if key in world.templates},
             "verified_requirements": sorted(requirements), "evidence_refs": refs,
             "consent_verified": world.contacts.get(entity, {}).get("consent_verified") is True and not world.is_suppressed(entity),
             "authority_verified": facts.get("authority_verified") is True or facts.get("customer_authority_verified") is True}
@@ -318,7 +344,10 @@ class _Runner:
                 for _, signal in signals:
                     if signal["delivery_id"] in self.ingested or not all(self.dependency_ready(d) for d in signal.get("after", [])):
                         continue
-                    apply_stage2_signal(self.world, state.source, signal, self.world.frozen_at)
+                    try:
+                        apply_stage2_signal(self.world, state.source, signal, self.world.frozen_at)
+                    except Exception as exc:
+                        raise HarnessDefect(f"signal ingestion: {type(exc).__name__}: {exc}") from exc
                     self.ingested.add(signal["delivery_id"])
                     state.consumed.append(deepcopy(signal))
                     self.activity += 1
@@ -381,8 +410,21 @@ class _Runner:
             elif failure_type not in {*self.pack.get("scripted_failure_types", []), "CompanyOSMalformedOutputError"}:
                 self.report.environment_failure = {"case_id": state.source["id"], "type": failure_type}
         self.report.outcomes[state.source["id"]] = state.outcome
-        self.drain()
         return pair
+
+    async def resolve(self, state, decision_id):
+        """Existence-only binding; exact replays remain the service's responsibility."""
+        row = await self.approval(state, decision_id)
+        if row is None:
+            raise HarnessDefect("resolution has no persisted approval request")
+        correction = next(r for r in self.corrections if
+                          (r["case_id"], r["decision_id"]) == (state.source["id"], decision_id))
+        params = {key: correction.get(key) for key in
+                  ("status", "founder_id", "founder_minutes", "corrected_decision", "manual_evidence_ref")}
+        key = f"{state.source['id']}:{decision_id}:{correction['status']}"
+        return await self.call(state, resolve_sandbox_approval, approval_id=row.id,
+            resolution_key=key, event_schema=self.options["event_schema"],
+            workflow=self.workflows[state.source["workflow_id"]], **params)
 
     async def controls(self) -> AsyncIterator[tuple[dict, dict]]:
         """Dispatch one command/service call at a time, then globally re-scan."""
@@ -428,15 +470,8 @@ class _Runner:
                     self.activity += 1
                     changed = True
                     if command["command_type"] == "founder_resolution":
-                        correction = next(r for r in self.corrections if
-                                          (r["case_id"], r["decision_id"]) == (state.source["id"], row.decision_id))
-                        params = {key: correction.get(key) for key in
-                                  ("status", "founder_id", "founder_minutes", "corrected_decision", "manual_evidence_ref")}
-                        key = f"{state.source['id']}:{row.decision_id}:{correction['status']}"
-                        event = await self.call(state, resolve_sandbox_approval, approval_id=row.id,
-                            resolution_key=key, event_schema=self.options["event_schema"],
-                            workflow=self.workflows[state.source["workflow_id"]], **params)
-                        if event is not None and correction["status"] in EXECUTABLE:
+                        event = await self.resolve(state, row.decision_id)
+                        if event is not None and row.status in EXECUTABLE:
                             state.resume_due = row.decision_id
                     else:
                         if state.retries >= MAX_RETRIES_PER_CASE:
@@ -520,7 +555,7 @@ async def run_stage2_fixture_pack(
     event_schema: dict, canonical_agents, canonical_handoffs, canonical_actions,
     synthetic_adapters: dict[str, SyntheticAdapter], world: SyntheticWorld | None = None,
     compliance_policy: dict | None = None, founder_resolutions: list | None = None,
-    report: HarnessReport | None = None,
+    report: HarnessReport | None = None, driver_controls: dict | None = None,
 ) -> AsyncIterator[tuple[dict, dict | None]]:
     """Yield each newly persisted canonical/native pair once, in service-call order.
 
@@ -533,9 +568,21 @@ async def run_stage2_fixture_pack(
     try:
         if not settings.sandbox_mode or pack.get("synthetic_only") is not True:
             raise FixtureAuthoringError("synthetic-only pack and sandbox_mode are required")
+        # Evaluator/control artifacts are separate from the input-only fixture pack.
+        controls = deepcopy(driver_controls or {})
+        ids = {case["id"] for case in pack["cases"]}
+        if set(controls) - ids:
+            raise FixtureAuthoringError("controls reference an unknown case")
+        for case in pack["cases"]:
+            if set(case) & {"attempts", "control_commands", "expected_service_rejection"}:
+                raise FixtureAuthoringError("attempts, commands and expectations belong in driver_controls")
+            control = controls.get(case["id"], {})
+            if set(control) - {"attempts", "control_commands", "expected_service_rejection"}:
+                raise FixtureAuthoringError("unknown driver control field")
+            case.update(control)
         validate_pack(pack, workflows, corrections, integration_registry)
         if world is None:
-            world = build_stage2_snapshot(pack, integration_registry, pack["approved_templates"],
+            world = build_stage2_snapshot(fixture_pack, integration_registry, pack["approved_templates"],
                 run_id=run_id, compliance_policy=compliance_policy or pack.get("compliance_policy", {}))
             synthetic_adapters = {name: SyntheticAdapter(world, adapter.kind) for name, adapter in synthetic_adapters.items()}
         if world.run_id != run_id or world.frozen_at != datetime.fromisoformat(pack["frozen_clock"]):
@@ -580,6 +627,16 @@ async def run_stage2_fixture_pack(
             report.outcomes[case_id] = state.outcome
             pending_signals = [s["delivery_id"] for s in state.source["inputs"] if s["delivery_id"] not in runner.ingested]
             pending_commands = [c["id"] for c in state.source.get("control_commands", []) if c["id"] not in state.commands_done]
+            if pending_commands:
+                report.failures.append({"case_id": case_id, "outcome": "unconsumed_control_command",
+                                        "commands": pending_commands, "last_outcome": state.outcome})
+                if state.outcome not in {"decision_budget_exhausted", "retry_budget_exhausted"}:
+                    report.outcomes[case_id] = "unconsumed_control_command"
+            if state.outcome in {"decision_budget_exhausted", "retry_budget_exhausted"}:
+                report.failures.append({"case_id": case_id, "outcome": state.outcome})
+            if pending_signals:
+                report.failures.append({"case_id": case_id, "outcome": "unconsumed_signal",
+                                        "signals": pending_signals})
             if pending_signals or pending_commands:
                 report.pending[case_id] = {"signals": pending_signals, "commands": pending_commands,
                                            "reason": "runtime_precondition_unsatisfied"}
