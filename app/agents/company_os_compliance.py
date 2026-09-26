@@ -130,9 +130,9 @@ def _time(value: Any) -> datetime | None:
 def evaluate_outbound_eligibility(context: dict[str, Any]) -> ComplianceResult:
     """Evaluate without mutating input, reading a clock, or consulting services."""
     c = deepcopy(context)
-    sender, contact = c.get("sender") or {}, c.get("contact") or {}
-    consent, suppression = c.get("consent") or {}, c.get("suppression") or {}
-    template, payload = c.get("template") or {}, c.get("rendered_payload") or {}
+    sender, contact = _record(c.get("sender")), _record(c.get("contact"))
+    consent, suppression = _record(c.get("consent")), _record(c.get("suppression"))
+    template, payload = _record(c.get("template")), _record(c.get("rendered_payload"))
     now = _time(c.get("evaluated_at"))
     zone = contact.get("recipient_time_zone")
     try:

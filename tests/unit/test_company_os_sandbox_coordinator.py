@@ -4,7 +4,7 @@ from copy import deepcopy
 
 import pytest
 from jsonschema import Draft202012Validator
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 
 import app.services.company_os_sandbox_approval_service as approval_module
 from app.models.company_os_sandbox import CompanyOSSandboxApproval, CompanyOSSandboxEvent
@@ -555,6 +555,44 @@ async def test_modified_approval_changed_action_blocks_direct_delivery_with_no_p
     corrected["policy_intent"]["action_type"] = "send_followup"
     corrected["policy_intent"]["requested_total"] = 5
     await resolve(async_db_session, approval, "modified", corrected_decision=corrected)
+
+    adapter = Adapter()
+    bypass_attempt = await invoke(
+        async_db_session, instance, corrected, adapter=adapter,
+        key="direct-bypass", workflow=FOLLOWUP_WORKFLOW,
+    )
+    assert bypass_attempt.payload["event_type"] == "failure_detected"
+    assert bypass_attempt.payload["result"] == "blocked"
+    assert bypass_attempt.payload["metadata"]["gate"] == "approval"
+    assert bypass_attempt.payload["approval"] is None
+    assert adapter.calls == 0
+    assert instance.current_state == "scored"
+
+
+@pytest.mark.asyncio
+async def test_stale_cached_approval_object_does_not_hide_a_committed_correction(async_db_session):
+    """A session-cached approval object must not shadow a row change committed elsewhere.
+
+    expire_on_commit=False means a session's identity map can keep serving an
+    already-loaded approval's stale Python attributes even after a fresh
+    SELECT's WHERE clause is evaluated against current row data -- unless the
+    read uses populate_existing. Simulate a second session's committed
+    resolution with a Core-level UPDATE that bypasses this session's ORM
+    object entirely, then confirm the approval gate still sees it.
+    """
+    instance, original, approval, _ = await pending_approval(async_db_session, workflow=FOLLOWUP_WORKFLOW)
+    corrected = deepcopy(original)
+    corrected["action"] = "send_followup"
+    corrected["policy_intent"]["action_type"] = "send_followup"
+    corrected["policy_intent"]["requested_total"] = 5
+
+    await async_db_session.execute(
+        update(CompanyOSSandboxApproval).where(CompanyOSSandboxApproval.id == approval.id).values(
+            status="modified", corrected_decision=corrected, founder_id="founder-1",
+        ).execution_options(synchronize_session=False),
+    )
+    await async_db_session.flush()
+    assert approval.status == "pending"  # this session's cached object is still stale
 
     adapter = Adapter()
     bypass_attempt = await invoke(

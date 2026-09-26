@@ -535,19 +535,24 @@ async def _awaiting_resume(db, instance, record) -> bool:
     consumer = record["consumers"][instance.id]
     approval_id = consumer.get("approval_id")
     if approval_id is not None:
-        approval = await db.get(CompanyOSSandboxApproval, approval_id)
+        approval = await db.get(CompanyOSSandboxApproval, approval_id, populate_existing=True)
         if approval is not None and approval.status in ("approved", "modified") and approval.resume_event_id is None:
             return True
     return await _has_unresumed_approval(db, instance, consumer["consumer_decision"]["action"])
 
 
 async def _has_unresumed_approval(db, instance, action) -> bool:
-    """An unresumed approval still binds its founder-corrected action, not just its original one."""
+    """An unresumed approval still binds its founder-corrected action, not just its original one.
+
+    populate_existing refreshes any approval already cached in this session's
+    identity map (expire_on_commit=False), so a resolution committed by another
+    session is not missed behind a stale cached row.
+    """
     approvals = await db.scalars(select(CompanyOSSandboxApproval).where(
         CompanyOSSandboxApproval.workflow_instance_id == instance.id,
         CompanyOSSandboxApproval.status.in_(("approved", "modified")),
         CompanyOSSandboxApproval.resume_event_id.is_(None),
-    ))
+    ).execution_options(populate_existing=True))
     for approval in approvals:
         effective_action = (
             approval.corrected_decision.get("action")

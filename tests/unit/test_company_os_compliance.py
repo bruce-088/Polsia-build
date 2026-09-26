@@ -158,6 +158,9 @@ def test_consent_address_comparison_is_normalized():
     ("suppression", "checked_at", "2026-09-24T00:00:00+00:60", "BASE-01"),
     ("template", "opt_out_route", [], "EMAIL-03"),
     ("template", "subject_accuracy_verified", [], "EMAIL-01"),
+    (None, "consent", ["malformed"], "BASE-01"),
+    (None, "sender", ["malformed"], "BASE-01"),
+    (None, "rendered_payload", ["malformed"], "BASE-01"),
     (None, "evaluated_at", 12, "BASE-01"),
     (None, "policy_sha256", "not-a-hash", "BASE-01"),
 ])
