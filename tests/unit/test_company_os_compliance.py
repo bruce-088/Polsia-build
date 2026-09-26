@@ -141,24 +141,27 @@ def test_consent_address_comparison_is_normalized():
     assert evaluate_outbound_eligibility(c).eligible
 
 
-@pytest.mark.parametrize("record,field,value", [
-    ("contact", "recipient_time_zone", 5),
-    ("contact", "recipient_time_zone", "Not/AZone"),
-    ("contact", "recipient_time_zone", "america/new_york"),
-    ("contact", "recipient_time_zone", "posixrules"),
-    ("suppression", "checked_at", "2026-09-25 00:00:00+00:00"),
-    ("contact", "recipient_location", {"country": "US", "state": ""}),
-    ("contact", "recipient_location", "Florida"),
-    ("sender", "dispatch_method", ""),
-    ("sender", "dispatch_method", []),
-    ("consent", "method", []),
-    ("sender", "sender_id", 7),
-    ("suppression", "version", ""),
-    ("suppression", "checked_at", "yesterday"),
-    (None, "evaluated_at", 12),
-    (None, "policy_sha256", "not-a-hash"),
+@pytest.mark.parametrize("record,field,value,rule", [
+    ("contact", "recipient_time_zone", 5, "BASE-01"),
+    ("contact", "recipient_time_zone", "Not/AZone", "BASE-01"),
+    ("contact", "recipient_time_zone", "america/new_york", "BASE-01"),
+    ("contact", "recipient_time_zone", "posixrules", "BASE-01"),
+    ("suppression", "checked_at", "2026-09-25 00:00:00+00:00", "BASE-01"),
+    ("contact", "recipient_location", {"country": "US", "state": ""}, "BASE-01"),
+    ("contact", "recipient_location", "Florida", "BASE-01"),
+    ("sender", "dispatch_method", "", "BASE-01"),
+    ("sender", "dispatch_method", [], "BASE-01"),
+    ("consent", "method", [], "BASE-01"),
+    ("sender", "sender_id", 7, "BASE-01"),
+    ("suppression", "version", "", "BASE-01"),
+    ("suppression", "checked_at", "yesterday", "BASE-01"),
+    ("suppression", "checked_at", "2026-09-24T00:00:00+00:60", "BASE-01"),
+    ("template", "opt_out_route", [], "EMAIL-03"),
+    ("template", "subject_accuracy_verified", [], "EMAIL-01"),
+    (None, "evaluated_at", 12, "BASE-01"),
+    (None, "policy_sha256", "not-a-hash", "BASE-01"),
 ])
-def test_malformed_facts_still_produce_a_schema_valid_block(record, field, value):
+def test_malformed_facts_still_produce_a_schema_valid_block(record, field, value, rule):
     import json
     from pathlib import Path
 
@@ -168,5 +171,5 @@ def test_malformed_facts_still_produce_a_schema_valid_block(record, field, value
     ctx = context()
     (ctx if record is None else ctx[record])[field] = value
     result = evaluate_outbound_eligibility(ctx)
-    assert not result.eligible and "BASE-01" in result.evidence["failed_rule_ids"]
+    assert not result.eligible and rule in result.evidence["failed_rule_ids"]
     Draft202012Validator(schema["properties"]["compliance"], format_checker=FormatChecker()).validate(result.evidence)

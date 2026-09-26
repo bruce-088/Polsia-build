@@ -540,6 +540,37 @@ async def test_modified_approval_changed_action_still_blocks_direct_delivery(asy
 
 
 @pytest.mark.asyncio
+async def test_modified_approval_changed_action_blocks_direct_delivery_with_no_pending_dispatch(async_db_session):
+    """The corrected action must stay bound to its approval even before any resume attempt.
+
+    _has_unresumed_approval must check the founder-corrected action for a
+    modified approval, not only the immutable original approval.action --
+    otherwise a direct decision for the corrected action has no unresumed
+    approval of its own to match and slips through with no pending dispatch
+    involved at all.
+    """
+    instance, original, approval, _ = await pending_approval(async_db_session, workflow=FOLLOWUP_WORKFLOW)
+    corrected = deepcopy(original)
+    corrected["action"] = "send_followup"
+    corrected["policy_intent"]["action_type"] = "send_followup"
+    corrected["policy_intent"]["requested_total"] = 5
+    await resolve(async_db_session, approval, "modified", corrected_decision=corrected)
+
+    adapter = Adapter()
+    bypass_attempt = await invoke(
+        async_db_session, instance, corrected, adapter=adapter,
+        key="direct-bypass", workflow=FOLLOWUP_WORKFLOW,
+    )
+    assert bypass_attempt.payload["event_type"] == "failure_detected"
+    assert bypass_attempt.payload["result"] == "blocked"
+    assert bypass_attempt.payload["metadata"]["gate"] == "approval"
+    assert bypass_attempt.payload["approval"] is None
+    assert adapter.calls == 0
+    assert instance.current_state == "scored"
+    assert approval.resume_event_id is None
+
+
+@pytest.mark.asyncio
 async def test_manual_evidence_is_rejected_for_email_execute(async_db_session):
     instance, _, approval, adapter = await pending_approval(async_db_session)
     await resolve(async_db_session, approval, manual_evidence_ref="sandbox://founder/manual-1")

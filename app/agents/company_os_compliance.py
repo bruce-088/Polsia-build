@@ -99,12 +99,22 @@ def _text(value: Any) -> bool:
     return isinstance(value, str) and bool(value.strip())
 
 
+def _enum(value: Any, options: frozenset[str]) -> str | None:
+    """A malformed (non-string, e.g. list) fact must fail the predicate, never raise."""
+    return value if isinstance(value, str) and value in options else None
+
+
+def _record(value: Any) -> dict[str, Any]:
+    """A nested trusted-record fact must be a mapping; any other shape is malformed."""
+    return value if isinstance(value, dict) else {}
+
+
 def _dispatch_method(value: Any) -> str | None:
     """A dispatch/consent method fact must be a known string; any other shape is malformed."""
-    return value if isinstance(value, str) and value in {"manual", "automated"} else None
+    return _enum(value, frozenset({"manual", "automated"}))
 
 
-RFC3339 = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})")
+RFC3339 = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:[0-5]\d:[0-5]\d(\.\d+)?(Z|[+-]\d{2}:[0-5]\d)")
 CANONICAL_ZONES = frozenset(available_timezones())
 
 
@@ -173,7 +183,7 @@ def evaluate_outbound_eligibility(context: dict[str, Any]) -> ComplianceResult:
             )
         except ComplianceContentError:
             expected = None
-        verified = template.get("subject_accuracy_verified") or {}
+        verified = _record(template.get("subject_accuracy_verified"))
         approved = (timestamp(template.get("approved_at")) and "revoked_at" in template
                     and template["revoked_at"] is None and _text(verified.get("by"))
                     and timestamp(verified.get("at")))
@@ -190,15 +200,16 @@ def evaluate_outbound_eligibility(context: dict[str, Any]) -> ComplianceResult:
             and _text(template.get("ad_disclosure")) and template["ad_disclosure"] in body
             and payload.get("ad_disclosure") == template["ad_disclosure"]
         )
-        route = template.get("opt_out_route") or {}
+        route = _record(template.get("opt_out_route"))
         days = route.get("valid_days")
+        route_type = _enum(route.get("type"), frozenset({"reply", "web"}))
         checks["EMAIL-03"] = bool(
-            route.get("type") in {"reply", "web"} and _text(route.get("target"))
+            route_type is not None and _text(route.get("target"))
             and route["target"] in body and payload.get("opt_out_route") == route
             and type(days) is int and days >= 30 and route.get("covers_all_marketing") is True
             and route.get("fee_required") is False and route.get("extra_data_required") is False
             and timestamp(route.get("verified_at"))
-            and (route["type"] != "reply" or route["target"] == sender.get("reply_to"))
+            and (route_type != "reply" or route["target"] == sender.get("reply_to"))
         )
         checks["EMAIL-04"] = not suppressed
 

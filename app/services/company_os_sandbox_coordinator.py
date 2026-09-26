@@ -542,10 +542,18 @@ async def _awaiting_resume(db, instance, record) -> bool:
 
 
 async def _has_unresumed_approval(db, instance, action) -> bool:
-    approval = await db.scalar(select(CompanyOSSandboxApproval.id).where(
+    """An unresumed approval still binds its founder-corrected action, not just its original one."""
+    approvals = await db.scalars(select(CompanyOSSandboxApproval).where(
         CompanyOSSandboxApproval.workflow_instance_id == instance.id,
-        CompanyOSSandboxApproval.action == action,
         CompanyOSSandboxApproval.status.in_(("approved", "modified")),
         CompanyOSSandboxApproval.resume_event_id.is_(None),
     ))
-    return approval is not None
+    for approval in approvals:
+        effective_action = (
+            approval.corrected_decision.get("action")
+            if approval.status == "modified" and isinstance(approval.corrected_decision, dict)
+            else approval.action
+        )
+        if effective_action == action:
+            return True
+    return False
