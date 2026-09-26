@@ -142,7 +142,15 @@ def evaluate_outbound_eligibility(context: dict[str, Any]) -> ComplianceResult:
     except (ZoneInfoNotFoundError, ValueError):
         zone_info = None
     zone = zone if zone_info is not None else None
-    local_time = now.astimezone(zone_info).isoformat() if now and zone_info else None
+    try:
+        local_time = now.astimezone(zone_info).isoformat() if now and zone_info else None
+    except (OverflowError, ValueError, OSError):
+        local_time = None
+    # A historical zone can have a non-round-minute UTC offset (seconds), which
+    # isoformat emits but our RFC 3339 evidence contract (and the event schema)
+    # does not accept; such a fact cannot be recorded and must fail closed.
+    if local_time is not None and not RFC3339.fullmatch(local_time):
+        local_time = None
     location = contact.get("recipient_location") or {}
     location = location if isinstance(location, dict) else {}
     def timestamp(value):

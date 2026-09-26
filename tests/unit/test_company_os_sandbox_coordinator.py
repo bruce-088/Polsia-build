@@ -609,6 +609,33 @@ async def test_stale_cached_approval_object_does_not_hide_a_committed_correction
 
 
 @pytest.mark.asyncio
+async def test_stale_cached_approval_cannot_overwrite_a_committed_resolution(async_db_session):
+    """A session's cached pending approval must not survive a resolution committed elsewhere.
+
+    resolve_sandbox_approval's own .with_for_update() load must refresh a
+    session-cached approval object (populate_existing), or a session that
+    loaded the approval while it was still pending keeps seeing "pending" on
+    its own status check even after the fresh SELECT, and could overwrite a
+    resolution (e.g. a rejection) already committed through another path.
+    """
+    instance, original, approval, _ = await pending_approval(async_db_session)
+    assert approval.status == "pending"
+
+    await async_db_session.execute(
+        update(CompanyOSSandboxApproval).where(CompanyOSSandboxApproval.id == approval.id).values(
+            status="rejected", founder_id="other-founder", founder_minutes=1,
+            resolution_key="other-session-resolve",
+        ).execution_options(synchronize_session=False),
+    )
+    await async_db_session.flush()
+    assert approval.status == "pending"  # still stale in this session's identity map
+
+    with pytest.raises(SandboxApprovalError, match="only pending"):
+        await resolve(async_db_session, approval)
+    assert approval.status == "rejected"
+
+
+@pytest.mark.asyncio
 async def test_modified_approval_still_blocks_direct_delivery_of_the_original_action(async_db_session):
     """A founder correction binds both the original and the corrected action.
 

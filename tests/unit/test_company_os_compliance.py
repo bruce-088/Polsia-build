@@ -163,6 +163,8 @@ def test_consent_address_comparison_is_normalized():
     (None, "rendered_payload", ["malformed"], "BASE-01"),
     (None, "evaluated_at", 12, "BASE-01"),
     (None, "policy_sha256", "not-a-hash", "BASE-01"),
+    (None, "evaluated_at", "0001-01-01T00:00:00Z", "BASE-01"),
+    (None, "evaluated_at", "1800-01-01T00:00:00Z", "BASE-01"),
 ])
 def test_malformed_facts_still_produce_a_schema_valid_block(record, field, value, rule):
     import json

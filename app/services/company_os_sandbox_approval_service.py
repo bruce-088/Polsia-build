@@ -94,7 +94,7 @@ async def resolve_sandbox_approval(
 
     approval = await db.scalar(select(CompanyOSSandboxApproval).where(
         CompanyOSSandboxApproval.id == approval_id,
-    ).with_for_update())
+    ).with_for_update().execution_options(populate_existing=True))
     if approval is None:
         raise SandboxApprovalError("approval does not exist")
     if approval.status != "pending":
@@ -162,7 +162,7 @@ async def resume_sandbox_approval(
         raise SandboxApprovalError("Stage 2 requires sandbox_mode")
     approval = await db.scalar(select(CompanyOSSandboxApproval).where(
         CompanyOSSandboxApproval.id == approval_id,
-    ).with_for_update())
+    ).with_for_update().execution_options(populate_existing=True))
     if approval is None:
         raise SandboxApprovalError("approval does not exist")
     if approval.status not in EXECUTABLE:
