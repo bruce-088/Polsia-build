@@ -554,11 +554,9 @@ async def _has_unresumed_approval(db, instance, action) -> bool:
         CompanyOSSandboxApproval.resume_event_id.is_(None),
     ).execution_options(populate_existing=True))
     for approval in approvals:
-        effective_action = (
-            approval.corrected_decision.get("action")
-            if approval.status == "modified" and isinstance(approval.corrected_decision, dict)
-            else approval.action
-        )
-        if effective_action == action:
+        if approval.action == action:
+            return True
+        if (approval.status == "modified" and isinstance(approval.corrected_decision, dict)
+                and approval.corrected_decision.get("action") == action):
             return True
     return False

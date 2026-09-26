@@ -60,6 +60,8 @@ def is_email_execute(request: Any, registry: dict[str, Any]) -> bool:
 
 def render_message(message: dict, template: dict, sender: dict, contact: dict) -> dict:
     """Render literal named placeholders, never format expressions or headers."""
+    if not isinstance(sender, dict) or not isinstance(contact, dict):
+        raise ComplianceContentError("sender and contact records must be objects")
     if not isinstance(message, dict) or set(message) != {"template_id", "fills"}:
         raise ComplianceContentError("template_id and fills are required")
     if not isinstance(template, dict) or message["template_id"] != template.get("template_id"):

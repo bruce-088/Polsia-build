@@ -609,6 +609,75 @@ async def test_stale_cached_approval_object_does_not_hide_a_committed_correction
 
 
 @pytest.mark.asyncio
+async def test_modified_approval_still_blocks_direct_delivery_of_the_original_action(async_db_session):
+    """A founder correction binds both the original and the corrected action.
+
+    _has_unresumed_approval must not swap the original action out for the
+    corrected one -- it must recognize both, since the original action is
+    still the one on file for this approval. Otherwise, once modified, the
+    untouched original decision could complete directly with approval=null,
+    desyncing the workflow version out from under the pending correction's
+    own resume.
+    """
+    instance, original, approval, _ = await pending_approval(async_db_session, workflow=FOLLOWUP_WORKFLOW)
+    corrected = deepcopy(original)
+    corrected["action"] = "send_followup"
+    corrected["policy_intent"]["action_type"] = "send_followup"
+    corrected["policy_intent"]["requested_total"] = 5
+    await resolve(async_db_session, approval, "modified", corrected_decision=corrected)
+
+    # Also within policy limits: isolates the approval-binding gate from the
+    # separate "outstanding escalation" guard, which would otherwise catch
+    # this decision first (it matches approval.action regardless of this fix).
+    original_within_limits = deepcopy(original)
+    original_within_limits["policy_intent"]["requested_total"] = 5
+
+    adapter = Adapter()
+    bypass_attempt = await invoke(
+        async_db_session, instance, original_within_limits, adapter=adapter,
+        key="direct-original", workflow=FOLLOWUP_WORKFLOW,
+    )
+    assert bypass_attempt.payload["event_type"] == "failure_detected"
+    assert bypass_attempt.payload["result"] == "blocked"
+    assert bypass_attempt.payload["metadata"]["gate"] == "approval"
+    assert adapter.calls == 0
+    assert instance.current_state == "scored"
+    assert approval.resume_event_id is None
+
+    recovered = await resume(async_db_session, approval, adapter, workflow=FOLLOWUP_WORKFLOW)
+    assert recovered.payload["event_type"] == "transition_completed"
+    assert instance.current_state == "sent"
+    assert approval.resume_event_id == recovered.id
+
+
+@pytest.mark.asyncio
+async def test_malformed_registry_sender_blocks_dispatch_instead_of_raising(async_db_session):
+    """A malformed sandbox_sender record must fail closed through the real dispatch path.
+
+    execute_dispatch calls render_message directly, before
+    evaluate_outbound_eligibility ever runs. If render_message raises
+    anything other than ComplianceContentError for a malformed sender
+    record, that exception propagates past both governed callers with no
+    compliance evidence recorded at all.
+    """
+    instance, _ = await setup(async_db_session, initial_state="scored")
+    adapter = Adapter()
+    registry = deepcopy(REGISTRY)
+    registry["integrations"]["sandbox_mail"]["sandbox_sender"] = ["malformed"]
+    decision = native(
+        action="send_outreach", state="sent", risk="YELLOW",
+        integration={"name": "sandbox_mail", "phase": "execute", "use": "acquisition_email"},
+        limit_name="max_discount_percent", requested_total=5,
+    )
+    blocked = await invoke(async_db_session, instance, decision, adapter=adapter, registry=registry)
+    assert blocked.payload["event_type"] == "transition_attempted"
+    assert blocked.payload["result"] == "blocked"
+    assert blocked.payload["metadata"]["gate"] == "compliance"
+    assert "BASE-01" in blocked.payload["compliance"]["failed_rule_ids"]
+    assert adapter.calls == 0
+
+
+@pytest.mark.asyncio
 async def test_manual_evidence_is_rejected_for_email_execute(async_db_session):
     instance, _, approval, adapter = await pending_approval(async_db_session)
     await resolve(async_db_session, approval, manual_evidence_ref="sandbox://founder/manual-1")
