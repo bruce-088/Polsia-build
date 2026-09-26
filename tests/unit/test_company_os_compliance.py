@@ -150,6 +150,8 @@ def test_consent_address_comparison_is_normalized():
     ("contact", "recipient_location", {"country": "US", "state": ""}),
     ("contact", "recipient_location", "Florida"),
     ("sender", "dispatch_method", ""),
+    ("sender", "dispatch_method", []),
+    ("consent", "method", []),
     ("sender", "sender_id", 7),
     ("suppression", "version", ""),
     ("suppression", "checked_at", "yesterday"),

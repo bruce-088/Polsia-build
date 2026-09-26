@@ -275,7 +275,7 @@ async def coordinate_sandbox_action(
                 denial = ("integration", "write requires registered sandbox execution")
 
     if (denial is None and native is not None and isinstance(native.get("action"), str)
-            and await _has_unresumed_approval(db, instance, native["action"])):
+            and (awaiting_resume or await _has_unresumed_approval(db, instance, native["action"]))):
         denial = ("approval", "approved action requires approval resume; direct execution rejected")
 
     if denial is None and decision is not None and decision.disposition == "requires_founder":

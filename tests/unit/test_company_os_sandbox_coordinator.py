@@ -41,6 +41,15 @@ POLICY = {
     "non_approvable_blocks": [],
     "limits": {"max_discount_percent": 10},
 }
+# A second scored->sent email action distinct from send_outreach, so a founder
+# correction can retarget the action name while keeping the same transition.
+FOLLOWUP_WORKFLOW = {
+    **WORKFLOW,
+    "transitions": [
+        *WORKFLOW["transitions"],
+        {"from": "scored", "to": "sent", "action": "send_followup", "risk_level": "YELLOW", "integration": "sandbox_mail"},
+    ],
+}
 REGISTRY = {
     "modes": ["disabled", "documented", "sandbox", "read_only", "write_limited", "live"],
     "integrations": {
@@ -151,7 +160,7 @@ async def invoke(db, instance, decision, *, adapter=None, key="delivery-1", vers
         integration_registry=registry, event_schema=schema,
         canonical_agents=["acquisition", "governance"],
         canonical_handoffs=["governance"],
-        canonical_actions=["score_against_icp", "send_outreach", "pricing_change", "bypass_opt_out"],
+        canonical_actions=["score_against_icp", "send_outreach", "send_followup", "pricing_change", "bypass_opt_out"],
         synthetic_adapters={"sandbox_mail": adapter} if adapter else {},
     )
 
@@ -361,7 +370,7 @@ async def resume(db, approval, adapter=None, **kwargs):
         policy=kwargs.pop("policy", POLICY), integration_registry=kwargs.pop("registry", REGISTRY),
         event_schema=EVENT_SCHEMA, canonical_agents=["acquisition", "governance"],
         canonical_handoffs=["governance"], canonical_actions=[
-            "score_against_icp", "send_outreach", "pricing_change", "bypass_opt_out",
+            "score_against_icp", "send_outreach", "send_followup", "pricing_change", "bypass_opt_out",
         ], synthetic_adapters={"sandbox_mail": adapter} if adapter else {},
         retry=kwargs.pop("retry", False),
     )
@@ -481,6 +490,53 @@ async def test_timed_out_adapter_retries_with_same_key_without_second_effect(asy
     assert len(adapter.effects) == 1
     assert approval.failure_attempt_count == 1
     assert await resume(async_db_session, approval, adapter) is recovered
+
+
+@pytest.mark.asyncio
+async def test_modified_approval_changed_action_still_blocks_direct_delivery(async_db_session):
+    """A corrected action must stay bound to its approval even after a stuck resume.
+
+    The founder can correct a pending action to a different, otherwise-allowable
+    action. If the resume attempt sends the message but fails before recording
+    the resume (a rollback/timeout), the dispatch is left executed and unresumed.
+    Direct delivery must not reuse that receipt under a fresh decision for the
+    corrected action; it must stay blocked pending an explicit resume.
+    """
+    instance, original, approval, _ = await pending_approval(async_db_session, workflow=FOLLOWUP_WORKFLOW)
+    corrected = deepcopy(original)
+    corrected["action"] = "send_followup"
+    corrected["policy_intent"]["action_type"] = "send_followup"
+    corrected["policy_intent"]["requested_total"] = 5  # within policy limits: otherwise allowable
+    await resolve(async_db_session, approval, "modified", corrected_decision=corrected)
+
+    class TimeoutAfterSyntheticEffect(Adapter):
+        async def execute(self, decision, *, idempotency_key, run_id, recipient_id):
+            for record in self.world.dispatches.values():
+                record.update(status="executed", receipt="sandbox://mail/followup-receipt")
+            raise SyntheticCapabilityError("receipt lost after synthetic effect")
+
+    adapter = TimeoutAfterSyntheticEffect()
+    stuck = await resume(async_db_session, approval, adapter, workflow=FOLLOWUP_WORKFLOW)
+    assert stuck.payload["event_type"] == "failure_detected"
+    assert instance.current_state == "scored"
+    assert approval.resume_event_id is None
+
+    bypass_attempt = await invoke(
+        async_db_session, instance, corrected, adapter=adapter,
+        key="direct-bypass", workflow=FOLLOWUP_WORKFLOW,
+    )
+    assert bypass_attempt.payload["event_type"] == "failure_detected"
+    assert bypass_attempt.payload["result"] == "blocked"
+    assert bypass_attempt.payload["metadata"]["gate"] == "approval"
+    assert bypass_attempt.payload["approval"] is None
+    assert instance.current_state == "scored"
+    assert approval.resume_event_id is None
+
+    recovered = await resume(async_db_session, approval, adapter, workflow=FOLLOWUP_WORKFLOW, retry=True)
+    assert recovered.payload["event_type"] == "transition_completed"
+    assert recovered.payload["approval"]["status"] == "modified"
+    assert instance.current_state == "sent"
+    assert approval.resume_event_id == recovered.id
 
 
 @pytest.mark.asyncio

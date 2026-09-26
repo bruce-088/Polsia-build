@@ -99,6 +99,11 @@ def _text(value: Any) -> bool:
     return isinstance(value, str) and bool(value.strip())
 
 
+def _dispatch_method(value: Any) -> str | None:
+    """A dispatch/consent method fact must be a known string; any other shape is malformed."""
+    return value if isinstance(value, str) and value in {"manual", "automated"} else None
+
+
 RFC3339 = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})")
 CANONICAL_ZONES = frozenset(available_timezones())
 
@@ -136,13 +141,13 @@ def evaluate_outbound_eligibility(context: dict[str, Any]) -> ComplianceResult:
         _text(c.get("recipient_id")) and consent.get("recipient_id") == c.get("recipient_id")
         and _text(consent.get("contact_email")) and _text(contact.get("address"))
         and consent["contact_email"].strip().casefold() == contact["address"].strip().casefold()
-        and consent.get("method") in {"manual", "automated"}
-        and consent["method"] == sender.get("dispatch_method")
+        and _dispatch_method(consent.get("method")) is not None
+        and _dispatch_method(consent.get("method")) == _dispatch_method(sender.get("dispatch_method"))
     )
     suppressed = suppression.get("suppressed") is not False
     trusted = (
         c.get("channel") == "email" and c.get("purpose") == "commercial"
-        and sender.get("dispatch_method") in {"manual", "automated"}
+        and _dispatch_method(sender.get("dispatch_method")) is not None
         and all(_text(sender.get(k)) for k in (
             "sender_id", "from_address", "reply_to", "sending_domain", "postal_address", "seller_name"))
         and timestamp(sender.get("captured_at")) and timestamp(contact.get("captured_at"))
