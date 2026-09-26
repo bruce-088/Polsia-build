@@ -45,7 +45,7 @@ def _consent_verified(contact: dict, consent: dict, sender: dict, now: datetime)
     )
 
 
-def load_stage2_inputs(
+def build_stage2_snapshot(
     fixtures: dict[str, Any], registry: dict[str, Any], templates: list[dict[str, Any]],
     *, run_id: str, compliance_policy: dict[str, str],
 ) -> SyntheticWorld:
@@ -85,36 +85,64 @@ def load_stage2_inputs(
             world.set_contact(recipient, contact)
             world.consents[recipient] = consent
             world.suppression_snapshots[recipient] = deepcopy(case.get("suppression_snapshot") or {})
-        # All contacts must exist before signals (including cross-case queue references).
-        for case in fixtures["cases"]:
-            for signal in case["inputs"]:
-                channel, facts = signal["type"], deepcopy(signal["facts"])
-                if channel == "failure_injection":
-                    identity = tuple(facts[k] for k in ("workflow_id", "entity_id", "action"))
-                    if (any(not isinstance(v, str) or not v for v in identity)
-                            or type(facts.get("after_effect")) is not bool
-                            or identity in world.action_failures):
-                        raise Stage2InputError("invalid or duplicate action failure injection")
-                    world.action_failures[identity] = facts["after_effect"]
-                elif channel in {"authority", "lead", "reply", "mail", "payment", "opt_out", "contact", "queued_message"}:
-                    # The enclosing case is an explicit identity source for unqualified signals.
-                    facts.setdefault("entity_id", case["entity_id"])
-                    if channel == "queued_message" and (
-                        facts.get("entity_id") != case["entity_id"] or facts.get("workflow_id") != case["workflow_id"]
-                        or any(not isinstance(facts.get(k), str) or not facts[k] for k in
-                               ("origin_workflow_id", "origin_entity_id", "original_action"))
-                    ):
-                        raise Stage2InputError("queue origin and consumer bindings are required")
-                    world.receive(channel, signal["delivery_id"], facts)
-                    if channel == "lead":
-                        recipient = facts["entity_id"]
-                        world.leads[recipient]["eligible"] = (
-                            world.contacts.get(recipient, {}).get("consent_verified") is True
-                            and not world.is_suppressed(recipient)
-                        )
-                elif channel not in {"prospect", "estimate", "lead_batch", "founder_resolution", "retry"}:
-                    raise Stage2InputError(f"unsupported canonical input type: {channel}")
-                # Non-provider facts remain verbatim in input_cases for the decision driver.
         return world
     except (KeyError, TypeError, SyntheticCapabilityError) as exc:
         raise Stage2InputError(f"invalid canonical Stage 2 input: {exc}") from exc
+
+
+def apply_stage2_signal(
+    world: SyntheticWorld, case: dict[str, Any], signal: dict[str, Any], now: datetime,
+) -> None:
+    """Apply one arriving signal using the canonical loader's existing rules.
+
+    ``now`` is the caller's frozen clock; signal application uses the world's
+    frozen clock exactly as the eager loader did.
+    """
+    try:
+        channel, facts = signal["type"], deepcopy(signal["facts"])
+        if channel == "failure_injection":
+            identity = tuple(facts[k] for k in ("workflow_id", "entity_id", "action"))
+            if (any(not isinstance(v, str) or not v for v in identity)
+                    or type(facts.get("after_effect")) is not bool
+                    or identity in world.action_failures):
+                raise Stage2InputError("invalid or duplicate action failure injection")
+            world.action_failures[identity] = facts["after_effect"]
+        elif channel in {"authority", "lead", "reply", "mail", "payment", "opt_out", "contact", "queued_message"}:
+            # The enclosing case is an explicit identity source for unqualified signals.
+            facts.setdefault("entity_id", case["entity_id"])
+            if channel == "queued_message" and (
+                facts.get("entity_id") != case["entity_id"] or facts.get("workflow_id") != case["workflow_id"]
+                or any(not isinstance(facts.get(k), str) or not facts[k] for k in
+                       ("origin_workflow_id", "origin_entity_id", "original_action"))
+            ):
+                raise Stage2InputError("queue origin and consumer bindings are required")
+            world.receive(channel, signal["delivery_id"], facts)
+            if channel == "lead":
+                recipient = facts["entity_id"]
+                world.leads[recipient]["eligible"] = (
+                    world.contacts.get(recipient, {}).get("consent_verified") is True
+                    and not world.is_suppressed(recipient)
+                )
+        elif channel not in {"prospect", "estimate", "lead_batch", "founder_resolution", "retry"}:
+            raise Stage2InputError(f"unsupported canonical input type: {channel}")
+        # Non-provider facts remain verbatim in input_cases for the decision driver.
+    except (KeyError, TypeError, SyntheticCapabilityError) as exc:
+        raise Stage2InputError(f"invalid canonical Stage 2 input: {exc}") from exc
+
+
+def load_stage2_inputs(
+    fixtures: dict[str, Any], registry: dict[str, Any], templates: list[dict[str, Any]],
+    *, run_id: str, compliance_policy: dict[str, str],
+) -> SyntheticWorld:
+    """Preserve eager loading: build every snapshot, then apply signals in file order."""
+    world = build_stage2_snapshot(
+        fixtures, registry, templates, run_id=run_id, compliance_policy=compliance_policy,
+    )
+    try:
+        now = datetime.fromisoformat(fixtures["frozen_clock"])
+        for case in fixtures["cases"]:
+            for signal in case["inputs"]:
+                apply_stage2_signal(world, case, signal, now)
+    except (KeyError, TypeError, SyntheticCapabilityError) as exc:
+        raise Stage2InputError(f"invalid canonical Stage 2 input: {exc}") from exc
+    return world

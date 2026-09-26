@@ -162,10 +162,20 @@ CONTEXT:
             exc.raw_output = raw_evidence
             raise
 
-    def _run_claude_structured(self, prompt: str, schema: dict) -> tuple[dict, str]:
+    async def run_company_os_stage2_decision(self, task: dict, context: dict, *, structured_transport=None) -> dict:
+        """Stage 2 sibling; real execution is disabled without an injected transport."""
+        from app.agents.company_os_stage2_provider import stage2_decision
+
+        return await stage2_decision(self, task, context, structured_transport=structured_transport)
+
+    def _run_claude_structured(self, prompt: str, schema: dict, *, stage2_errors: bool = False) -> tuple[dict, str]:
         """Request provider-validated JSON without parsing or repairing free text."""
+        from app.agents.company_os_stage2_provider import CompanyOSMalformedOutputError, CompanyOSTransportError
+
+        transport_error = CompanyOSTransportError if stage2_errors else CompanyOSContractError
+        output_error = CompanyOSMalformedOutputError if stage2_errors else CompanyOSContractError
         if not claude_structured_output_available():
-            raise CompanyOSContractError(
+            raise transport_error(
                 "installed Claude CLI does not support --json-schema"
             )
         command = [
@@ -176,19 +186,25 @@ CONTEXT:
             result = subprocess.run(command, capture_output=True, text=True, check=True)
         except subprocess.CalledProcessError as exc:
             evidence = exc.stdout or exc.stderr or ""
-            raise CompanyOSContractError(
+            raise transport_error(
                 "Claude structured output failed", raw_output=evidence
             ) from exc
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            if not stage2_errors:
+                raise
+            raise transport_error(str(exc)) from exc
         raw_evidence = result.stdout
         try:
             envelope = json.loads(raw_evidence)
         except json.JSONDecodeError as exc:
-            raise CompanyOSContractError(
+            raise output_error(
                 "Claude structured output wrapper was not JSON", raw_output=raw_evidence
             ) from exc
+        if stage2_errors and not isinstance(envelope, dict):
+            raise output_error("Claude result wrapper is not an object", raw_output=raw_evidence)
         payload = envelope.get("structured_output")
         if not isinstance(payload, dict):
-            raise CompanyOSContractError(
+            raise output_error(
                 "Claude result did not contain structured_output", raw_output=raw_evidence
             )
         return payload, raw_evidence

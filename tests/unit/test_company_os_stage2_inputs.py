@@ -1,11 +1,18 @@
 """The runtime loader preserves canonical facts and derives only verified eligibility."""
 
 from copy import deepcopy
+from dataclasses import asdict
+from datetime import datetime
 
 import pytest
 
 from app.config import settings
-from app.services.company_os_stage2_inputs import Stage2InputError, load_stage2_inputs
+from app.services.company_os_stage2_inputs import (
+    Stage2InputError,
+    apply_stage2_signal,
+    build_stage2_snapshot,
+    load_stage2_inputs,
+)
 from tests.unit.test_company_os_stage2_required_paths import FIXTURES, MANIFEST, REGISTRY
 
 
@@ -96,3 +103,21 @@ def test_action_failure_does_not_need_or_guess_a_database_key():
     assert not world.action_failures
     world.arm_action_failure("prospect_to_meeting", "p-syn-03", "send_outreach", "mail", "another-key")
     assert world._after_effect_once == {("mail", "actual-db-derived-key")}
+
+
+def test_load_stage2_inputs_unchanged_after_split():
+    fixtures = deepcopy(FIXTURES)
+    world = build_stage2_snapshot(
+        fixtures, REGISTRY, fixtures["approved_templates"], run_id="loader-proof",
+        compliance_policy={"version": MANIFEST["compliance_policy_version"],
+                           "sha256": MANIFEST["compliance_policy_sha256"]},
+    )
+    assert not world.signals and not world.queue and not world.action_failures
+    assert not world.payments and not world.leads
+    assert len(world.contacts) == len(fixtures["cases"])
+    now = datetime.fromisoformat(fixtures["frozen_clock"])
+    for case in fixtures["cases"]:
+        for signal in case["inputs"]:
+            apply_stage2_signal(world, case, signal, now)
+    assert asdict(world) == asdict(load())
+    assert fixtures == FIXTURES

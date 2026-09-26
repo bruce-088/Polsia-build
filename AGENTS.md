@@ -16,7 +16,7 @@ Stage 2 runs Acqivo (Company Test #1) against **synthetic** people, messages and
 | `app/services/company_os_synthetic_adapters.py` | `SyntheticWorld` (run-scoped fake provider state: contacts, consent, suppression, pending opt-outs, templates, queue items, dispatch ledger, outcomes, signal history) and `SyntheticAdapter` (in-memory executor). Opt-out ingestion and phrase detection live here. |
 | `app/agents/company_os_compliance.py` | `evaluate_outbound_eligibility` (BASE-01, EMAIL-01..04 from COMPLIANCE_POLICY.md v0.1.0), `render_message` (content only from approved templates + trusted sender/contact), `is_email_execute`, evidence hashing. |
 | `app/services/company_os_sandbox_service.py` | Persistence: `create_sandbox_run`, `create_workflow_instance`, `append_sandbox_event` (schema validation, version bump only on state change, terminal handling, blocked-event invariant), `export_sandbox_event`. |
-| `app/services/company_os_stage2_inputs.py` | `load_stage2_inputs`: maps canonical fixture inputs into a `SyntheticWorld` with no invented values. |
+| `app/services/company_os_stage2_inputs.py` | `build_stage2_snapshot` builds canonical contact/template snapshots; `apply_stage2_signal` applies one ordered signal; `load_stage2_inputs` preserves eager loading via both, with no invented values. |
 | `app/agents/company_os_{workflow,policy,integration}.py` | Canonical transition validation, action policy, integration capability. |
 | `app/models/company_os_sandbox.py` | Tables: run, workflow instance, event, approval. |
 
