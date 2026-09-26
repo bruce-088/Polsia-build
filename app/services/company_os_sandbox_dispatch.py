@@ -138,6 +138,7 @@ def compliance_context(world, recipient, native, registry, payload, *, scope_val
     config = registry["integrations"].get(request.get("name"), {})
     template_id = payload.get("template_id") or (request.get("message") or {}).get("template_id")
     suppression = deepcopy(world.suppression_snapshots.get(recipient, {}))
+    suppression = suppression if isinstance(suppression, dict) else {}
     suppression.update(
         suppressed=world.is_suppressed(recipient),
         normalized_addresses=sorted(world.suppressed_recipients),

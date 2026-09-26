@@ -178,3 +178,22 @@ def test_malformed_facts_still_produce_a_schema_valid_block(record, field, value
     result = evaluate_outbound_eligibility(ctx)
     assert not result.eligible and rule in result.evidence["failed_rule_ids"]
     Draft202012Validator(schema["properties"]["compliance"], format_checker=FormatChecker()).validate(result.evidence)
+
+
+def test_pinned_zone_allowlist_requires_a_loadable_zone(monkeypatch):
+    """The zone allowlist must be pinned to the event contract, not the host's live tzdata.
+
+    A host's zoneinfo database is not guaranteed to match the event
+    schema's fixed recipient_time_zone enum. Simulate a drifted allowlist
+    (as if the host exposed an extra tzdata entry the schema doesn't
+    recognize) and confirm the ZoneInfo-load requirement still rejects it,
+    so recipient_time_zone/recipient_local_time never assume an
+    unrecognized zone is safe to record.
+    """
+    import app.agents.company_os_compliance as compliance
+
+    monkeypatch.setattr(compliance, "CANONICAL_ZONES", compliance.CANONICAL_ZONES | {"Not/ARealZone"})
+    c = context()
+    c["contact"]["recipient_time_zone"] = "Not/ARealZone"
+    result = evaluate_outbound_eligibility(c)
+    assert not result.eligible and "BASE-01" in result.evidence["failed_rule_ids"]

@@ -687,7 +687,7 @@ async def test_malformed_registry_sender_blocks_dispatch_instead_of_raising(asyn
     record, that exception propagates past both governed callers with no
     compliance evidence recorded at all.
     """
-    instance, _ = await setup(async_db_session, initial_state="scored")
+    _, instance = await setup(async_db_session, initial_state="scored")
     adapter = Adapter()
     registry = deepcopy(REGISTRY)
     registry["integrations"]["sandbox_mail"]["sandbox_sender"] = ["malformed"]
@@ -702,6 +702,33 @@ async def test_malformed_registry_sender_blocks_dispatch_instead_of_raising(asyn
     assert blocked.payload["metadata"]["gate"] == "compliance"
     assert "BASE-01" in blocked.payload["compliance"]["failed_rule_ids"]
     assert adapter.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_malformed_suppression_snapshot_blocks_dispatch_instead_of_raising(async_db_session):
+    """A malformed suppression snapshot must fail closed through the real dispatch path.
+
+    compliance_context calls suppression.update() before
+    evaluate_outbound_eligibility's own record normalization ever runs, so a
+    non-dict snapshot (reachable through input loading, not just internal
+    corruption) must not raise AttributeError past both governed callers
+    with no compliance evidence recorded.
+    """
+    _, instance = await setup(async_db_session, initial_state="scored")
+    adapter = Adapter()
+    adapter.world.suppression_snapshots["p-1"] = ["malformed"]
+    decision = native(
+        action="send_outreach", state="sent", risk="YELLOW",
+        integration={"name": "sandbox_mail", "phase": "execute", "use": "acquisition_email"},
+        limit_name="max_discount_percent", requested_total=5,
+    )
+    blocked = await invoke(async_db_session, instance, decision, adapter=adapter)
+    assert blocked.payload["event_type"] == "transition_attempted"
+    assert blocked.payload["result"] == "blocked"
+    assert blocked.payload["metadata"]["gate"] == "compliance"
+    assert "BASE-01" in blocked.payload["compliance"]["failed_rule_ids"]
+    assert adapter.calls == 0
+    assert instance.current_state == "scored"
 
 
 @pytest.mark.asyncio
