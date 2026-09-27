@@ -78,6 +78,34 @@ def test_missing_contact_facts_are_rejected_instead_of_filled(field):
         load(fixtures)
 
 
+def test_invalid_frozen_clock_is_stage2_input_error_not_bare_value_error():
+    """P13-REV2-04: datetime.fromisoformat raises a bare ValueError on an
+    invalid frozen_clock string, which the narrower (KeyError, TypeError,
+    SyntheticCapabilityError) except tuple did not wrap -- it escaped as an
+    unclassified ValueError and (via the CLI's own classification boundary,
+    scripts/stage2_harness_export.py, which only catches HarnessDefect and
+    Stage2InputError) was misfiled as an environment failure instead of the
+    malformed-artifact defect it actually is.
+    """
+    fixtures = deepcopy(FIXTURES)
+    fixtures["frozen_clock"] = "not-a-real-timestamp"
+    with pytest.raises(Stage2InputError):
+        load(fixtures)
+
+
+def test_malformed_consent_record_is_stage2_input_error_not_bare_attribute_error():
+    """P13-REV2-04: a malformed consent object (e.g. a string where a dict
+    is required) makes _consent_verified's own consent.get(...) calls raise
+    AttributeError, which the same narrower except tuple above did not wrap
+    either -- same misclassification-as-environment-failure risk as the
+    invalid frozen_clock case.
+    """
+    fixtures = deepcopy(FIXTURES)
+    fixtures["cases"][0]["consent_record"] = "not-a-dict"
+    with pytest.raises(Stage2InputError):
+        load(fixtures)
+
+
 def test_missing_sender_capture_time_is_not_replaced_with_frozen_clock():
     registry = deepcopy(REGISTRY)
     del registry["integrations"]["sendgrid"]["sandbox_sender"]["captured_at"]

@@ -9,7 +9,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 import app.services.company_os_stage2_harness_runner as harness
 from app.agents.base_agent import BasePolsiaAgent
@@ -136,7 +136,7 @@ async def test_native_export_matches_persisted_rows_and_literal_ids(async_db_ses
     assert len(r.world.outcomes) == 1
 
 
-def test_evidence_context_keys_on_contact_records_recipient_id_not_entity_id():
+async def test_evidence_context_keys_on_contact_records_recipient_id_not_entity_id(async_db_session):
     """P13B-01: build_stage2_snapshot stores contact/consent/suppression under
     the contact record's own recipient_id (company_os_stage2_inputs.py), not
     the case's entity_id -- 6 of 9 dev-pack cases differ between the two
@@ -151,7 +151,7 @@ def test_evidence_context_keys_on_contact_records_recipient_id_not_entity_id():
     fixtures["cases"] = [case]
     world = build_stage2_snapshot(fixtures, REGISTRY, fixtures["approved_templates"],
         run_id="evidence-context-test", compliance_policy={"version": "0.1.0", "sha256": "a" * 64})
-    context = harness.evidence_context(case, [], world, REGISTRY)
+    context = await harness.evidence_context(case, [], world, REGISTRY, async_db_session)
     assert context["contact_record"] == world.contacts[case["contact_record"]["recipient_id"]]
     assert context["consent_record"]["recipient_id"] == case["contact_record"]["recipient_id"]
     assert context["consent_verified"] is True
@@ -227,15 +227,47 @@ def test_requirement_rules_cover_every_string_in_all_in_scope_workflows():
     have several transition-requirement strings with no REQUIREMENT_RULES
     entry -- regardless of whether a given pack's own fixture cases ever
     reach those specific transitions. Every requirement string declared
-    anywhere in all four in-scope real workflow definitions must have a rule.
+    anywhere in all six in-scope real workflow definitions must have a rule.
     """
     for workflow_id in ("prospect_to_meeting", "customer_onboarding",
-                        "missed_inquiry_recovery", "integration_failure_recovery"):
+                        "missed_inquiry_recovery", "estimate_followup",
+                        "stale_lead_reactivation", "integration_failure_recovery"):
         workflow = WORKFLOWS[workflow_id]
         requirement_strings = {req for t in workflow["transitions"] for req in t.get("requirements", [])}
         assert requirement_strings, f"{workflow_id} fixture has no requirement strings to prove against"
         missing = requirement_strings - set(harness.REQUIREMENT_RULES)
         assert not missing, f"{workflow_id} has unmapped requirement strings: {missing}"
+
+
+def test_followup_and_reactivation_requirements_use_source_evidence():
+    world = SyntheticWorld("requirements", datetime(2026, 9, 25, 14, tzinfo=UTC))
+    world.customers["customer"] = {"authority_verified": True,
+                                   "workflow_permissions": ["missed_inquiry_recovery"],
+                                   "approved_message_channels": ["email"], "approved_batch_size": 10}
+    template = deepcopy(FIXTURES["approved_templates"][0])
+    world.templates[template["template_id"]] = template
+    rules = harness.REQUIREMENT_RULES
+    inquiry = {"workflow_id": "missed_inquiry_recovery"}
+    assert rules["approved customer workflow"]({"customer_id": "customer"}, world, inquiry, REGISTRY, 0)
+    assert not rules["approved customer workflow"]({"customer_id": "other"}, world, inquiry, REGISTRY, 0)
+    estimate = {"customer_id": "customer", "customer_authority_verified": True,
+                "customer_approved_channel": "email",
+                "customer_approved_followup_at": world.frozen_at.isoformat(),
+                "followups_sent": 1, "approved_max_followups": 3}
+    assert rules["customer-approved timing and channel"](estimate, world, {}, REGISTRY, 0)
+    assert not rules["customer-approved timing and channel"](
+        {**estimate, "customer_approved_channel": "sms"}, world, {}, REGISTRY, 0)
+    assert rules["follow-up count within policy"](estimate, world, {}, REGISTRY, 0)
+    assert not rules["follow-up count within policy"](
+        {**estimate, "followups_sent": 3}, world, {}, REGISTRY, 0)
+    stale_case = {"available_template_ids": [template["template_id"]]}
+    assert rules["opt-out path"]({}, world, stale_case, REGISTRY, 0)
+    assert not rules["opt-out path"]({}, world, {"available_template_ids": []}, REGISTRY, 0)
+    batch = {"customer_id": "customer", "customer_authority_verified": True, "record_count": 5}
+    assert rules["batch size approved"](batch, world, {}, REGISTRY, 0)
+    assert not rules["batch size approved"]({**batch, "customer_id": "other"}, world, {}, REGISTRY, 0)
+    assert not rules["batch size approved"](
+        {**batch, "record_count": 11}, world, {}, REGISTRY, 0)
 
 
 def test_validate_pack_accepts_real_customer_onboarding_missed_inquiry_and_recovery_workflows():
@@ -323,7 +355,8 @@ async def test_missed_inquiry_recovery_full_chain_uses_genuine_derived_requireme
     case.update(id="one", workflow_id="missed_inquiry_recovery", entity_type="lead")
     case["inputs"] = [{
         "delivery_id": "authority", "type": "authority",
-        "facts": {"workflow_permissions": ["missed_inquiry_recovery"]},
+        "facts": {"customer_id": case["entity_id"], "authority_verified": True,
+                  "workflow_permissions": ["missed_inquiry_recovery"]},
     }]
     fixtures.update(cases=[case], infrastructure_only=True)
 
@@ -346,18 +379,24 @@ async def test_missed_inquiry_recovery_full_chain_uses_genuine_derived_requireme
     r.workflows["missed_inquiry_recovery"] = workflow
     r.options["canonical_actions"] = actions
     events = await r.run()
-    assert r.report.outcomes["one"] == "terminal"
+    assert r.report.outcomes["one"] == "terminal", (events[-1]['action'], events[-1]['result'], events[-1].get('error'), r.world.customers)
     assert events[-1]["event_type"] == "terminal_outcome" and events[-1]["state_after"] == "routed"
     assert not r.report.harness_defect and not r.report.environment_failure
 
 
 async def test_integration_failure_recovery_full_chain_uses_genuine_derived_requirements(async_db_session):
-    """P13-REV-01/02: integration_failure_recovery's own real requirement
-    strings are grounded in the persistent dispatch-ledger record its own
-    queued_message origin facts describe (_origin_dispatch) -- never
+    """P13-REV-01/02/P13-REV2-01/02: integration_failure_recovery's own real
+    requirement strings are grounded in the persistent dispatch-ledger record
+    its own queued_message origin facts describe (_origin_dispatch) -- never
     world.action_failures, which is popped the instant a failure is armed
     (company_os_synthetic_adapters.py:236-243) and so is already gone by the
-    time this recovery case's own transitions are evaluated.
+    time this recovery case's own transitions are evaluated -- and the
+    retry-count-shaped requirements ("retry policy permits another attempt",
+    "provider errors continue", "provider health verified") are grounded in
+    the origin instance's own genuinely persisted failure_detected events
+    (origin_failures), never in dispatch-ledger status alone (P13-REV2-01/02:
+    a single prepared record with zero real failures previously satisfied
+    every one of these at once).
 
     Drives the unmodified real integration_failure_recovery.json definition
     through the driver's own advance()/drain() (the same internals
@@ -368,7 +407,11 @@ async def test_integration_failure_recovery_full_chain_uses_genuine_derived_requ
     dispatch-ledger record seeded exactly as a real, prior send_outreach
     failure would leave it: created (prepare_dispatch), then left at
     status="prepared" because the adapter never returns a valid receipt --
-    never a fixture fact standing in for that evidence.
+    never a fixture fact standing in for that evidence -- and against a real
+    origin workflow instance that accumulates one genuinely persisted
+    failure_detected event per real retry, exactly as the coordinator's own
+    denial path (company_os_sandbox_coordinator.py's failure_detected
+    _append call) would leave it.
     """
     workflow = WORKFLOWS["integration_failure_recovery"]
     actions = [t["action"] for t in workflow["transitions"]]
@@ -383,15 +426,68 @@ async def test_integration_failure_recovery_full_chain_uses_genuine_derived_requ
         "original_action": "send_outreach"}}]
     world = build_stage2_snapshot(fixtures, REGISTRY, fixtures["approved_templates"],
         run_id="ifr-full-chain", compliance_policy={"version": "0.1.0", "sha256": "a" * 64})
-    world.prepare_dispatch(
-        message_key="origin-msg", recipient_id=recipient, adapter_kind="mail",
-        adapter_idempotency_key="origin-key-1", origin_workflow_instance_id=999,
-        origin_state_before="ready_to_send", origin_workflow_version=0,
-        frozen_native_decision={"action": "send_outreach"}, rendered_payload={},
-        consumers={}, origin_workflow_id="prospect_to_meeting", origin_entity_id="origin-case",
-    )
     run = await create_sandbox_run(async_db_session, run_id=world.run_id, company_slug="acqivo",
         protocol_version="0.1.0", input_manifest={"provider": "deterministic_mock"})
+    origin = await create_workflow_instance(async_db_session, sandbox_run_id=run.id,
+        workflow_id="prospect_to_meeting", entity_type="prospect", entity_id="origin-case",
+        initial_state="sent")
+    world.prepare_dispatch(
+        message_key="origin-msg", recipient_id=recipient, adapter_kind="mail",
+        adapter_idempotency_key="origin-key-1", origin_workflow_instance_id=origin.id,
+        origin_state_before="scored", origin_workflow_version=0,
+        frozen_native_decision={"action": "send_outreach",
+                                 "integration": {"name": "sendgrid", "phase": "execute"}},
+        rendered_payload={}, consumers={}, origin_workflow_id="prospect_to_meeting", origin_entity_id="origin-case",
+    )
+
+    origin_dispatch_id = next(iter(world.dispatches.values()))["dispatch_id"]
+    origin_failure_ordinal = 0
+
+    async def persist_origin_failure():
+        """Mirror the shape of a real coordinator-persisted failure_detected
+        event (company_os_sandbox_coordinator.py's _append/denial path) on
+        the origin instance -- never a fixture fact standing in for it. The
+        recovery case's own advance() calls persist real events into this
+        same sandbox_run_id too, so the next sequence number is computed
+        fresh each time rather than hardcoded (the same allocation
+        company_os_sandbox_service.append_sandbox_event itself uses)."""
+        nonlocal origin_failure_ordinal
+        origin_failure_ordinal += 1
+        next_sequence = (await async_db_session.scalar(
+            select(func.max(CompanyOSSandboxEvent.sequence)).where(
+                CompanyOSSandboxEvent.sandbox_run_id == run.id))) or 0
+        async_db_session.add(CompanyOSSandboxEvent(
+            sandbox_run_id=run.id, workflow_instance_id=origin.id,
+            event_id=f"origin-fail-{origin_failure_ordinal}", sequence=next_sequence + 1,
+            idempotency_key=f"origin-key-1:attempt:{origin_failure_ordinal}",
+            primary_classification="acquisition", event_type="failure_detected", result="failed",
+            risk_level="GREEN", state_before="scored", state_after="scored", external_side_effect=False,
+            payload={"action": "send_outreach", "metadata": {"gate": "integration", "dispatch_id": origin_dispatch_id,
+                                                          "dispatch_attempted": True}},
+            native_decision=None, native_failure={"type": "SyntheticCapabilityError"},
+        ))
+        await async_db_session.flush()
+
+    async def persist_provider_recovery(label, *, provider="sendgrid", target="sandbox", attempted=True):
+        """Persist an actual-success-shaped event, with variants that must
+        never be mistaken for post-failure health evidence."""
+        next_sequence = (await async_db_session.scalar(
+            select(func.max(CompanyOSSandboxEvent.sequence)).where(
+                CompanyOSSandboxEvent.sandbox_run_id == run.id))) or 0
+        async_db_session.add(CompanyOSSandboxEvent(
+            sandbox_run_id=run.id, workflow_instance_id=origin.id,
+            event_id=f"provider-recovered-{label}", sequence=next_sequence + 1,
+            idempotency_key=f"provider-recovered-{label}",
+            primary_classification="acquisition", event_type="decision_produced",
+            result="executed_in_sandbox", risk_level="GREEN",
+            state_before="scored", state_after="scored", external_side_effect=False,
+            payload={"action": "send_outreach",
+                     "integration": {"name": provider, "target": target},
+                     "metadata": {"gate": "allow", "dispatch_attempted": attempted}},
+            native_decision={"action": "send_outreach"}, native_failure=None,
+        ))
+        await async_db_session.flush()
+
     instance = await create_workflow_instance(async_db_session, sandbox_run_id=run.id,
         workflow_id="integration_failure_recovery", entity_type="integration_operation",
         entity_id=case["entity_id"], initial_state=workflow["states"][0])
@@ -411,7 +507,24 @@ async def test_integration_failure_recovery_full_chain_uses_genuine_derived_requ
     runner.cases["one"] = harness._Case(case, instance)
     state = runner.cases["one"]
     events = []
-    for decision in decisions:
+    # One genuine failure persisted before retry_within_safe_limit: eligible
+    # to retry, not yet exhausted or "repeated".
+    await persist_origin_failure()
+    for index, decision in enumerate(decisions):
+        if index == 1:
+            # A success before the *latest* failure cannot certify later
+            # recovery; the second failure invalidates the earlier success.
+            await persist_provider_recovery("before-latest-failure")
+            await persist_origin_failure()
+        if index == 3:
+            origin_record = next(iter(world.dispatches.values()))
+            assert await harness._post_failure_provider_health(async_db_session, origin_record) is False
+            await persist_provider_recovery("wrong-provider", provider="imap")
+            await persist_provider_recovery("not-attempted", attempted=False)
+            await persist_provider_recovery("wrong-target", target="live")
+            assert await harness._post_failure_provider_health(async_db_session, origin_record) is False
+            await persist_provider_recovery("actual")
+            assert await harness._post_failure_provider_health(async_db_session, origin_record) is True
         pair = await runner.advance(state)
         assert pair is not None, report.harness_defect or report.environment_failure
         events.append(pair[0])
@@ -419,6 +532,19 @@ async def test_integration_failure_recovery_full_chain_uses_genuine_derived_requ
     assert [e["state_after"] for e in events] == ["retry_wait", "blocked", "recovery_review", "ready_to_resume"]
     assert state.outcome == "ready"
     assert not report.harness_defect and not report.environment_failure
+
+
+def test_origin_dispatch_requires_unambiguous_queue_binding():
+    world = SyntheticWorld("origin-binding", datetime(2026, 9, 25, tzinfo=UTC))
+    facts = {"entity_id": "recovery-case", "origin_workflow_id": "prospect_to_meeting",
+             "origin_entity_id": "origin-case", "original_action": "send_outreach"}
+    base = {"origin_workflow_id": "prospect_to_meeting", "origin_entity_id": "origin-case",
+            "frozen_native_decision": {"action": "send_outreach"}}
+    world.dispatches["first"] = {**base, "dispatch_id": "first"}
+    world.dispatches["second"] = {**base, "dispatch_id": "second"}
+    assert harness._origin_dispatch(facts, world) is None
+    world.queue["recovery-case"] = {"item_id": "item", "dispatch_id": "second"}
+    assert harness._origin_dispatch(facts, world) is world.dispatches["second"]
 
 
 def test_verified_writable_integration_and_no_scope_expansion_predicates():
@@ -434,17 +560,23 @@ def test_verified_writable_integration_and_no_scope_expansion_predicates():
     world = SyntheticWorld("scope-test", datetime(2026, 9, 25, tzinfo=UTC))
     facts = {"origin_workflow_id": "prospect_to_meeting", "origin_entity_id": "case-a",
              "original_action": "send_outreach"}
-    assert harness.REQUIREMENT_RULES["verified writable integration"](facts, world, {}, REGISTRY) is True
-    assert harness.REQUIREMENT_RULES["verified writable integration"](facts, world, {}, {"integrations": {}}) is False
+    assert harness.REQUIREMENT_RULES["verified writable integration"](facts, world, {}, REGISTRY, 0) is True
+    assert harness.REQUIREMENT_RULES["verified writable integration"](facts, world, {}, {"integrations": {}}, 0) is False
     world.dispatches["d1"] = {"origin_workflow_id": "prospect_to_meeting", "origin_entity_id": "case-a",
                               "frozen_native_decision": {"action": "send_outreach"}, "status": "prepared"}
-    assert harness.REQUIREMENT_RULES["no scope expansion"](facts, world, {}, REGISTRY) is True
+    assert harness.REQUIREMENT_RULES["no scope expansion"](facts, world, {}, REGISTRY, 0) is True
     # A second record for the same origin identity but a different action
     # would mean the recovery is no longer resuming the exact action that
     # failed -- that must never verify.
     world.dispatches["d2"] = {"origin_workflow_id": "prospect_to_meeting", "origin_entity_id": "case-a",
                               "frozen_native_decision": {"action": "some_other_action"}, "status": "prepared"}
-    assert harness.REQUIREMENT_RULES["no scope expansion"](facts, world, {}, REGISTRY) is False
+    assert harness.REQUIREMENT_RULES["no scope expansion"](facts, world, {}, REGISTRY, 0) is False
+
+
+def test_qualify_requirement_rejects_below_threshold_score():
+    rule = harness.REQUIREMENT_RULES["score and confidence recorded"]
+    assert rule({"icp_score": 6, "confidence": 0.91}, None, {}, {}, 0) is False
+    assert rule({"icp_score": 7, "confidence": 0.91}, None, {}, {}, 0) is True
 
 
 def test_sending_identity_approved_requires_real_registry_sender_match():
@@ -456,10 +588,10 @@ def test_sending_identity_approved_requires_real_registry_sender_match():
     world = SyntheticWorld("identity-test", datetime(2026, 9, 25, tzinfo=UTC))
     rule = harness.REQUIREMENT_RULES["sending identity approved"]
     real_id = REGISTRY["integrations"]["sendgrid"]["sandbox_sender"]["sender_id"]
-    assert rule({"approved_sequence_id": real_id}, world, {}, REGISTRY) is True
+    assert rule({"approved_sequence_id": real_id}, world, {}, REGISTRY, 0) is True
     # An arbitrary, unverified fixture-invented string must never verify.
-    assert rule({"approved_sequence_id": "invented-sequence-id"}, world, {}, REGISTRY) is False
-    assert rule({}, world, {}, REGISTRY) is False
+    assert rule({"approved_sequence_id": "invented-sequence-id"}, world, {}, REGISTRY, 0) is False
+    assert rule({}, world, {}, REGISTRY, 0) is False
 
 
 def test_daily_send_and_follow_up_limits_independently_verified():
@@ -472,11 +604,135 @@ def test_daily_send_and_follow_up_limits_independently_verified():
     world = SyntheticWorld("limits-test", datetime(2026, 9, 25, tzinfo=UTC))
     rule = harness.REQUIREMENT_RULES["within daily send and follow-up limits"]
     within_both = {"daily_sends_used": 1, "daily_send_limit": 50, "follow_ups_sent": 0, "follow_up_limit": 3}
-    assert rule(within_both, world, {}, REGISTRY) is True
+    assert rule(within_both, world, {}, REGISTRY, 0) is True
     exhausted_follow_up = {**within_both, "follow_ups_sent": 3}
-    assert rule(exhausted_follow_up, world, {}, REGISTRY) is False
+    assert rule(exhausted_follow_up, world, {}, REGISTRY, 0) is False
     missing_follow_up_evidence = {"daily_sends_used": 1, "daily_send_limit": 50}
-    assert rule(missing_follow_up_evidence, world, {}, REGISTRY) is False
+    assert rule(missing_follow_up_evidence, world, {}, REGISTRY, 0) is False
+
+
+def test_integration_registry_verified_binds_to_customers_required_channels():
+    """P13-REV2-02: "integration registry verified" previously accepted ANY
+    verified, non-disabled registry entry -- a verified sandbox SendGrid
+    entry could certify readiness for a customer whose own required
+    connection was actually disabled. It must now bind to whichever
+    channels the customer's own approved_message_channels facts declare,
+    checking that channel's own specific capability.
+    """
+    rule = harness.REQUIREMENT_RULES["integration registry verified"]
+    world = SyntheticWorld("registry-test", datetime(2026, 9, 25, tzinfo=UTC))
+    assert rule({"approved_message_channels": ["email"]}, world, {}, REGISTRY, 0) is True
+    # The customer's required channel (email) has no verified, write-capable
+    # integration serving it -- an unrelated verified entry (imap, which
+    # serves reply_ingestion/support_inbox, not an email use) must never
+    # substitute for the customer's own actual requirement.
+    email_disabled = deepcopy(REGISTRY)
+    email_disabled["integrations"]["sendgrid"]["verified"] = False
+    assert rule({"approved_message_channels": ["email"]}, world, {}, email_disabled, 0) is False
+    # A channel with no established use-vocabulary mapping never verifies --
+    # this must fail closed, never silently pass.
+    assert rule({"approved_message_channels": ["carrier_pigeon"]}, world, {}, REGISTRY, 0) is False
+    assert rule({"approved_message_channels": []}, world, {}, REGISTRY, 0) is False
+    assert rule({}, world, {}, REGISTRY, 0) is False
+
+
+@pytest.mark.asyncio
+async def test_origin_failure_count_is_bound_to_dispatch_not_just_action():
+    origin = {"origin_workflow_instance_id": 7, "dispatch_id": "target-dispatch",
+              "frozen_native_decision": {"action": "send_outreach"}}
+    events = [
+        SimpleNamespace(payload={"action": "send_outreach", "metadata":
+            {"gate": "integration", "dispatch_id": "other-dispatch", "dispatch_attempted": True}}),
+        SimpleNamespace(payload={"action": "send_outreach", "metadata":
+            {"gate": "provider", "dispatch_id": "target-dispatch", "dispatch_attempted": True}}),
+        SimpleNamespace(payload={"action": "send_outreach", "metadata":
+            {"gate": "integration", "dispatch_id": "target-dispatch", "dispatch_attempted": True}}),
+        SimpleNamespace(payload={"action": "send_outreach", "metadata":
+            {"gate": "approval_resume", "dispatch_id": "target-dispatch", "dispatch_attempted": True}}),
+    ]
+    db = SimpleNamespace(scalars=AsyncMock(return_value=events))
+    assert await harness._origin_failure_count(db, origin) == 2
+
+
+def test_origin_failure_count_grounds_retry_predicates(async_db_session):
+    """P13-REV2-01: "retry policy permits another attempt" / "safe retry
+    limit reached or repeated provider errors" / "provider errors continue"
+    were all satisfied by a single prepared dispatch record with no actual
+    retry happening, because SyntheticWorld's dispatch-ledger status carries
+    no retry count. They must now be grounded in origin_failures -- the
+    origin dispatch's own genuinely persisted failure_detected count.
+    Proves all four tiers: no failure yet (nothing verified), one failure
+    (retry-eligible, not exhausted), repeated failures below the limit
+    (still eligible), and failures at/above the limit (exhausted, no
+    longer eligible).
+    """
+    rule = harness.REQUIREMENT_RULES
+    world = SyntheticWorld("origin-count-test", datetime(2026, 9, 25, tzinfo=UTC))
+    facts = {"origin_workflow_id": "prospect_to_meeting", "origin_entity_id": "origin-case",
+             "original_action": "send_outreach"}
+    # No originating dispatch at all: nothing can ever verify, regardless of count.
+    assert rule["retry policy permits another attempt"](facts, world, {}, REGISTRY, 0) is False
+    assert rule["safe retry limit reached or repeated provider errors"](facts, world, {}, REGISTRY, 5) is False
+    assert rule["provider errors continue"](facts, world, {}, REGISTRY, 5) is False
+    world.dispatches["origin-msg"] = {
+        "origin_workflow_id": "prospect_to_meeting", "origin_entity_id": "origin-case",
+        "frozen_native_decision": {"action": "send_outreach"}, "status": "prepared",
+        "adapter_idempotency_key": "origin-key-1",
+    }
+    for count in range(0, harness.SAFE_RETRY_LIMIT + 1):
+        eligible = rule["retry policy permits another attempt"](facts, world, {}, REGISTRY, count)
+        exhausted_or_repeated = rule["safe retry limit reached or repeated provider errors"](
+            facts, world, {}, REGISTRY, count)
+        continuing = rule["provider errors continue"](facts, world, {}, REGISTRY, count)
+        if count == 0:
+            # Newly prepared dispatch, no real failure yet: nothing verified.
+            assert (eligible, exhausted_or_repeated, continuing) == (False, False, False)
+        elif count < 2:
+            # One real failure: eligible to retry, not yet "repeated"/exhausted.
+            assert (eligible, exhausted_or_repeated, continuing) == (True, False, False)
+        elif count < harness.SAFE_RETRY_LIMIT:
+            # Below the limit but repeated (>=2): still eligible, and errors
+            # genuinely "continue".
+            assert (eligible, exhausted_or_repeated, continuing) == (True, True, True)
+        else:
+            # At/above the safe retry limit: exhausted, no longer eligible.
+            assert (eligible, exhausted_or_repeated, continuing) == (False, True, True)
+    # idempotency is preserved and unsent records remain durable are
+    # unaffected by origin_failures -- both stay grounded in the record
+    # itself, never the failure count.
+    assert rule["idempotency is preserved"](facts, world, {}, REGISTRY, 0) is True
+    assert rule["unsent records remain durable"](facts, world, {}, REGISTRY, 0) is True
+
+
+def test_provider_health_verified_binds_to_specific_originating_provider():
+    """P13-REV2-02: "provider health verified" previously accepted ANY
+    verified sandbox registry entry, and certified "recovery" from static
+    registration alone with no failure having ever happened. It must now
+    bind to the *originating* failed dispatch's own specific provider and
+    require a successful same-provider attempt after a persisted failure.
+    """
+    rule = harness.REQUIREMENT_RULES["provider health verified"]
+    world = SyntheticWorld("health-test", datetime(2026, 9, 25, tzinfo=UTC))
+    facts = {"origin_workflow_id": "prospect_to_meeting", "origin_entity_id": "origin-case",
+             "original_action": "send_outreach"}
+    world.dispatches["origin-msg"] = {
+        "origin_workflow_id": "prospect_to_meeting", "origin_entity_id": "origin-case",
+        "frozen_native_decision": {"action": "send_outreach",
+                                    "integration": {"name": "sendgrid", "phase": "execute"}},
+        "status": "prepared", "adapter_idempotency_key": "origin-key-1",
+    }
+    # No failure has actually happened yet: static registration alone must
+    # never certify recovery.
+    assert rule(facts, world, {}, REGISTRY, 0) is False
+    # A failure plus static registration still does not establish recovery.
+    assert rule(facts, world, {}, REGISTRY, 1) is False
+    observed = {"_post_failure_provider_health": True}
+    assert rule(facts, world, observed, REGISTRY, 1) is True
+    # An unrelated verified entry must never certify a DIFFERENT provider's
+    # recovery: sendgrid itself (the one that actually failed) is disabled here.
+    sendgrid_disabled = deepcopy(REGISTRY)
+    sendgrid_disabled["integrations"]["sendgrid"]["verified"] = False
+    assert rule(facts, world, observed, sendgrid_disabled, 1) is False
 
 
 @pytest.mark.parametrize("status", ["approved", "modified", "rejected", "expired", "cancelled", "needs_more_evidence"])
@@ -614,7 +870,7 @@ async def test_unrelated_signal_after_compliance_block_causes_no_re_attempt(asyn
     state.source["inputs"].append({"delivery_id": "unrelated", "type": "failure_injection", "facts": {
         "workflow_id": "prospect_to_meeting", "entity_id": state.source["entity_id"],
         "action": "close", "after_effect": False}})
-    runner.drain()
+    await runner.drain()
     assert state.outcome == "compliance_blocked"
     assert await runner.advance(state) is None
     assert state.attempts == attempts_before
@@ -683,6 +939,27 @@ def _bare_dependency(p):
     p["cases"][0]["inputs"].append({"delivery_id": "second", "type": "reply", "facts": {}})
 
 
+@pytest.mark.asyncio
+async def test_other_case_event_wakes_blocked_case_when_shared_evidence_changes(monkeypatch):
+    report = harness.HarnessReport()
+    runner = harness._Runner(None, {}, None, None, {}, {"integration_registry": {}}, [], report)
+    blocked = harness._Case({"id": "blocked"}, SimpleNamespace())
+    blocked.outcome = "waiting_on_evidence"
+    blocked.blocked_fingerprint = "before"
+    other = harness._Case({"id": "other"}, SimpleNamespace())
+    runner.cases = {"blocked": blocked, "other": other}
+
+    async def fingerprint(case, *_):
+        return "after" if case["id"] == "blocked" else "unchanged"
+
+    monkeypatch.setattr(harness, "decision_fingerprint", fingerprint)
+    monkeypatch.setattr(harness, "export_pair", lambda _: ({"action": "other_action"}, {}))
+    monkeypatch.setattr(harness, "classify_outcome", lambda _: "terminal")
+    await runner.record(other, SimpleNamespace(event_id="other-event", native_failure=None))
+    assert blocked.outcome == "ready"
+    assert report.outcomes["blocked"] == "ready"
+
+
 @pytest.mark.parametrize("mutate,match", [
     (_bare_dependency, "ambiguous dependency: expected signal: or milestone:"),
     (lambda p: p["cases"][0]["inputs"].append({"delivery_id": "next", "type": "reply", "facts": {},
@@ -737,7 +1014,7 @@ async def test_idempotent_replay_without_pending_precondition(async_db_session):
     assert row.id == approval.resolution_event_id and resume.id == approval.resume_event_id
     runner = harness._Runner(async_db_session, r.pack, r.world, r.provider, r.workflows, {}, [], r.report)
     runner.exported = {p[0]["event_id"] for p in r.pairs}
-    assert runner.record(None, row) is None and runner.record(None, resume) is None
+    assert await runner.record(None, row) is None and await runner.record(None, resume) is None
     assert len(await r.rows()) == len(r.pairs)
 
 
@@ -942,6 +1219,26 @@ def test_queued_message_milestone_mismatch_rejected_at_pack_build():
                                              "entity_type": "integration_operation"}}, [], REGISTRY)
 
 
+def test_queued_message_recipient_must_match_person_origin_at_pack_build():
+    fixtures = pack()
+    origin = fixtures["cases"][0]
+    recovery = deepcopy(origin)
+    recovery.update(id="two", workflow_id="integration_failure_recovery", entity_type="integration_operation",
+                    entity_id="queue-one")
+    recovery["inputs"] = [
+        {"delivery_id": "initial-two", "type": "estimate", "facts": {}},
+        {"delivery_id": "queue", "type": "queued_message", "after": ["milestone:one:send_outreach"], "facts": {
+            "entity_id": "queue-one", "workflow_id": "integration_failure_recovery", "item_id": "queue-one",
+            "recipient_id": "different-recipient", "origin_workflow_id": "prospect_to_meeting",
+            "origin_entity_id": origin["entity_id"], "original_action": "send_outreach"}},
+    ]
+    fixtures["cases"].append(recovery)
+    with pytest.raises(harness.FixtureAuthoringError, match="queued message recipient differs"):
+        harness.validate_pack(fixtures, {"prospect_to_meeting": WORKFLOW,
+            "integration_failure_recovery": {**WORKFLOW, "id": "integration_failure_recovery",
+                                             "entity_type": "integration_operation"}}, [], REGISTRY)
+
+
 async def test_failure_injection_ingested_before_dispatch_attempt(async_db_session, monkeypatch):
     fixtures = pack()
     identity = ("prospect_to_meeting", fixtures["cases"][0]["entity_id"], "send_outreach")
@@ -1045,7 +1342,7 @@ async def test_decision_loop_covers_every_real_service_signature(async_db_sessio
             if scenario == "resume_defect":
                 runner.options["policy"] = {**POLICY, "hard_denies": ["pricing_change"]}
             event = await runner.call(state, resume_sandbox_approval, approval_id=approval.id, **runner.options_for(state))
-            pair = runner.record(state, event)
+            pair = await runner.record(state, event)
         else:
             state.outcome = "ready"  # deliberate collision, never normal scheduler behavior
             state.source["attempts"].append({"ordinal": 2, "ref": "collision", "decision_id": "D2"})
@@ -1094,7 +1391,7 @@ async def test_expected_resolution_conflict_rejection_recorded_as_evidence(async
     r.provider.decisions["one"] = [native("pricing_change", "research", "RED")]
     await runner.advance(state)
     first = await runner.resolve(state, "D")
-    assert runner.record(state, first) is not None
+    assert await runner.record(state, first) is not None
     # A second, conflicting resolution of the same already-resolved approval
     # -- deliberately different founder_minutes, so it can never take the
     # service's own identical-replay branch -- reproduces the service's real
@@ -1105,7 +1402,7 @@ async def test_expected_resolution_conflict_rejection_recorded_as_evidence(async
     assert state.rejection_credited is True and state.outcome == "service_rejection"
     assert r.report.service_rejections == [{"case_id": "one", "call": "resolve_sandbox_approval",
         "exception_type": "SandboxApprovalError", "message": "only pending approval may be resolved",
-        "expected": True}]
+        "binding": "D", "expected": True}]
     assert len(await r.rows()) == 2  # approval_requested + the one successful approval_resolved
 
 
@@ -1136,10 +1433,10 @@ async def test_resolution_replay_through_driver_exports_once(async_db_session):
     r.provider.decisions["one"] = [native("pricing_change", "research", "RED")]
     await runner.advance(state)
     first = await runner.resolve(state, "D")
-    assert runner.record(state, first) is not None
+    assert await runner.record(state, first) is not None
     second = await runner.resolve(state, "D")
     assert second.event_id == first.event_id
-    assert runner.record(state, second) is None
+    assert await runner.record(state, second) is None
     assert len(await r.rows()) == 2
 
 
@@ -1323,6 +1620,49 @@ async def test_genuine_database_error_is_not_misfiled_as_harness_defect(async_db
     with pytest.raises(DBAPIError):
         await r.run()
     assert r.report.harness_defect is None
+
+
+async def test_evidence_query_outage_preserves_environment_classification(async_db_session, monkeypatch):
+    from sqlalchemy.exc import OperationalError
+
+    async def broken_context(*args, **kwargs):
+        raise OperationalError("select events", {}, Exception("connection reset"))
+
+    monkeypatch.setattr(harness, "evidence_context", broken_context)
+    r = Run(async_db_session, [native()])
+    with pytest.raises(OperationalError):
+        await r.run()
+    assert r.report.harness_defect is None
+    assert r.report.environment_failure is None
+
+
+@pytest.mark.parametrize("exception_type", ["IntegrityError", "DataError", "ProgrammingError"])
+async def test_constraint_violation_is_harness_defect_not_environment_failure(
+    async_db_session, monkeypatch, exception_type,
+):
+    """P13-REV2-03: IntegrityError/DataError/ProgrammingError all inherit
+    from DBAPIError too, but each means the application or fixture issued a
+    bad constraint/value/statement -- a genuine code/fixture defect, never
+    an infrastructure outage. The previous blanket "except DBAPIError:
+    raise" carve-out (P13-REV-03) folded these into environment_failure
+    alongside real connection/availability failures. They must instead
+    reach the generic classification and be reported as a harness defect,
+    exactly like any other code/fixture bug -- proven here for all three,
+    directly alongside the genuine-outage proof above for the same call site.
+    """
+    import sqlalchemy.exc as sa_exc
+
+    error_cls = getattr(sa_exc, exception_type)
+
+    async def broken(*a, **k):
+        raise error_cls("stmt", {}, Exception("synthetic constraint/value/statement defect"))
+    monkeypatch.setattr(harness, "coordinate_sandbox_action", broken)
+    r = Run(async_db_session, [native()])
+    with pytest.raises(harness.HarnessDefect):
+        await r.run()
+    assert r.report.harness_defect is not None
+    assert r.report.harness_defect["type"] == exception_type
+    assert r.report.environment_failure is None
 
 
 @pytest.mark.parametrize("declared", ["CompanyOSTransportError", "CompanyOSDecisionMethodDefect", "UnknownError"])

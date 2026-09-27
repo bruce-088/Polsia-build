@@ -107,7 +107,11 @@ person (and otherwise-unscoped) cases, or the bound queue item's
 `recipient_id` for aggregate cases, matching `resolve_recipient`. A fixture
 fact key literally named after a requirement string is rejected at pack-build
 time as self-fulfilling; every reachable transition requirement must have a
-rule, or pack-build fails loudly rather than silently passing.
+rule, or pack-build fails loudly rather than silently passing. Recovery retry
+requirements count persisted integration failures for the bound dispatch only;
+`provider health verified` additionally requires a later successful sandbox
+adapter attempt on that same provider. Registry verification alone does not
+establish post-failure health.
 
 The coordinator-call budget is 25 per case and the retry-command budget is 3.
 Unknown references and signal cycles fail validation before the run. As approved

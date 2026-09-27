@@ -12,7 +12,6 @@ from datetime import datetime
 from typing import Any
 
 from app.services.company_os_synthetic_adapters import (
-    SyntheticCapabilityError,
     SyntheticWorld,
     normalize_address,
 )
@@ -86,7 +85,18 @@ def build_stage2_snapshot(
             world.consents[recipient] = consent
             world.suppression_snapshots[recipient] = deepcopy(case.get("suppression_snapshot") or {})
         return world
-    except (KeyError, TypeError, SyntheticCapabilityError) as exc:
+    except Exception as exc:
+        # Every exception type is converted here (P13-REV2-04): a bare
+        # ValueError from datetime.fromisoformat on an invalid frozen_clock,
+        # or an AttributeError from a malformed consent/contact object (e.g.
+        # a string where a dict is required), previously escaped this
+        # narrower (KeyError, TypeError, SyntheticCapabilityError) tuple
+        # unwrapped and were misclassified downstream as environment
+        # failures instead of the malformed-artifact defects they are. This
+        # function performs only in-memory parsing/construction -- no
+        # database or filesystem I/O happens here, so it is safe to convert
+        # everything raised inside it; a genuine infrastructure failure can
+        # never originate from this call.
         raise Stage2InputError(f"invalid canonical Stage 2 input: {exc}") from exc
 
 
@@ -126,7 +136,12 @@ def apply_stage2_signal(
         elif channel not in {"prospect", "estimate", "lead_batch", "founder_resolution", "retry"}:
             raise Stage2InputError(f"unsupported canonical input type: {channel}")
         # Non-provider facts remain verbatim in input_cases for the decision driver.
-    except (KeyError, TypeError, SyntheticCapabilityError) as exc:
+    except Exception as exc:
+        # Widened for the same reason as build_stage2_snapshot's own except
+        # clause above (P13-REV2-04): a malformed nested signal (e.g.
+        # non-dict facts) can raise AttributeError/ValueError, not just
+        # KeyError/TypeError/SyntheticCapabilityError. Pure in-memory
+        # signal application; no I/O to accidentally swallow.
         raise Stage2InputError(f"invalid canonical Stage 2 input: {exc}") from exc
 
 
@@ -143,6 +158,12 @@ def load_stage2_inputs(
         for case in fixtures["cases"]:
             for signal in case["inputs"]:
                 apply_stage2_signal(world, case, signal, now)
-    except (KeyError, TypeError, SyntheticCapabilityError) as exc:
+    except Stage2InputError:
+        raise
+    except Exception as exc:
+        # Same widening as build_stage2_snapshot/apply_stage2_signal above
+        # (P13-REV2-04); apply_stage2_signal already raises Stage2InputError
+        # directly (re-raised untouched above), this covers only what this
+        # function's own frozen_clock re-parse could raise.
         raise Stage2InputError(f"invalid canonical Stage 2 input: {exc}") from exc
     return world

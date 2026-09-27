@@ -1,0 +1,97 @@
+{
+  "id": "estimate_followup",
+  "version": "0.2.0",
+  "purpose": "Follow up on an existing customer estimate using approved timing, channel, and authority rules.",
+  "entity_type": "estimate",
+  "owner_agent": "revenue_ops",
+  "states": [
+    "open",
+    "eligibility_check",
+    "ineligible",
+    "sequence_drafted",
+    "active",
+    "responded",
+    "needs_customer",
+    "won",
+    "lost",
+    "paused",
+    "opted_out"
+  ],
+  "terminal_states": [
+    "ineligible",
+    "won",
+    "lost",
+    "opted_out"
+  ],
+  "transitions": [
+    {
+      "from": "open",
+      "to": "eligibility_check",
+      "action": "verify_estimate_status_and_contact_eligibility",
+      "risk_level": "GREEN"
+    },
+    {
+      "from": "eligibility_check",
+      "to": "ineligible",
+      "action": "block_ineligible_followup",
+      "risk_level": "GREEN"
+    },
+    {
+      "from": "eligibility_check",
+      "to": "sequence_drafted",
+      "action": "prepare_followup_sequence",
+      "risk_level": "GREEN"
+    },
+    {
+      "from": "sequence_drafted",
+      "to": "active",
+      "action": "activate_approved_sequence",
+      "risk_level": "YELLOW",
+      "requirements": [
+        "customer-approved timing and channel",
+        "follow-up count within policy"
+      ]
+    },
+    {
+      "from": "active",
+      "to": "responded",
+      "action": "classify_response",
+      "risk_level": "GREEN"
+    },
+    {
+      "from": "responded",
+      "to": "needs_customer",
+      "action": "escalate_pricing_or_technical_question",
+      "risk_level": "GREEN"
+    },
+    {
+      "from": "responded",
+      "to": "won",
+      "action": "record_customer_confirmed_win",
+      "risk_level": "GREEN"
+    },
+    {
+      "from": "responded",
+      "to": "lost",
+      "action": "record_customer_confirmed_loss",
+      "risk_level": "GREEN"
+    },
+    {
+      "from": "active",
+      "to": "paused",
+      "action": "pause_after_sequence_limit",
+      "risk_level": "GREEN"
+    },
+    {
+      "from": "active",
+      "to": "opted_out",
+      "action": "record_opt_out",
+      "risk_level": "GREEN"
+    }
+  ],
+  "invariants": [
+    "Never alter the estimate amount.",
+    "Never negotiate price unless customer policy explicitly grants that authority.",
+    "Do not record won/lost from sentiment alone when confirmation is missing."
+  ]
+}

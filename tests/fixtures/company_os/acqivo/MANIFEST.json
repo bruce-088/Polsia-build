@@ -14,6 +14,14 @@
       "source_path": "/Users/brucelove/.openclaw/workspace/.openclaw/tmp/acqivo-company-os/workflows/missed_inquiry_recovery.json",
       "sha256": "1f42751e31523de50fce3c1083d77fe22809e11353a7eee7369fdd814757b6b2"
     },
+    "workflows/estimate_followup.json": {
+      "source_path": "/Users/brucelove/.openclaw/workspace/.openclaw/tmp/acqivo-company-os/workflows/estimate_followup.json",
+      "sha256": "63dd636bd51139667541f14c3b0b516b153f8ac9333dd07f2c2e092c0f0f9e3d"
+    },
+    "workflows/stale_lead_reactivation.json": {
+      "source_path": "/Users/brucelove/.openclaw/workspace/.openclaw/tmp/acqivo-company-os/workflows/stale_lead_reactivation.json",
+      "sha256": "7e2a7b30a1ceba3d9ae0a7975c3863d02a1d6796cec2609566a7f47d80eaa1b2"
+    },
     "workflows/integration_failure_recovery.json": {
       "source_path": "/Users/brucelove/.openclaw/workspace/.openclaw/tmp/acqivo-company-os/workflows/integration_failure_recovery.json",
       "sha256": "b6ade7bb19a0442b76a2fc48347c32f6c475702bb6181bc584bd0c3dd59fef79"

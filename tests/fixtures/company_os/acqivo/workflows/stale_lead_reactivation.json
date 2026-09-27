@@ -1,0 +1,106 @@
+{
+  "id": "stale_lead_reactivation",
+  "version": "0.2.0",
+  "purpose": "Safely test reactivation of older leads that are demonstrably eligible under customer policy and applicable messaging rules.",
+  "entity_type": "lead_batch",
+  "owner_agent": "revenue_ops",
+  "states": [
+    "candidate_batch",
+    "eligibility_review",
+    "blocked",
+    "approval_pending",
+    "test_batch_ready",
+    "test_batch_active",
+    "review_results",
+    "scale_ready",
+    "active",
+    "responded",
+    "booked",
+    "opted_out",
+    "closed"
+  ],
+  "terminal_states": [
+    "blocked",
+    "booked",
+    "opted_out",
+    "closed"
+  ],
+  "transitions": [
+    {
+      "from": "candidate_batch",
+      "to": "eligibility_review",
+      "action": "verify_source_age_channel_and_eligibility",
+      "risk_level": "YELLOW"
+    },
+    {
+      "from": "eligibility_review",
+      "to": "blocked",
+      "action": "block_unverified_or_ineligible_batch",
+      "risk_level": "GREEN"
+    },
+    {
+      "from": "eligibility_review",
+      "to": "approval_pending",
+      "action": "request_first_reactivation_approval",
+      "risk_level": "RED"
+    },
+    {
+      "from": "approval_pending",
+      "to": "test_batch_ready",
+      "action": "founder_approves_test",
+      "risk_level": "RED"
+    },
+    {
+      "from": "test_batch_ready",
+      "to": "test_batch_active",
+      "action": "activate_small_test_batch",
+      "risk_level": "YELLOW",
+      "requirements": [
+        "verified writable integration",
+        "opt-out path",
+        "batch size approved"
+      ]
+    },
+    {
+      "from": "test_batch_active",
+      "to": "review_results",
+      "action": "measure_test",
+      "risk_level": "GREEN"
+    },
+    {
+      "from": "review_results",
+      "to": "scale_ready",
+      "action": "recommend_scale_if_safe",
+      "risk_level": "YELLOW"
+    },
+    {
+      "from": "scale_ready",
+      "to": "active",
+      "action": "activate_within_approved_bounds",
+      "risk_level": "YELLOW"
+    },
+    {
+      "from": "active",
+      "to": "responded",
+      "action": "classify_reply",
+      "risk_level": "GREEN"
+    },
+    {
+      "from": "responded",
+      "to": "booked",
+      "action": "record_confirmed_next_step",
+      "risk_level": "GREEN"
+    },
+    {
+      "from": "active",
+      "to": "opted_out",
+      "action": "record_opt_out",
+      "risk_level": "GREEN"
+    }
+  ],
+  "invariants": [
+    "Technical ability to message does not establish eligibility.",
+    "First live reactivation requires founder approval.",
+    "Begin with a small measured test, not a full database blast."
+  ]
+}

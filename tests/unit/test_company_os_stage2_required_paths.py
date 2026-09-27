@@ -64,7 +64,8 @@ def test_manifest_hashes_and_source_identity():
                 "integrations/stage2_sandbox_registry.json", "schemas/sandbox_event.schema.json",
                 "simulations/stage2_synthetic_input_fixtures.json"}
     expected |= {f"workflows/{name}.json" for name in (
-        "prospect_to_meeting", "customer_onboarding", "missed_inquiry_recovery", "integration_failure_recovery")}
+        "prospect_to_meeting", "customer_onboarding", "missed_inquiry_recovery",
+        "estimate_followup", "stale_lead_reactivation", "integration_failure_recovery")}
     assert set(MANIFEST["files"]) == expected
     assert {str(p.relative_to(ROOT)) for p in ROOT.rglob("*") if p.is_file()} == expected | {"MANIFEST.json"}
     for path, record in MANIFEST["files"].items():

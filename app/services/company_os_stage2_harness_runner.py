@@ -17,10 +17,10 @@ from datetime import datetime
 from typing import Any
 
 from sqlalchemy import select
-from sqlalchemy.exc import DBAPIError
+from sqlalchemy.exc import DataError, DBAPIError, IntegrityError, ProgrammingError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.agents.company_os_compliance import is_email_execute
+from app.agents.company_os_compliance import EMAIL_USES, is_email_execute
 from app.agents.company_os_stage2_provider import ScriptedProviderTimeout
 from app.config import settings
 from app.models.company_os_sandbox import CompanyOSSandboxApproval, CompanyOSSandboxEvent
@@ -36,7 +36,7 @@ from app.services.company_os_sandbox_coordinator import (
     SandboxCoordinatorError,
     coordinate_sandbox_action,
 )
-from app.services.company_os_sandbox_dispatch import AGGREGATE_WORKFLOWS
+from app.services.company_os_sandbox_dispatch import AGGREGATE_WORKFLOWS, PERSON_WORKFLOWS
 from app.services.company_os_sandbox_service import (
     create_sandbox_run,
     create_workflow_instance,
@@ -47,6 +47,17 @@ from app.services.company_os_synthetic_adapters import SyntheticAdapter, Synthet
 
 MAX_DECISIONS_PER_CASE = 25
 MAX_RETRIES_PER_CASE = 3
+# The one real, explicit retry-policy limit integration_failure_recovery's own
+# "safe retry limit reached" requirement is grounded in -- deliberately the
+# same bound as the driver's own retry-command budget (MAX_RETRIES_PER_CASE)
+# rather than a second, disconnected magic number (P13-REV2-01).
+SAFE_RETRY_LIMIT = MAX_RETRIES_PER_CASE
+# customer_onboarding's "integration registry verified" binds each of the
+# customer's own approved_message_channels to the registry integrations that
+# actually serve that channel's use, never to any unrelated verified entry
+# (P13-REV2-02). Only "email" has a real, established use-vocabulary mapping
+# (EMAIL_USES, company_os_compliance.py) anywhere in this codebase.
+CHANNEL_INTEGRATION_USES = {"email": EMAIL_USES}
 CLASSIFICATIONS = {
     "prospect_to_meeting": "acquisition", "customer_onboarding": "customer_onboarding",
     "missed_inquiry_recovery": "missed_inquiry_recovery", "estimate_followup": "estimate_followup",
@@ -65,6 +76,16 @@ def _finite_number(value: Any) -> bool:
     return type(value) in (int, float) and math.isfinite(value)
 
 
+def _approved_followup_time(facts: dict, world: SyntheticWorld) -> bool:
+    value = facts.get("customer_approved_followup_at")
+    if not isinstance(value, str):
+        return False
+    try:
+        return datetime.fromisoformat(value) == world.frozen_at
+    except ValueError:
+        return False
+
+
 def _origin_dispatch(facts: dict, world: SyntheticWorld) -> dict | None:
     """Find the persistent dispatch-ledger record a recovery signal's own
     origin_workflow_id/origin_entity_id/original_action facts describe.
@@ -76,10 +97,87 @@ def _origin_dispatch(facts: dict, world: SyntheticWorld) -> dict | None:
     evidence of "a failure happened here and here is its current state" by
     the time integration_failure_recovery's own requirements are checked.
     """
-    return next((record for record in world.dispatches.values()
-                 if record.get("origin_workflow_id") == facts.get("origin_workflow_id")
-                 and record.get("origin_entity_id") == facts.get("origin_entity_id")
-                 and record.get("frozen_native_decision", {}).get("action") == facts.get("original_action")), None)
+    matches = [record for record in world.dispatches.values()
+               if record.get("origin_workflow_id") == facts.get("origin_workflow_id")
+               and record.get("origin_entity_id") == facts.get("origin_entity_id")
+               and record.get("frozen_native_decision", {}).get("action") == facts.get("original_action")]
+    item = world.queue.get(facts.get("entity_id")) if isinstance(facts.get("entity_id"), str) else None
+    if item:
+        dispatch_id = item.get("dispatch_id") or world.dispatch_id(item["item_id"])
+        return next((record for record in matches if record.get("dispatch_id") == dispatch_id), None)
+    # Without a bound queue item, ambiguity must fail closed, not select a
+    # convenient first record and borrow its failure or health evidence.
+    return matches[0] if len(matches) == 1 else None
+
+
+async def _origin_failure_count(db: AsyncSession, record: dict | None) -> int:
+    """Count the recovery case's own originating dispatch's genuinely
+    persisted failure_detected events -- the only real, accumulating,
+    queryable evidence of how many times the provider has actually failed on
+    this attempt (P13-REV2-01).
+
+    SyntheticWorld's dispatch-ledger status is set once by prepare_dispatch
+    and stores no retry count or policy at all; a genuine provider failure
+    (adapter.execute raising SyntheticCapabilityError) never advances it past
+    "prepared" -- company_os_sandbox_dispatch.py's execute_dispatch only ever
+    moves status to "blocked" on a compliance/eligibility refusal, never on
+    the adapter's own failure. So dispatch-ledger status alone can never
+    distinguish "never attempted" from "failed five times," which is exactly
+    what let one prepared record satisfy every retry-count-shaped requirement
+    at once. Each real failure the origin instance's own coordinator call
+    persists is a separate, immutable failure_detected event row, scoped by
+    the origin's own workflow_instance_id and the action that failed --
+    never derived from a fixture fact or from world.action_failures (already
+    popped by the time integration_failure_recovery's own transitions run).
+    """
+    if record is None or not record.get("dispatch_id"):
+        return 0
+    action = (record.get("frozen_native_decision") or {}).get("action")
+    events = await db.scalars(select(CompanyOSSandboxEvent).where(
+        CompanyOSSandboxEvent.workflow_instance_id == record["origin_workflow_instance_id"],
+        CompanyOSSandboxEvent.event_type == "failure_detected",
+    ))
+    return sum(
+        1 for event in events
+        if event.payload.get("metadata", {}).get("gate") in {"integration", "approval_resume"}
+        and event.payload.get("metadata", {}).get("dispatch_attempted") is True
+        and event.payload.get("metadata", {}).get("dispatch_id") == record.get("dispatch_id")
+        and event.payload.get("action") == action
+    )
+
+
+async def _post_failure_provider_health(db: AsyncSession, record: dict | None) -> bool:
+    """A later successful sandbox adapter attempt on the same provider is the
+    only available operational health observation. Static registry verification
+    alone cannot prove recovery after this dispatch failed.
+    """
+    if not record or not record.get("dispatch_id"):
+        return False
+    provider = ((record.get("frozen_native_decision") or {}).get("integration") or {}).get("name")
+    if not provider:
+        return False
+    origin_events = await db.scalars(select(CompanyOSSandboxEvent).where(
+        CompanyOSSandboxEvent.workflow_instance_id == record["origin_workflow_instance_id"],
+        CompanyOSSandboxEvent.event_type == "failure_detected",
+    ))
+    failures = [event for event in origin_events
+                if event.payload.get("metadata", {}).get("gate") in {"integration", "approval_resume"}
+                and event.payload.get("metadata", {}).get("dispatch_attempted") is True
+                and event.payload.get("metadata", {}).get("dispatch_id") == record["dispatch_id"]]
+    if not failures:
+        return False
+    latest = max(failures, key=lambda event: event.sequence)
+    later = await db.scalars(select(CompanyOSSandboxEvent).where(
+        CompanyOSSandboxEvent.sandbox_run_id == latest.sandbox_run_id,
+        CompanyOSSandboxEvent.sequence > latest.sequence,
+        CompanyOSSandboxEvent.result == "executed_in_sandbox",
+    ))
+    return any(
+        (event.payload.get("integration") or {}).get("name") == provider
+        and (event.payload.get("integration") or {}).get("target") == "sandbox"
+        and event.payload.get("metadata", {}).get("dispatch_attempted") is True
+        for event in later
+    )
 
 
 # Explicit, per-string predicates for genuinely derivable transition requirements.
@@ -89,26 +187,33 @@ def _origin_dispatch(facts: dict, world: SyntheticWorld) -> dict | None:
 # entry here fail pack-build loudly instead of silently passing. Covers every
 # requirement string declared anywhere in the four in-scope canonical workflow
 # definitions (prospect_to_meeting, customer_onboarding, missed_inquiry_recovery,
-# integration_failure_recovery -- tests/fixtures/company_os/acqivo/workflows/*.json),
+# estimate_followup, stale_lead_reactivation, integration_failure_recovery --
+# tests/fixtures/company_os/acqivo/workflows/*.json),
 # not just the ones a particular dev fixture happens to reach (P13-REV-01).
-REQUIREMENT_RULES: dict[str, Callable[[dict, SyntheticWorld, dict, dict], bool]] = {
-    "public evidence preserved": lambda facts, world, case, registry: (
+# The 5th positional argument, origin_failures, is the recovery case's own
+# originating dispatch's genuinely-persisted failure_detected count (see
+# _origin_failure_count) -- 0 whenever there is no such origin (most
+# predicates below never use it, but every predicate accepts it so the
+# caller (evidence_context) can invoke all of them uniformly).
+REQUIREMENT_RULES: dict[str, Callable[[dict, SyntheticWorld, dict, dict, int], bool]] = {
+    "public evidence preserved": lambda facts, world, case, registry, origin_failures: (
         isinstance(facts.get("public_source"), str) and bool(facts["public_source"])),
-    "score and confidence recorded": lambda facts, world, case, registry: (
-        _finite_number(facts.get("icp_score")) and _finite_number(facts.get("confidence"))),
-    "score below qualification threshold": lambda facts, world, case, registry: (
+    "score and confidence recorded": lambda facts, world, case, registry, origin_failures: (
+        _finite_number(facts.get("icp_score")) and facts["icp_score"] >= 7
+        and _finite_number(facts.get("confidence"))),
+    "score below qualification threshold": lambda facts, world, case, registry, origin_failures: (
         _finite_number(facts.get("icp_score")) and facts["icp_score"] < 7),
-    "score and reason recorded": lambda facts, world, case, registry: (
+    "score and reason recorded": lambda facts, world, case, registry, origin_failures: (
         _finite_number(facts.get("icp_score")) and isinstance(facts.get("disqualification_reason"), str)
         and bool(facts["disqualification_reason"])),
-    "personalization supported by evidence": lambda facts, world, case, registry: (
+    "personalization supported by evidence": lambda facts, world, case, registry, origin_failures: (
         isinstance(facts.get("personalization_evidence"), str) and bool(facts["personalization_evidence"])),
-    "first live batch or unapproved sequence": lambda facts, world, case, registry: (
+    "first live batch or unapproved sequence": lambda facts, world, case, registry, origin_failures: (
         facts.get("first_live_batch") is True or facts.get("unapproved_sequence") is True),
     # Both bounds independently verified against their own usage/limit evidence
     # (P13-REV-02) -- previously only the daily-send pair was checked, so a
     # case with an exhausted follow-up allowance verified anyway.
-    "within daily send and follow-up limits": lambda facts, world, case, registry: (
+    "within daily send and follow-up limits": lambda facts, world, case, registry, origin_failures: (
         _finite_number(facts.get("daily_sends_used")) and _finite_number(facts.get("daily_send_limit"))
         and facts["daily_sends_used"] < facts["daily_send_limit"]
         and _finite_number(facts.get("follow_ups_sent")) and _finite_number(facts.get("follow_up_limit"))
@@ -116,65 +221,114 @@ REQUIREMENT_RULES: dict[str, Callable[[dict, SyntheticWorld, dict, dict], bool]]
     # Bound to the registry's own real sandbox sender identity (P13-REV-02) --
     # previously any nonempty fixture-supplied string satisfied this with no
     # check that the sender/identity was actually approved by real evidence.
-    "sending identity approved": lambda facts, world, case, registry: (
+    "sending identity approved": lambda facts, world, case, registry, origin_failures: (
         isinstance(facts.get("approved_sequence_id"), str) and bool(facts["approved_sequence_id"])
         and registry.get("integrations", {}).get("sendgrid", {}).get("verified") is True
         and facts["approved_sequence_id"] == (
             registry.get("integrations", {}).get("sendgrid", {}).get("sandbox_sender", {}).get("sender_id"))),
-    "integration mode permits write": lambda facts, world, case, registry: any(
+    "integration mode permits write": lambda facts, world, case, registry, origin_failures: any(
         cfg.get("external_writes") is True for cfg in registry.get("integrations", {}).values()),
-    "opt-out handling enabled": lambda facts, world, case, registry: any(
+    "opt-out handling enabled": lambda facts, world, case, registry, origin_failures: any(
         isinstance((world.templates.get(tid) or {}).get("opt_out_route"), dict)
         and world.templates[tid]["opt_out_route"].get("covers_all_marketing") is True
         for tid in case.get("available_template_ids", [])),
-    "authoritative calendar or human handoff": lambda facts, world, case, registry: (
+    "authoritative calendar or human handoff": lambda facts, world, case, registry, origin_failures: (
         facts.get("meeting_confirmed") is True and str(facts.get("confirmation_ref", "")).startswith("sandbox://")),
     # customer_onboarding (required_customer_facts: service_area, business_hours,
     # workflow_permissions, approved_message_channels, escalation_contacts --
     # the same "authority" channel evidence company_os_stage2_inputs.py's own
     # authority_verified derivation reads).
-    "first production activation requires founder approval": lambda facts, world, case, registry: (
+    "first production activation requires founder approval": lambda facts, world, case, registry, origin_failures: (
         facts.get("authority_verified") is True or facts.get("customer_authority_verified") is True),
-    "scope approved": lambda facts, world, case, registry: (
+    "scope approved": lambda facts, world, case, registry, origin_failures: (
         isinstance(facts.get("service_area"), str) and bool(facts["service_area"])
         and isinstance(facts.get("business_hours"), str) and bool(facts["business_hours"])
         and isinstance(facts.get("approved_message_channels"), list) and bool(facts["approved_message_channels"])),
-    "customer permissions recorded": lambda facts, world, case, registry: (
+    "customer permissions recorded": lambda facts, world, case, registry, origin_failures: (
         isinstance(facts.get("workflow_permissions"), list) and bool(facts["workflow_permissions"])
         and isinstance(facts.get("escalation_contacts"), list) and bool(facts["escalation_contacts"])),
-    "integration registry verified": lambda facts, world, case, registry: any(
-        cfg.get("verified") is True and cfg.get("mode") not in (None, "live", "disabled")
-        for cfg in registry.get("integrations", {}).values()),
+    # Bound to the customer's own required connections (P13-REV2-02) --
+    # every channel the customer's own approved_message_channels facts
+    # declare must be served by a specific verified, write-capable registry
+    # integration for that channel's use; an unrelated verified entry (e.g.
+    # a verified read-only imap connection) can never satisfy an email
+    # requirement, and an unrecognized channel with no established
+    # use-vocabulary mapping (CHANNEL_INTEGRATION_USES) never verifies.
+    "integration registry verified": lambda facts, world, case, registry, origin_failures: (
+        isinstance(facts.get("approved_message_channels"), list) and bool(facts["approved_message_channels"])
+        and all(
+            channel in CHANNEL_INTEGRATION_USES and any(
+                cfg.get("verified") is True and cfg.get("external_writes") is True
+                and set(cfg.get("desired_use", [])) & CHANNEL_INTEGRATION_USES[channel]
+                for cfg in registry.get("integrations", {}).values())
+            for channel in facts["approved_message_channels"])),
     # missed_inquiry_recovery / integration_failure_recovery: the customer's own
     # recorded authority must cover this specific workflow, and the registry
     # must have a genuinely verified, write-capable integration -- never a
     # same-named fact flag standing in for either.
-    "approved customer workflow": lambda facts, world, case, registry: (
-        isinstance(facts.get("workflow_permissions"), list)
-        and case["workflow_id"] in facts["workflow_permissions"]),
-    "verified writable integration": lambda facts, world, case, registry: any(
+    "approved customer workflow": lambda facts, world, case, registry, origin_failures: (
+        (customer := world.customers.get(facts.get("customer_id"), {})).get("authority_verified") is True
+        and isinstance(customer.get("workflow_permissions"), list)
+        and case["workflow_id"] in customer["workflow_permissions"]),
+    "verified writable integration": lambda facts, world, case, registry, origin_failures: any(
         cfg.get("verified") is True and cfg.get("external_writes") is True
         for cfg in registry.get("integrations", {}).values()),
+    # Estimate follow-up is grounded in the linked customer's recorded authority,
+    # an explicit channel/time fact, and the fixture's numeric send budget.
+    "customer-approved timing and channel": lambda facts, world, case, registry, origin_failures: (
+        (customer := world.customers.get(facts.get("customer_id"), {})).get("authority_verified") is True
+        and facts.get("customer_authority_verified") is True
+        and isinstance(customer.get("approved_message_channels"), list)
+        and facts.get("customer_approved_channel") in customer["approved_message_channels"]
+        and _approved_followup_time(facts, world)),
+    "follow-up count within policy": lambda facts, world, case, registry, origin_failures: (
+        type(facts.get("followups_sent")) is int and facts["followups_sent"] >= 0
+        and type(facts.get("approved_max_followups")) is int
+        and facts["approved_max_followups"] > facts["followups_sent"]),
+    # Reactivation requires an actual opt-out route on an available approved
+    # template and a bounded, positive batch size in the synthetic authority.
+    "opt-out path": lambda facts, world, case, registry, origin_failures: any(
+        isinstance((world.templates.get(tid) or {}).get("opt_out_route"), dict)
+        and world.templates[tid]["opt_out_route"].get("covers_all_marketing") is True
+        and world.templates[tid].get("approved_at")
+        and world.templates[tid].get("revoked_at") is None
+        for tid in case.get("available_template_ids", [])),
+    "batch size approved": lambda facts, world, case, registry, origin_failures: (
+        (customer := world.customers.get(facts.get("customer_id"), {})).get("authority_verified") is True
+        and facts.get("customer_authority_verified") is True
+        and type(facts.get("record_count")) is int and facts["record_count"] > 0
+        and type(customer.get("approved_batch_size")) is int
+        and facts["record_count"] <= customer["approved_batch_size"]),
     # integration_failure_recovery: grounded in the persistent dispatch-ledger
-    # record the recovery case's own origin facts describe (_origin_dispatch),
-    # never world.action_failures (already popped by the time these run) and
-    # never a same-named fixture fact.
-    "retry policy permits another attempt": lambda facts, world, case, registry: (
-        (record := _origin_dispatch(facts, world)) is not None and record["status"] == "prepared"),
-    "idempotency is preserved": lambda facts, world, case, registry: (
+    # record the recovery case's own origin facts describe (_origin_dispatch)
+    # for structural identity, and in origin_failures -- the origin's own
+    # genuinely persisted failure_detected count -- for retry-count evidence
+    # (P13-REV2-01). Never world.action_failures (already popped by the time
+    # these run), never dispatch-ledger status alone (sits at "prepared"
+    # whether zero or five real failures happened), and never a same-named
+    # fixture fact.
+    "retry policy permits another attempt": lambda facts, world, case, registry, origin_failures: (
+        _origin_dispatch(facts, world) is not None and 1 <= origin_failures < SAFE_RETRY_LIMIT),
+    "idempotency is preserved": lambda facts, world, case, registry, origin_failures: (
         (record := _origin_dispatch(facts, world)) is not None and bool(record.get("adapter_idempotency_key"))),
-    "safe retry limit reached or repeated provider errors": lambda facts, world, case, registry: (
+    "safe retry limit reached or repeated provider errors": lambda facts, world, case, registry, origin_failures: (
+        _origin_dispatch(facts, world) is not None and origin_failures >= 2),
+    "unsent records remain durable": lambda facts, world, case, registry, origin_failures: (
         (record := _origin_dispatch(facts, world)) is not None and record["status"] == "prepared"),
-    "unsent records remain durable": lambda facts, world, case, registry: (
-        (record := _origin_dispatch(facts, world)) is not None and record["status"] == "prepared"),
-    "provider errors continue": lambda facts, world, case, registry: (
-        (record := _origin_dispatch(facts, world)) is not None and record["status"] == "prepared"),
-    "provider health verified": lambda facts, world, case, registry: any(
-        cfg.get("verified") is True and cfg.get("mode") == "sandbox"
-        for cfg in registry.get("integrations", {}).values()),
-    "original approval remains valid": lambda facts, world, case, registry: (
+    "provider errors continue": lambda facts, world, case, registry, origin_failures: (
+        _origin_dispatch(facts, world) is not None and origin_failures >= 2),
+    # Bound to the origin's provider and to a later successful sandbox
+    # adapter attempt on that same provider. Static registry verification
+    # remains necessary but cannot certify post-failure recovery by itself.
+    "provider health verified": lambda facts, world, case, registry, origin_failures: (
+        (record := _origin_dispatch(facts, world)) is not None
+        and case.get("_post_failure_provider_health") is True
+        and bool(provider := ((record.get("frozen_native_decision") or {}).get("integration") or {}).get("name"))
+        and registry.get("integrations", {}).get(provider, {}).get("verified") is True
+        and registry["integrations"][provider].get("mode") == "sandbox"),
+    "original approval remains valid": lambda facts, world, case, registry, origin_failures: (
         (record := _origin_dispatch(facts, world)) is not None and record["status"] != "blocked"),
-    "no scope expansion": lambda facts, world, case, registry: (
+    "no scope expansion": lambda facts, world, case, registry, origin_failures: (
         _origin_dispatch(facts, world) is not None and not any(
             record.get("origin_workflow_id") == facts.get("origin_workflow_id")
             and record.get("origin_entity_id") == facts.get("origin_entity_id")
@@ -182,7 +336,7 @@ REQUIREMENT_RULES: dict[str, Callable[[dict, SyntheticWorld, dict, dict], bool]]
             for record in world.dispatches.values())),
     # Reused wherever a recovery/aggregate case needs evidence that its queue
     # binding genuinely exists, not merely a same-named fact flag.
-    "queue integrity verified": lambda facts, world, case, registry: case["entity_id"] in world.queue,
+    "queue integrity verified": lambda facts, world, case, registry, origin_failures: case["entity_id"] in world.queue,
 }
 
 
@@ -290,8 +444,8 @@ def validate_pack(pack: dict, workflows: dict, corrections: list, registry: dict
         workflow = workflows[case["workflow_id"]]
         if case["workflow_id"] not in CLASSIFICATIONS or workflow["entity_type"] != case["entity_type"]:
             raise FixtureAuthoringError("unsupported workflow classification or entity type")
-        if not any(not s.get("after") for s in case["inputs"]):
-            raise FixtureAuthoringError("case needs initial signals")
+        if not case["inputs"]:
+            raise FixtureAuthoringError("case needs signals")
         # Every reachable transition requirement needs a real derivation rule
         # (P13B-02); a fixture fact literally named after one would trivially
         # self-fulfill it, so that exact key is banned from signal facts.
@@ -394,6 +548,16 @@ def validate_pack(pack: dict, workflows: dict, corrections: list, registry: dict
                 if target not in deliveries:
                     raise FixtureAuthoringError("unknown signal dependency")
                 graph[delivery].append(target)
+            elif dependency.startswith("event:"):
+                parts = dependency.split(":")
+                if (len(parts) != 5 or parts[1] not in cases or parts[3] not in
+                    {"failure_detected", "transition_completed", "terminal_outcome"} or
+                    not parts[4].isdigit() or int(parts[4]) < 1 or
+                    not any(t["action"] == parts[2] for t in workflows[cases[parts[1]]["workflow_id"]]["transitions"])):
+                    raise FixtureAuthoringError("invalid persisted-event dependency")
+                source_signals = cases[parts[1]]["inputs"]
+                initial = [s["delivery_id"] for s in source_signals if not s.get("after")]
+                graph[delivery].extend(initial or [s["delivery_id"] for s in source_signals])
             elif dependency.startswith("milestone:"):
                 parts = dependency.split(":")
                 if len(parts) != 3 or parts[1] not in cases:
@@ -415,6 +579,9 @@ def validate_pack(pack: dict, workflows: dict, corrections: list, registry: dict
                             or origin_facts.get("original_action") != parts[2]):
                         raise FixtureAuthoringError(
                             "queued message origin facts do not match its milestone dependency")
+                    if (target["workflow_id"] in PERSON_WORKFLOWS
+                            and origin_facts.get("recipient_id") != target["contact_record"].get("recipient_id")):
+                        raise FixtureAuthoringError("queued message recipient differs from person-workflow origin")
             else:
                 raise FixtureAuthoringError("ambiguous dependency: expected signal: or milestone:")
     visiting, done = set(), set()
@@ -453,6 +620,11 @@ def validate_pack(pack: dict, workflows: dict, corrections: list, registry: dict
             "action", "risk_level", "state_after", "agent_type", "handoff_to", "policy_intent", "integration"
         }:
             raise FixtureAuthoringError("corrected decision must have the seven native fields")
+        if row["status"] == "modified" and pack.get("infrastructure_only") is not True:
+            intent = row["corrected_decision"].get("policy_intent")
+            expected_marker = f"sandbox://founder-correction/{row['case_id']}/{row['decision_id']}"
+            if not isinstance(intent, dict) or intent.get("founder_correction_ref") != expected_marker:
+                raise FixtureAuthoringError("modified correction needs founder-only marker")
 
 
 def bound_recipient(case: dict, world: SyntheticWorld) -> tuple[str | None, dict | None]:
@@ -469,7 +641,7 @@ def bound_recipient(case: dict, world: SyntheticWorld) -> tuple[str | None, dict
     return case["contact_record"]["recipient_id"], None
 
 
-def evidence_context(case: dict, consumed: list, world: SyntheticWorld, registry: dict) -> dict:
+async def evidence_context(case: dict, consumed: list, world: SyntheticWorld, registry: dict, db: AsyncSession) -> dict:
     """Conservative factual derivation; never copy a workflow requirement list.
 
     Every verified requirement comes from an explicit, per-string predicate
@@ -481,7 +653,16 @@ def evidence_context(case: dict, consumed: list, world: SyntheticWorld, registry
     for signal in consumed:
         if signal["type"] != "failure_injection":
             facts.update(deepcopy(signal["facts"]))
-    requirements = {name for name, rule in REQUIREMENT_RULES.items() if rule(facts, world, case, registry)}
+    # Computed once per call, not once per predicate, and passed to every
+    # predicate uniformly (P13-REV2-01) -- the only real, accumulating,
+    # queryable evidence of how many times the recovery case's own
+    # originating dispatch has genuinely failed.
+    origin_record = _origin_dispatch(facts, world)
+    origin_failures = await _origin_failure_count(db, origin_record)
+    derived_case = {**case, "_post_failure_provider_health":
+                    await _post_failure_provider_health(db, origin_record)}
+    requirements = {name for name, rule in REQUIREMENT_RULES.items()
+                     if rule(facts, world, derived_case, registry, origin_failures)}
     refs = [f"sandbox://fixture/{case['id']}/snapshot"]
     refs.extend(f"sandbox://delivery/{s['delivery_id']}" for s in consumed)
     contact = world.contacts.get(recipient, {}) if recipient else {}
@@ -494,17 +675,21 @@ def evidence_context(case: dict, consumed: list, world: SyntheticWorld, registry
                                    for key in case.get("available_template_ids", []) if key in world.templates},
             "verified_requirements": sorted(requirements), "evidence_refs": refs,
             "consent_verified": bool(recipient) and contact.get("consent_verified") is True and not world.is_suppressed(recipient),
-            "authority_verified": facts.get("authority_verified") is True or facts.get("customer_authority_verified") is True}
+            "authority_verified": (
+                (world.customers.get(facts.get("customer_id"), {}).get("authority_verified") is True
+                 and facts.get("customer_authority_verified") is True)
+                if isinstance(facts.get("customer_id"), str)
+                else facts.get("authority_verified") is True or facts.get("customer_authority_verified") is True)}
 
 
-def decision_fingerprint(case: dict, consumed: list, world: SyntheticWorld, registry: dict) -> str:
+async def decision_fingerprint(case: dict, consumed: list, world: SyntheticWorld, registry: dict, db: AsyncSession) -> str:
     """Hash only compliance/policy-relevant evidence, never the ever-growing raw ref list.
 
     Used both to gate drain()'s blocked-outcome reset and record()'s
     no-progress guard, so neither mistakes an unrelated new signal (or the
     delivery-ref list simply getting longer) for genuinely new evidence.
     """
-    context = evidence_context(case, consumed, world, registry)
+    context = await evidence_context(case, consumed, world, registry, db)
     relevant = {key: context[key] for key in (
         "facts", "verified_requirements", "consent_verified", "authority_verified",
         "contact_record", "consent_record", "suppression_snapshot")}
@@ -522,6 +707,7 @@ class _Case:
     retries: int = 0
     outcome: str = "ready"
     last_progress: tuple | None = None
+    blocked_fingerprint: str | None = None
     retry_key: str | None = None
     attempt_events: dict = field(default_factory=dict)
     attempt_keys: dict = field(default_factory=dict)
@@ -535,14 +721,40 @@ class _Runner:
         self.workflows, self.options, self.corrections, self.report = workflows, options, corrections, report
         self.cases = {}
         self.ingested, self.exported = set(), set()
+        self.recorded = []
         self.activity = 0
 
     def options_for(self, state):
         return {**self.options, "workflow": self.workflows[state.source["workflow_id"]]}
 
+    async def wake_blocked_cases(self):
+        """Recheck shared evidence after any signal or persisted event.
+
+        Recovery requirements can change through another case's dispatch or
+        provider-health event, with no new signal to the blocked case itself.
+        """
+        for state in self.cases.values():
+            if state.outcome not in {"waiting_on_evidence", "compliance_blocked", "policy_blocked"}:
+                continue
+            current = await decision_fingerprint(state.source, state.consumed, self.world,
+                self.options["integration_registry"], self.db)
+            if state.blocked_fingerprint is None:
+                state.blocked_fingerprint = current
+            elif current != state.blocked_fingerprint:
+                state.blocked_fingerprint = None
+                state.outcome = "ready"
+                self.report.outcomes[state.source["id"]] = "ready"
+
     def dependency_ready(self, dependency):
         if dependency.startswith("signal:"):
             return dependency[7:] in self.ingested
+        if dependency.startswith("event:"):
+            _, case_id, action, event_type, count = dependency.split(":")
+            case = self.cases[case_id].source
+            return sum(event["workflow_id"] == case["workflow_id"]
+                       and event["entity_id"] == case["entity_id"]
+                       and event["action"] == action and event["event_type"] == event_type
+                       for event in self.recorded) >= int(count)
         _, case_id, action = dependency.split(":")
         case = self.cases[case_id].source
         # Evaluate the identical predicate SyntheticWorld.receive uses to match
@@ -558,7 +770,7 @@ class _Runner:
                    and record["frozen_native_decision"]["action"] == action
                    for record in self.world.dispatches.values())
 
-    def drain(self):
+    async def drain(self):
         """Global fixed point after each arrival/event, before another service call."""
         while True:
             changed = False
@@ -567,9 +779,6 @@ class _Runner:
                 for _, signal in signals:
                     if signal["delivery_id"] in self.ingested or not all(self.dependency_ready(d) for d in signal.get("after", [])):
                         continue
-                    blocked = state.outcome in {"waiting_on_evidence", "compliance_blocked", "policy_blocked"}
-                    before = decision_fingerprint(state.source, state.consumed, self.world,
-                                                  self.options["integration_registry"]) if blocked else None
                     try:
                         apply_stage2_signal(self.world, state.source, signal, self.world.frozen_at)
                     except Exception as exc:
@@ -578,17 +787,9 @@ class _Runner:
                     state.consumed.append(deepcopy(signal))
                     self.activity += 1
                     changed = True
-                    # A blocked/waiting case only re-attempts once the arriving
-                    # signal actually changes compliance/policy-relevant
-                    # evidence -- never on an unrelated signal, and never
-                    # fingerprinted against the ever-growing raw ref list
-                    # (P13B-07); otherwise an identical compliance-blocked send
-                    # could repeat indefinitely, bounded only by the budget.
-                    if blocked:
-                        after = decision_fingerprint(state.source, state.consumed, self.world,
-                                                     self.options["integration_registry"])
-                        if after != before:
-                            state.outcome = "ready"
+                    # Recheck every blocked case, because shared dispatch/health
+                    # evidence can also change through another case (M3).
+                    await self.wake_blocked_cases()
                     # Re-scan from the beginning after each signal, including cross-case references.
                     break
                 if changed:
@@ -611,7 +812,7 @@ class _Runner:
         return row
 
     async def call(self, state, function, *, binding=None, **kwargs):
-        self.drain()
+        await self.drain()
         try:
             return await function(self.db, **kwargs)
         except (SandboxCoordinatorError, SandboxApprovalError) as exc:
@@ -623,7 +824,8 @@ class _Runner:
                     and await self._rejection_precondition_holds(state, function, kwargs, binding)):
                 state.rejection_credited = True
                 self.report.service_rejections.append({"case_id": state.source["id"], "call": function.__name__,
-                    "exception_type": type(exc).__name__, "message": str(exc), "expected": True})
+                    "exception_type": type(exc).__name__, "message": str(exc), "binding": binding,
+                    "expected": True})
                 state.outcome = "service_rejection"
                 self.activity += 1
                 return None
@@ -653,16 +855,17 @@ class _Runner:
         approval = await self.db.get(CompanyOSSandboxApproval, approval_id)
         return approval is not None and approval.decision_id == binding
 
-    def record(self, state, event):
+    async def record(self, state, event):
         if event is None or event.event_id in self.exported:
             return None
         pair = export_pair(event)
         self.exported.add(event.event_id)
+        self.recorded.append(pair[0])
         self.activity += 1
         state.outcome = classify_outcome(pair[0])
         if state.outcome == "ready":
-            fingerprint = decision_fingerprint(state.source, state.consumed, self.world,
-                                               self.options["integration_registry"])
+            fingerprint = await decision_fingerprint(state.source, state.consumed, self.world,
+                                               self.options["integration_registry"], self.db)
             progress = (event.state_before, pair[0]["action"], event.state_after, fingerprint)
             if progress == state.last_progress:
                 state.outcome = "waiting_on_evidence"
@@ -673,7 +876,13 @@ class _Runner:
                 self.report.harness_defect = {"case_id": state.source["id"], "type": failure_type}
             elif failure_type not in {*self.pack.get("scripted_failure_types", []), "CompanyOSMalformedOutputError"}:
                 self.report.environment_failure = {"case_id": state.source["id"], "type": failure_type}
+        if state.outcome in {"waiting_on_evidence", "compliance_blocked", "policy_blocked"}:
+            state.blocked_fingerprint = await decision_fingerprint(
+                state.source, state.consumed, self.world, self.options["integration_registry"], self.db)
+        else:
+            state.blocked_fingerprint = None
         self.report.outcomes[state.source["id"]] = state.outcome
+        await self.wake_blocked_cases()
         return pair
 
     async def resolve(self, state, decision_id):
@@ -693,7 +902,7 @@ class _Runner:
     async def controls(self) -> AsyncIterator[tuple[dict, dict]]:
         """Dispatch one command/service call at a time, then globally re-scan."""
         while True:
-            self.drain()
+            await self.drain()
             changed = False
             for state in self.cases.values():
                 if state.resume_due:
@@ -702,7 +911,7 @@ class _Runner:
                     row = await self.approval(state, decision_id)
                     event = await self.call(state, resume_sandbox_approval, binding=decision_id,
                         approval_id=row.id, **self.options_for(state))
-                    pair = self.record(state, event)
+                    pair = await self.record(state, event)
                     if pair:
                         yield pair
                     changed = True
@@ -761,7 +970,7 @@ class _Runner:
                                 state.outcome = "ready"
                             self.report.outcomes[state.source["id"]] = state.outcome
                             break
-                    pair = self.record(state, event)
+                    pair = await self.record(state, event)
                     if pair:
                         yield pair
                     break
@@ -771,8 +980,8 @@ class _Runner:
                 return
 
     async def advance(self, state):
-        self.drain()
-        if state.outcome != "ready":
+        await self.drain()
+        if state.outcome != "ready" or not state.consumed:
             return None
         if state.attempts >= MAX_DECISIONS_PER_CASE:
             state.outcome = "decision_budget_exhausted"
@@ -782,7 +991,8 @@ class _Runner:
         attempt = next((a for a in state.source.get("attempts", []) if a["ordinal"] == state.attempts), {})
         # Every driver-owned operation completes before the coordinator is called.
         try:
-            context = evidence_context(state.source, state.consumed, self.world, self.options["integration_registry"])
+            context = await evidence_context(state.source, state.consumed, self.world,
+                self.options["integration_registry"], self.db)
             context.update(case_id=state.source["id"], current_state=state.instance.current_state,
                            workflow=deepcopy(self.workflows[state.source["workflow_id"]]),
                            canonical_agents=self.options["canonical_agents"], canonical_actions=self.options["canonical_actions"],
@@ -816,6 +1026,10 @@ class _Runner:
 
                 async def callback(_):
                     return await self.decide(frozen)
+        except DBAPIError:
+            # Evidence derivation queries the event store. Preserve database
+            # failure provenance for the run-level DBAPIError classifier.
+            raise
         except Exception as exc:
             raise HarnessDefect(f"decision preparation: {type(exc).__name__}: {exc}") from exc
         event = await self.call(state, coordinate_sandbox_action, binding=attempt.get("ref"),
@@ -826,7 +1040,7 @@ class _Runner:
             state.attempt_keys[attempt["ref"]] = key
             if event is not None:
                 state.attempt_events[attempt["ref"]] = event.id
-        return self.record(state, event)
+        return await self.record(state, event)
 
 
 async def run_stage2_fixture_pack(
@@ -892,7 +1106,7 @@ async def run_stage2_fixture_pack(
             runner.cases[case["id"]] = _Case(case, instance)
         while True:
             before = runner.activity
-            runner.drain()
+            await runner.drain()
             for state in runner.cases.values():
                 async for pair in runner.controls():
                     yield pair
@@ -942,14 +1156,24 @@ async def run_stage2_fixture_pack(
     except HarnessDefect as exc:
         report.harness_defect = {"type": type(exc).__name__, "message": str(exc)}
         raise
-    except DBAPIError:
-        # A genuine database/infrastructure I/O failure (connection drop,
-        # timeout, disk error -- anything the DBAPI driver itself raised, as
-        # opposed to a programming/application-level SQLAlchemy misuse) must
-        # keep its infrastructure/environment classification, never be folded
-        # into harness_defect just because it happened to surface inside this
-        # generator (P13-REV-03: the P13B-06 widening below is for code/
-        # fixture defects, not for the database transport itself failing).
+    except DBAPIError as exc:
+        if isinstance(exc, IntegrityError | DataError | ProgrammingError):
+            # These three inherit from DBAPIError too, but they mean the
+            # application or fixture issued a bad constraint/value/
+            # statement -- a genuine code/fixture defect, never an
+            # infrastructure outage (P13-REV2-03: the previous blanket
+            # "except DBAPIError: raise" carve-out folded these into
+            # environment_failure alongside real connection/availability
+            # failures). Convert exactly like the generic except Exception
+            # below, since none of the three is itself a HarnessDefect.
+            report.harness_defect = {"type": type(exc).__name__, "message": str(exc)}
+            raise HarnessDefect(str(exc)) from exc
+        # Everything else DBAPIError wraps (InterfaceError, OperationalError,
+        # InternalError, NotSupportedError, or an unclassified base
+        # DBAPIError) represents a genuine connection/availability/storage
+        # failure -- the infrastructure actually failing -- and must keep
+        # that classification, never folded into harness_defect just because
+        # it happened to surface inside this generator.
         raise
     except Exception as exc:
         # Widened from a fixed (KeyError, TypeError, ValueError) tuple
