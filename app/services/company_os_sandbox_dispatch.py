@@ -25,6 +25,12 @@ from app.services.company_os_synthetic_adapters import (
     SyntheticWorld,
 )
 
+PERSON_WORKFLOWS = {"prospect_to_meeting", "missed_inquiry_recovery"}
+AGGREGATE_WORKFLOWS = {"integration_failure_recovery", "estimate_followup", "stale_lead_reactivation"}
+ENTITY_TYPES = {"prospect_to_meeting": "prospect", "missed_inquiry_recovery": "lead",
+                "integration_failure_recovery": "integration_operation",
+                "estimate_followup": "estimate", "stale_lead_reactivation": "lead_batch"}
+
 
 class DispatchBlocked(SyntheticComplianceBlock):
     def __init__(self, result: ComplianceResult):
@@ -95,15 +101,10 @@ def resolve_recipient(world, instance, snapshot, action):
     """Person workflows address their entity; aggregate workflows require a bound queue."""
     item_id = snapshot.get("item_id")
     item = None
-    entity_types = {"prospect_to_meeting": "prospect", "missed_inquiry_recovery": "lead",
-                    "integration_failure_recovery": "integration_operation",
-                    "estimate_followup": "estimate", "stale_lead_reactivation": "lead_batch"}
-    if entity_types.get(instance.workflow_id) != instance.entity_type:
+    if ENTITY_TYPES.get(instance.workflow_id) != instance.entity_type:
         raise SyntheticComplianceBlock("evidence_missing_or_scope_unknown")
-    person_workflow = instance.workflow_id in {"prospect_to_meeting", "missed_inquiry_recovery"}
-    aggregate_workflow = instance.workflow_id in {
-        "integration_failure_recovery", "estimate_followup", "stale_lead_reactivation",
-    }
+    person_workflow = instance.workflow_id in PERSON_WORKFLOWS
+    aggregate_workflow = instance.workflow_id in AGGREGATE_WORKFLOWS
     if not person_workflow and not aggregate_workflow:
         raise SyntheticComplianceBlock("evidence_missing_or_scope_unknown")
     if aggregate_workflow:

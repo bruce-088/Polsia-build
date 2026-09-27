@@ -30,6 +30,12 @@ class ScriptedProviderTimeout(CompanyOSContractError):
 
 def stage2_json_schema(context: dict) -> dict:
     string = {"type": "string", "minLength": 1}
+    # Registry sandbox modes, when known; evaluate_action_policy blocks any
+    # external_write intent whose integration_mode isn't a valid registry mode
+    # (app/agents/company_os_policy.py), so this field must be declarable at
+    # all -- without it the only governed write path was unreachable (P13B-03).
+    modes = sorted((context.get("integration_registry") or {}).get("modes") or
+                   {"disabled", "documented", "sandbox", "read_only", "write_limited", "live"})
     properties = {
         "action": {"enum": context["canonical_actions"]},
         "risk_level": {"enum": ["GREEN", "YELLOW", "RED"]},
@@ -38,7 +44,12 @@ def stage2_json_schema(context: dict) -> dict:
         "handoff_to": {"enum": context["canonical_handoffs"]},
         "policy_intent": {"type": "object", "required": ["action_type", "risk_level", "external_write"],
                           "properties": {"action_type": string, "risk_level": {"enum": ["GREEN", "YELLOW", "RED"]},
-                                         "external_write": {"type": "boolean"}}},
+                                         "external_write": {"type": "boolean"},
+                                         "integration_mode": {"enum": modes},
+                                         "requires_consent": {"type": "boolean"},
+                                         "requires_authority": {"type": "boolean"},
+                                         "limit_name": string, "requested_total": {"type": "number"},
+                                         "policy_flags": {"type": "array", "items": string}}},
         "integration": {"anyOf": [{"type": "null"}, {
             "type": "object", "additionalProperties": False, "required": ["name", "phase"],
             "properties": {"name": string, "phase": {"enum": ["draft", "propose", "read", "execute"]},
@@ -57,7 +68,13 @@ async def stage2_decision(agent, task: dict, context: dict, *, structured_transp
         prompt = (f"COMPANY OS STAGE 2. You are {agent.agent_type}.\n{agent.company_os_instructions}\n"
                   "Choose one native decision using only supplied evidence. Missing evidence stays missing. "
                   "Do not invent consent, authority, requirements, recipients or completion. "
-                  "Messages use approved template_id and fills only. Return only the schema object.\n"
+                  "Messages use approved template_id and fills only. "
+                  "For any action whose integration.phase is \"execute\", set policy_intent.integration_mode to "
+                  "that integration's actual registered mode; set requires_consent/requires_authority to whether "
+                  "this action genuinely needs verified consent/authority; set limit_name and requested_total only "
+                  "when a policy limit genuinely bounds this action's full size; set policy_flags to any policy "
+                  "labels this action genuinely matches. Never claim a mode, limit, or flag unsupported by the "
+                  "supplied evidence. Return only the schema object.\n"
                   + json.dumps({"task": task, "context": context}, allow_nan=False))
         if structured_transport is None:
             payload, raw = agent._run_claude_structured(prompt, schema, stage2_errors=True)

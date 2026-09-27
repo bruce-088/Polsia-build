@@ -77,17 +77,37 @@ fixtures never guess the DB-generated resume key. Founder corrections have
 `corrected_decision`, and `manual_evidence_ref`. Only `modified` carries a
 non-null corrected decision. All six lifecycle statuses are supported.
 
-An expected service rejection specifies exact `call`, `exception_type`, and
-`expects` message. The separate rejection stream contains `case_id`, `call`,
-`exception_type`, `message`, and `expected: true`. Undeclared rejections abort as
-harness defects.
+An expected service rejection specifies exact `call`, `exception_type`,
+`expects` message, and a `binding` (an attempt `ref` or approval `decision_id`
+-- see "Evidence and failure reporting" below). The separate rejection stream
+contains `case_id`, `call`, `exception_type`, `message`, and `expected: true`.
+Undeclared, unbound, or repeated rejections abort as harness defects.
 
 Signals may use `sequence_hint` to order eligible arrivals and `after` barriers
 with `signal:<delivery_id>` or `milestone:<case_id>:<email-action>`. Signal
 barriers wait for ingestion; milestones wait for a nonblocked dispatch ledger
-record, including a prepared record left by an adapter failure. A hint alone is
-not a barrier. Eligible signals are drained globally to a fixed point between
-individual service calls. Autonomous decisions advance round-robin.
+record, including a prepared record left by an adapter failure, matched on
+that record's own origin fields and frozen action -- the identical predicate
+`SyntheticWorld.receive` uses to bind a `queued_message`, never on which case
+happens to be a registered consumer of the record (that diverges for a
+chained recovery). A `queued_message` signal's own origin facts must agree
+with its declared milestone; a mismatch is rejected at pack-build time. A hint
+alone is not a barrier. Eligible signals are drained globally to a fixed
+point between individual service calls, and reset a blocked/waiting case to
+ready only when the arriving signal actually changes compliance/policy-
+relevant evidence -- never on an unrelated signal. Autonomous decisions
+advance round-robin. Once an aggregate-workflow case's queue item is bound,
+its `item_id` is carried at the snapshot's top level, so
+`find_dispatch`/`resolve_recipient`'s queue-scope cross-check actually runs.
+
+`verified_requirements` comes from an explicit, per-string predicate mapping
+(`REQUIREMENT_RULES`) grounded in genuinely available evidence -- contact/
+consent/suppression are keyed on the contact record's own `recipient_id` for
+person (and otherwise-unscoped) cases, or the bound queue item's
+`recipient_id` for aggregate cases, matching `resolve_recipient`. A fixture
+fact key literally named after a requirement string is rejected at pack-build
+time as self-fulfilling; every reachable transition requirement must have a
+rule, or pack-build fails loudly rather than silently passing.
 
 The coordinator-call budget is 25 per case and the retry-command budget is 3.
 Unknown references and signal cycles fail validation before the run. As approved
@@ -102,9 +122,48 @@ per-case outcomes, pending work, failures, and raw canonical/native SHA-256.
 `<events>_harness_defect.json` takes precedence over
 `<events>_environment_failure.json`; partial evidence is preserved. Malformed
 model output remains an exported, scoreable failure. Transport failures abort
-as environment failures; typed method defects abort as harness defects.
+as environment failures; typed method defects abort as harness defects. Pack,
+founder-resolution, and driver-controls shape is validated before
+`build_stage2_snapshot` even runs, so a malformed artifact is always a harness
+defect, never an environment failure.
+
+`outcomes` is the authoritative per-case final classification. `failures`
+additionally lists every case whose final outcome was not `terminal`, except
+for the run's intentionally-scored non-terminal endpoints -- a
+compliance/policy block or a credited service rejection, each the deliberate
+success criterion of its own coverage bucket, not a defect. Every other
+non-terminal outcome (a waiting/defect/collision/budget-exhaustion/unconsumed
+signal or command) gets a `failures` entry, so nothing that kept a case from
+reaching terminal is visible only in `outcomes`. A retry/founder-resolution
+control command dropped by budget exhaustion (marked consumed without ever
+dispatching) is reported explicitly as `dropped_commands`, distinct from
+`commands` (truly unconsumed ones), inside the same `unconsumed_control_command`
+failure entry.
+
+An expected service rejection is additionally bound to one specific attempt
+`ref` (for `coordinate_sandbox_action`) or `decision_id` (for
+`resolve_sandbox_approval`/`resume_sandbox_approval`) via a required `binding`
+field, and is credited at most once per case. The coordinator's duplicate/
+stale/terminal raise persists an identical message for three distinct causes;
+matching on message text alone could credit an unrelated scheduler bug as if
+it were the one deliberately-scripted scenario, so the driver additionally
+verifies the real runtime cause (idempotency-key reuse, version mismatch, or
+a terminal instance) before crediting. Any further or non-matching rejection
+is a harness defect.
 
 The driver deliberately does not claim gate success or implement Acqivo's
 validators. Modified-approval authorization must be checked against the resolved
 effective decision and a real preceding `approval_resolved` event by that
 validator (round-6 findings 3 and 4).
+
+## Non-determinism
+
+`occurred_at` and `event_id` on every persisted event are wall-clock and
+random respectively (`app/services/company_os_sandbox_coordinator.py`'s
+`_append`). Two runs of the same frozen pack therefore never share a
+canonical NDJSON SHA-256, even byte-for-byte identical inputs and outcomes --
+`raw_sha256`/`native_sha256` in the driver report identify one run's own
+exported files, not a fingerprint of the pack's behavior. Anything that needs
+to compare two runs for behavioral equivalence must diff parsed, order-
+independent event content (or a subset of fields excluding `occurred_at`/
+`event_id`), never compare `event_log` hashes directly.

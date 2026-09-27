@@ -4,6 +4,7 @@ These are small synthetic test scenarios, never smoke/scoreable fixture runs.
 The coordinator, approval service, persistence and dispatch ledger are real.
 """
 from copy import deepcopy
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -24,11 +25,12 @@ from app.services.company_os_sandbox_approval_service import (
     resolve_sandbox_approval,
     resume_sandbox_approval,
 )
+from app.services.company_os_sandbox_coordinator import SandboxCoordinatorError
 from app.services.company_os_sandbox_service import create_sandbox_run, create_workflow_instance
 from app.services.company_os_stage2_inputs import build_stage2_snapshot
-from app.services.company_os_synthetic_adapters import SyntheticAdapter
+from app.services.company_os_synthetic_adapters import SyntheticAdapter, SyntheticWorld
 from scripts.stage2_harness_export import DeterministicMockProvider
-from tests.unit.test_company_os_stage2_required_paths import FIXTURES, REGISTRY, SCHEMA
+from tests.unit.test_company_os_stage2_required_paths import FIXTURES, REGISTRY, SCHEMA, WORKFLOWS
 
 POLICY = {"red_action_types": ["pricing_change"], "hard_denies": ["bypass_opt_out"],
           "non_approvable_blocks": [], "limits": {"max_discount_percent": 10}}
@@ -43,7 +45,9 @@ WORKFLOW = {
         {"from": "research", "to": "done", "action": "finish", "risk_level": "GREEN"},
     ],
 }
-ACTIONS = ["score_against_icp", "revisit", "send_outreach", "close", "finish", "pricing_change", "bypass_opt_out"]
+ACTIONS = ["score_against_icp", "revisit", "send_outreach", "close", "finish", "pricing_change", "bypass_opt_out",
+           "qualify_if_score_7_plus", "draft_personalized_outreach", "apply_existing_approved_sequence",
+           "classify_reply", "qualify_positive_reply", "book_or_handoff_meeting"]
 
 
 def native(action="score_against_icp", state="scored", risk="GREEN", integration=None, **intent):
@@ -132,6 +136,29 @@ async def test_native_export_matches_persisted_rows_and_literal_ids(async_db_ses
     assert len(r.world.outcomes) == 1
 
 
+def test_evidence_context_keys_on_contact_records_recipient_id_not_entity_id():
+    """P13B-01: build_stage2_snapshot stores contact/consent/suppression under
+    the contact record's own recipient_id (company_os_stage2_inputs.py), not
+    the case's entity_id -- 6 of 9 dev-pack cases differ between the two
+    (e.g. sandbox-customer-fulfillment: entity_id "c-syn-01" vs. recipient_id
+    "l-syn-01"). Keying on entity_id would silently yield empty contact/
+    consent/suppression evidence and consent_verified=False for those cases.
+    """
+    fixtures = {k: deepcopy(v) for k, v in FIXTURES.items() if k != "cases"}
+    case = deepcopy(FIXTURES["cases"][1])
+    assert case["id"] == "sandbox-customer-fulfillment"
+    assert case["entity_id"] != case["contact_record"]["recipient_id"]
+    fixtures["cases"] = [case]
+    world = build_stage2_snapshot(fixtures, REGISTRY, fixtures["approved_templates"],
+        run_id="evidence-context-test", compliance_policy={"version": "0.1.0", "sha256": "a" * 64})
+    context = harness.evidence_context(case, [], world, REGISTRY)
+    assert context["contact_record"] == world.contacts[case["contact_record"]["recipient_id"]]
+    assert context["consent_record"]["recipient_id"] == case["contact_record"]["recipient_id"]
+    assert context["consent_verified"] is True
+    # Keying on entity_id instead would find nothing at all.
+    assert case["entity_id"] not in world.contacts
+
+
 async def test_reply_after_send_not_consumed_early(async_db_session):
     fixtures = pack()
     fixtures["cases"][0]["inputs"].append({"delivery_id": "reply", "type": "reply",
@@ -152,6 +179,39 @@ async def test_reply_after_send_not_consumed_early(async_db_session):
 
 async def test_milestone_evidence_visible_on_next_decision_after_persist(async_db_session):
     await test_reply_after_send_not_consumed_early(async_db_session)
+
+
+async def test_prospect_to_meeting_full_chain_uses_genuine_derived_requirements(async_db_session):
+    """P13B-02: verified_requirements must come from real per-workflow
+    predicates (REQUIREMENT_RULES), not a fake "any fact literally True" rule.
+    Drives the real prospect_to_meeting.json transition chain end to end,
+    proving every real requirement string on that chain gets satisfied by
+    genuine evidence the fixture supplies -- not a workflow with no
+    requirements at all, and not a same-named fact flag.
+    """
+    workflow = WORKFLOWS["prospect_to_meeting"]
+    fixtures = {k: deepcopy(v) for k, v in FIXTURES.items() if k != "cases"}
+    case = deepcopy(FIXTURES["cases"][0])
+    case["id"] = "one"
+    case["inputs"][0]["facts"].update(confidence=0.9, personalization_evidence="prior-project-notes",
+        daily_sends_used=1, daily_send_limit=50, approved_sequence_id="seq-1")
+    fixtures.update(cases=[case], infrastructure_only=True)
+    decisions = [
+        native("score_against_icp", "scored"),
+        native("qualify_if_score_7_plus", "qualified"),
+        native("draft_personalized_outreach", "outreach_drafted"),
+        native("apply_existing_approved_sequence", "ready_to_send", "YELLOW"),
+        send(),
+        native("classify_reply", "replied"),
+        native("qualify_positive_reply", "meeting_ready"),
+        native("book_or_handoff_meeting", "booked", "YELLOW"),
+    ]
+    r = Run(async_db_session, decisions, fixtures=fixtures, workflow=workflow)
+    events = await r.run()
+    assert [e["action"] for e in events] == [d["action"] for d in decisions]
+    assert events[-1]["event_type"] == "terminal_outcome"
+    assert r.report.outcomes["one"] == "terminal"
+    assert not r.report.harness_defect and not r.report.environment_failure
 
 
 @pytest.mark.parametrize("status", ["approved", "modified", "rejected", "expired", "cancelled", "needs_more_evidence"])
@@ -217,7 +277,8 @@ async def test_expected_duplicate_delivery_rejection_recorded_as_evidence(async_
     controls = {"one": {"attempts": [{"ordinal": 1, "ref": "first"}, {"ordinal": 2, "ref": "duplicate", "replay_of": "first"}]}}
     if declared:
         controls["one"]["expected_service_rejection"] = {"call": "coordinate_sandbox_action",
-            "exception_type": "SandboxCoordinatorError", "expects": "duplicate, stale, or terminal workflow delivery"}
+            "exception_type": "SandboxCoordinatorError", "expects": "duplicate, stale, or terminal workflow delivery",
+            "binding": "duplicate"}
     r = Run(async_db_session, [native(), send()], controls=controls)
     if declared:
         await r.run()
@@ -230,12 +291,68 @@ async def test_expected_duplicate_delivery_rejection_recorded_as_evidence(async_
     assert len(await r.rows()) == len(r.pairs) == 1
 
 
+async def test_expected_service_rejection_credited_at_most_once(async_db_session):
+    """P13B-05: a tag is bound to one specific attempt/decision and credited
+    at most once; a further matching rejection is a harness defect, never a
+    second silent credit -- otherwise a tag meant for one deliberate
+    duplicate-replay test could also credit an unrelated scheduler bug.
+    """
+    controls = {"one": {"attempts": [{"ordinal": 1, "ref": "first"}, {"ordinal": 2, "ref": "dup", "replay_of": "first"}],
+        "expected_service_rejection": {"call": "coordinate_sandbox_action",
+            "exception_type": "SandboxCoordinatorError", "expects": "duplicate, stale, or terminal workflow delivery",
+            "binding": "dup"}}}
+    r, runner, state = await start_internal(async_db_session, controls=controls)
+    r.provider.decisions["one"] = [native()]
+    await runner.advance(state)
+    state.attempt_keys["dup"] = state.attempt_keys["first"]  # the fixture's real, declared duplicate precondition
+
+    async def fake_coordinate(db, **kwargs):
+        raise SandboxCoordinatorError("duplicate, stale, or terminal workflow delivery")
+    fake_coordinate.__name__ = "coordinate_sandbox_action"
+
+    event = await runner.call(state, fake_coordinate, binding="dup",
+        idempotency_key=state.attempt_keys["first"], expected_version=state.instance.version)
+    assert event is None and state.rejection_credited is True and state.outcome == "service_rejection"
+    assert len(r.report.service_rejections) == 1
+    with pytest.raises(harness.HarnessDefect):
+        await runner.call(state, fake_coordinate, binding="dup",
+            idempotency_key=state.attempt_keys["first"], expected_version=state.instance.version)
+    assert len(r.report.service_rejections) == 1
+
+
 async def test_unconsumed_control_command_is_explicit_runtime_failure(async_db_session):
     r = Run(async_db_session, [native("finish", "done")], controls=approval_controls(), corrections=[resolution()])
     await r.run()
     assert r.report.outcomes["one"] == "unconsumed_control_command"
     assert r.report.failures == [{"case_id": "one", "outcome": "unconsumed_control_command",
-                                 "commands": ["resolve"], "last_outcome": "terminal"}]
+                                 "commands": ["resolve"], "dropped_commands": [], "last_outcome": "terminal"}]
+
+
+async def test_unrelated_signal_after_compliance_block_causes_no_re_attempt(async_db_session):
+    """P13B-07: drain() must reset a compliance/policy-blocked case to ready
+    only when the arriving signal actually changes compliance/policy-relevant
+    evidence, never on any signal -- otherwise, combined with the no-progress
+    guard never running on blocked outcomes, an identical compliance-blocked
+    send could repeat indefinitely (bounded only by the decision budget).
+    """
+    r, runner, state = await start_internal(async_db_session)
+    r.world.consents[state.instance.entity_id] = {}  # compliance-blocks the upcoming send
+    r.provider.decisions["one"] = [native(), send()]
+    await runner.advance(state)
+    pair = await runner.advance(state)
+    assert harness.classify_outcome(pair[0]) == "compliance_blocked"
+    assert state.outcome == "compliance_blocked"
+    attempts_before = state.attempts
+    # An unrelated signal arrives: it touches world state (a failure
+    # injection for a different action) but changes nothing evidence_context
+    # actually reads for this case's compliance/policy evidence.
+    state.source["inputs"].append({"delivery_id": "unrelated", "type": "failure_injection", "facts": {
+        "workflow_id": "prospect_to_meeting", "entity_id": state.source["entity_id"],
+        "action": "close", "after_effect": False}})
+    runner.drain()
+    assert state.outcome == "compliance_blocked"
+    assert await runner.advance(state) is None
+    assert state.attempts == attempts_before
 
 
 async def test_alternating_decisions_hit_budget_not_infinite_loop(async_db_session):
@@ -245,6 +362,19 @@ async def test_alternating_decisions_hit_budget_not_infinite_loop(async_db_sessi
     assert len(events) == harness.MAX_DECISIONS_PER_CASE
     assert r.report.outcomes["one"] == "decision_budget_exhausted"
     assert r.report.failures == [{"case_id": "one", "outcome": "decision_budget_exhausted"}]
+
+
+async def test_transition_defect_outcome_gets_a_failure_entry(async_db_session):
+    """P13B-11: a non-terminal halt that isn't an intentionally-scored
+    coverage-bucket endpoint (compliance/policy block, a credited service
+    rejection) must surface in the failures report too, not only in
+    outcomes -- otherwise a genuine defect (here: an illegal transition) is
+    invisible to anything that only reads failures.
+    """
+    r = Run(async_db_session, [native(state="sent")])  # illegal jump straight from "research"
+    await r.run()
+    assert r.report.outcomes["one"] == "transition_defect"
+    assert r.report.failures == [{"case_id": "one", "outcome": "transition_defect"}]
 
 
 async def test_driver_orchestration_bug_aborts_before_coordinator_call(async_db_session, monkeypatch):
@@ -279,8 +409,17 @@ async def test_provider_failure_provenance(async_db_session, error, marker):
     assert bool(r.report.environment_failure) == (marker == "environment_failure")
 
 
+def _bare_dependency(p):
+    # A second, "after"-free initial signal keeps the case's own "needs
+    # initial signals" precondition satisfied, so the mutated first signal's
+    # bare "bare" dependency actually reaches the ambiguous-dependency check
+    # instead of failing that earlier, unrelated check first (P13B-08).
+    p["cases"][0]["inputs"][0]["after"] = ["bare"]
+    p["cases"][0]["inputs"].append({"delivery_id": "second", "type": "reply", "facts": {}})
+
+
 @pytest.mark.parametrize("mutate,match", [
-    (lambda p: p["cases"][0]["inputs"][0].update(after=["bare"]), "initial signals|ambiguous"),
+    (_bare_dependency, "ambiguous dependency: expected signal: or milestone:"),
     (lambda p: p["cases"][0]["inputs"].append({"delivery_id": "next", "type": "reply", "facts": {},
         "after": ["milestone:one:score_against_icp"]}), "not a governed email"),
     (lambda p: p["cases"][0]["inputs"].extend([
@@ -337,6 +476,34 @@ async def test_idempotent_replay_without_pending_precondition(async_db_session):
     assert len(await r.rows()) == len(r.pairs)
 
 
+async def test_schema_declares_policy_intent_fields_email_execute_reaches_allow_or_approval(async_db_session):
+    """P13B-03: the decision-provider schema must declare integration_mode/
+    requires_consent/requires_authority/limit_name/requested_total/
+    policy_flags -- evaluate_action_policy blocks any external_write intent
+    whose integration_mode isn't declared, so without these fields a schema-
+    conformant email-execute decision was systematically policy-blocked.
+    Validates a schema-shaped decision against the actual schema, then drives
+    it through coordinate_sandbox_action to a real allow/approval outcome,
+    never blocked for a schema reason.
+    """
+    from jsonschema import Draft202012Validator
+
+    from app.agents.company_os_stage2_provider import stage2_json_schema
+
+    context = {"workflow": WORKFLOW, "canonical_actions": ACTIONS, "canonical_agents": ["email_outreach"],
+               "canonical_handoffs": ["orchestrator"], "integration_registry": REGISTRY}
+    schema = stage2_json_schema(context)
+    assert schema["properties"]["policy_intent"]["properties"]["integration_mode"]["enum"] == sorted(REGISTRY["modes"])
+    decision = send(requires_consent=True, requires_authority=False)
+    Draft202012Validator(schema).validate(decision)
+    r, runner, state = await start_internal(async_db_session)
+    r.provider.decisions["one"] = [native(), decision]
+    await runner.advance(state)
+    pair = await runner.advance(state)
+    assert pair[0]["metadata"]["gate"] in {"allow", "approval"}
+    assert r.report.outcomes["one"] in {"ready", "terminal", "waiting_on_approval"}
+
+
 async def test_revenue_ops_owner_route_uses_inherited_stage2_method():
     from app.agents.revenue_ops.agent import RevenueOperationsAgent
     agent = RevenueOperationsAgent()
@@ -382,20 +549,24 @@ async def test_cross_case_queue_ordering(async_db_session, dispatch):
     fixtures["cases"].append(recovery)
     if dispatch == "blocked":
         origin["consent_record"] = None
-    seen = []
+    seen, item_ids = [], []
     provider = DeterministicMockProvider({"one": [native(), send(), native("close", "done")],
                                          "two": [native("finish", "done")]})
     prepare = provider.prepare
     def capture(context):
         seen.append((context["case_id"], [s["delivery_id"] for s in context["signals"]]))
+        if context["case_id"] == "two":
+            item_ids.append(context.get("item_id"))
         return prepare(context)
     provider.prepare = capture
     r = Run(async_db_session, [], fixtures=fixtures, provider=provider)
     # Second case waits for a queue fact, then completes without a second send.
     r.workflows["integration_failure_recovery"] = {
         **deepcopy(WORKFLOW), "id": "integration_failure_recovery", "entity_type": "integration_operation"}
-    r.workflows["integration_failure_recovery"]["transitions"][-1]["requirements"] = ["queue_arrived"]
-    recovery["inputs"][1]["facts"]["queue_arrived"] = True
+    # "queue integrity verified" is a real, non-self-fulfilling predicate
+    # (REQUIREMENT_RULES): it checks world.queue for this case's own entity_id,
+    # never a same-named fixture fact (P13B-02's ban on that pattern).
+    r.workflows["integration_failure_recovery"]["transitions"][-1]["requirements"] = ["queue integrity verified"]
     # Run stores the supplied pack by reference; world has no ingested signals yet.
     provider.decisions["two"] = [native("finish", "done"), native("finish", "done")]
     if dispatch == "prepared":
@@ -411,8 +582,99 @@ async def test_cross_case_queue_ordering(async_db_session, dispatch):
         two_contexts = [signals for case, signals in seen if case == "two"]
         assert "queue" not in two_contexts[0] and "queue" in two_contexts[1]
         assert r.report.outcomes["two"] == "terminal"
+        # P13B-10: the snapshot only carries item_id once the queue item is
+        # actually bound -- before that, find_dispatch/resolve_recipient's
+        # queue-scope cross-check has nothing to check against.
+        assert item_ids == [None, "queue-one"]
     assert events[0]["entity_id"] == origin["entity_id"]
     assert events[1]["entity_id"] == "queue-one"  # round robin, not case exhaustion
+
+
+def test_snapshot_item_id_makes_queue_scope_mismatch_detectable():
+    """P13B-10: resolve_recipient's queue-scope cross-check (company_os_
+    sandbox_dispatch.py) only runs when the snapshot actually carries
+    item_id; without it, a real queue-scope mismatch for an aggregate-
+    workflow case would pass unnoticed for any harness run.
+    """
+    from app.services.company_os_sandbox_dispatch import resolve_recipient
+    from app.services.company_os_synthetic_adapters import SyntheticComplianceBlock
+
+    world = SyntheticWorld("item-id-test", datetime(2026, 9, 25, tzinfo=UTC))
+    world.set_contact("r-1", {"recipient_id": "r-1", "address": "r-1@example.test", "consent_verified": True})
+    world.queue["queue-one"] = {"item_id": "queue-one", "recipient_id": "r-1",
+        "workflow_id": "integration_failure_recovery", "entity_id": "queue-one",
+        "origin_workflow_id": "prospect_to_meeting", "origin_entity_id": "case-a", "original_action": "send_outreach"}
+    instance = SimpleNamespace(workflow_id="integration_failure_recovery", entity_type="integration_operation",
+                               entity_id="queue-one")
+    action = "resume_preserved_queue_within_original_approval"
+    # Without item_id in the snapshot (the pre-fix state), the cross-check
+    # never runs at all -- a wrong item_id would pass unnoticed.
+    resolve_recipient(world, instance, {}, action)
+    # With the real item_id carried at the snapshot's top level, a genuine
+    # mismatch is now caught.
+    with pytest.raises(SyntheticComplianceBlock):
+        resolve_recipient(world, instance, {"item_id": "wrong-item"}, action)
+    # And the correct item_id still resolves cleanly.
+    assert resolve_recipient(world, instance, {"item_id": "queue-one"}, action)[0] == "r-1"
+
+
+def test_chained_recovery_milestone_matches_receive_not_consumer_registration():
+    """P13B-04: dependency_ready must evaluate the identical predicate
+    SyntheticWorld.receive uses to match a queued_message against a dispatch
+    record -- the record's own origin_workflow_id/origin_entity_id and its
+    frozen action -- never "is this case's instance a registered consumer of
+    some record". Those diverge for a chained recovery: case B becomes a
+    consumer of case A's original record (by reusing A's queued dispatch)
+    without ever originating a record of its own for B's own action, so a
+    consumer-based check would falsely report a milestone on B's own action
+    as satisfied when receive() could never bind a queued_message against it.
+    """
+    world = SyntheticWorld("chain-test", datetime(2026, 9, 25, tzinfo=UTC))
+    record = world.prepare_dispatch(
+        message_key="origin-msg", recipient_id="r-1", adapter_kind="mail",
+        adapter_idempotency_key="k-1", origin_workflow_instance_id=1,
+        origin_state_before="ready_to_send", origin_workflow_version=0,
+        frozen_native_decision={"action": "send_outreach"}, rendered_payload={},
+        consumers={}, origin_workflow_id="prospect_to_meeting", origin_entity_id="case-a",
+    )
+    # Case B (a downstream recovery case) becomes a *consumer* of case A's
+    # record with its own, different action -- it never originates a record.
+    record["consumers"][99] = {"expected_state_before": "x", "expected_version": 0,
+        "consumer_decision": {"action": "retry_send"}, "approval_id": None}
+    runner = harness._Runner(None, {}, world, None, {}, {}, [], harness.HarnessReport())
+    runner.cases["a"] = harness._Case(
+        {"id": "a", "workflow_id": "prospect_to_meeting", "entity_id": "case-a"}, SimpleNamespace(id=1))
+    runner.cases["b"] = harness._Case(
+        {"id": "b", "workflow_id": "integration_failure_recovery", "entity_id": "queue-b"}, SimpleNamespace(id=99))
+    assert runner.dependency_ready("milestone:b:retry_send") is False
+    # The record's real origin -- case A's own send_outreach -- is exactly
+    # what receive() matches, and is correctly satisfied.
+    assert runner.dependency_ready("milestone:a:send_outreach") is True
+
+
+def test_queued_message_milestone_mismatch_rejected_at_pack_build():
+    """P13B-04: a queued_message's own origin facts must agree with its
+    declared milestone dependency; a mismatch would let the scheduler drain a
+    signal receive() can never bind to that dispatch record, producing a
+    silent unmatched queue entry instead of a loud pack-build failure.
+    """
+    fixtures = pack()
+    origin = fixtures["cases"][0]
+    recovery = deepcopy(origin)
+    recovery.update(id="two", workflow_id="integration_failure_recovery", entity_type="integration_operation",
+                    entity_id="queue-one")
+    recovery["inputs"] = [
+        {"delivery_id": "initial-two", "type": "estimate", "facts": {}},
+        {"delivery_id": "queue", "type": "queued_message", "after": ["milestone:one:send_outreach"], "facts": {
+            "entity_id": "queue-one", "workflow_id": "integration_failure_recovery", "item_id": "queue-one",
+            "recipient_id": origin["entity_id"], "origin_workflow_id": "prospect_to_meeting",
+            "origin_entity_id": origin["entity_id"], "original_action": "record_opt_out"}},  # wrong action
+    ]
+    fixtures["cases"].append(recovery)
+    with pytest.raises(harness.FixtureAuthoringError, match="queued message origin facts"):
+        harness.validate_pack(fixtures, {"prospect_to_meeting": WORKFLOW,
+            "integration_failure_recovery": {**WORKFLOW, "id": "integration_failure_recovery",
+                                             "entity_type": "integration_operation"}}, [], REGISTRY)
 
 
 async def test_failure_injection_ingested_before_dispatch_attempt(async_db_session, monkeypatch):
@@ -531,7 +793,8 @@ async def test_decision_loop_covers_every_real_service_signature(async_db_sessio
 async def test_expected_stale_workflow_state_rejection_recorded_as_evidence(async_db_session):
     controls = approval_controls()
     controls["one"]["expected_service_rejection"] = {"call": "resume_sandbox_approval",
-        "exception_type": "SandboxApprovalError", "expects": "workflow changed since approval request"}
+        "exception_type": "SandboxApprovalError", "expects": "workflow changed since approval request",
+        "binding": "D"}
     r, runner, state = await start_internal(async_db_session, controls=controls)
     r.provider.decisions["one"] = [native("pricing_change", "research", "RED")]
     await runner.advance(state)
@@ -540,7 +803,8 @@ async def test_expected_stale_workflow_state_rejection_recorded_as_evidence(asyn
         founder_id="founder", founder_minutes=1, resolution_key="resolve", event_schema=SCHEMA, workflow=WORKFLOW)
     state.instance.version += 1  # deliberately stale DB delivery, not a fabricated event
     await async_db_session.flush()
-    event = await runner.call(state, resume_sandbox_approval, approval_id=approval.id, **runner.options_for(state))
+    event = await runner.call(state, resume_sandbox_approval, binding="D", approval_id=approval.id,
+        **runner.options_for(state))
     assert event is None
     assert len(await r.rows()) == 2
     assert r.report.service_rejections[0]["exception_type"] == "SandboxApprovalError"
@@ -671,6 +935,44 @@ async def test_cli_failure_markers_preserve_partial_evidence(async_db_session, t
     assert len(args.native_evidence.read_text().splitlines()) == len(args.events.read_text().splitlines())
     assert (tmp_path / "events.ndjson_harness_defect.json").exists() == (kind in {"preparation", "method"})
     assert (tmp_path / "events.ndjson_environment_failure.json").exists() == (kind == "transport")
+
+
+@pytest.mark.parametrize("malformed", ["pack", "controls"])
+async def test_cli_malformed_pack_or_controls_is_harness_defect_not_environment_failure(
+    async_db_session, tmp_path, malformed,
+):
+    """P13B-06: a malformed pack/controls file is a code/fixture defect and
+    must never be misfiled as infrastructure flakiness -- widened from a
+    fixed (KeyError, TypeError, ValueError) tuple that let most other
+    exceptions (e.g. AttributeError from a case that isn't even an object)
+    fall through to the CLI's own broad except Exception.
+    """
+    import json
+
+    from scripts.stage2_harness_export import export
+    r = Run(async_db_session, [])
+    runtime = {k: v for k, v in r.options.items() if k != "synthetic_adapters"}
+    runtime.update(compliance_policy=r.world.compliance_policy, synthetic_adapter_kinds={"sendgrid": "mail"})
+    pack_payload = r.pack
+    driver_controls = None
+    if malformed == "pack":
+        pack_payload = deepcopy(r.pack)
+        pack_payload["cases"] = ["not-a-case-object"]
+    else:
+        driver_controls = ["not-an-object"]
+    for name, value in (("pack.json", pack_payload), ("runtime.json", runtime),
+                        ("decisions.json", {"one": [native("finish", "done")]})):
+        (tmp_path / name).write_text(json.dumps(value))
+    if driver_controls is not None:
+        (tmp_path / "controls.json").write_text(json.dumps(driver_controls))
+    args = SimpleNamespace(provider="deterministic_mock", infrastructure_only=True, run_id="cli-test",
+        fixture_pack=tmp_path / "pack.json", runtime_inputs=tmp_path / "runtime.json", mock_decisions=tmp_path / "decisions.json",
+        founder_resolutions=None, driver_controls=(tmp_path / "controls.json") if driver_controls is not None else None,
+        events=tmp_path / "events.ndjson", native_evidence=tmp_path / "native.ndjson",
+        service_rejections=tmp_path / "rejections.ndjson", database=tmp_path / "test.db")
+    assert await export(args) == 1
+    assert (tmp_path / "events.ndjson_harness_defect.json").exists()
+    assert not (tmp_path / "events.ndjson_environment_failure.json").exists()
 
 
 @pytest.mark.parametrize("declared", ["CompanyOSTransportError", "CompanyOSDecisionMethodDefect", "UnknownError"])
