@@ -1,7 +1,6 @@
-"""Stage 2 structured decision plumbing. No real-provider execution is enabled.
+"""Stage 2 structured decisions; execution requires a separate run authorization.
 
-The injected structured transport is a test seam. A future execution freeze must
-explicitly wire a real transport; neither this module nor the export CLI does so.
+Tests inject the structured transport and never invoke a real provider.
 """
 from __future__ import annotations
 
@@ -61,8 +60,9 @@ async def stage2_decision(agent, task: dict, context: dict, *, structured_transp
                   "Messages use approved template_id and fills only. Return only the schema object.\n"
                   + json.dumps({"task": task, "context": context}, allow_nan=False))
         if structured_transport is None:
-            raise CompanyOSTransportError("Stage 2 real-provider execution is not enabled")
-        payload, raw = structured_transport(prompt, schema)
+            payload, raw = agent._run_claude_structured(prompt, schema, stage2_errors=True)
+        else:
+            payload, raw = structured_transport(prompt, schema)
         errors = list(Draft202012Validator(schema).iter_errors(payload))
         if errors:
             raise CompanyOSMalformedOutputError(errors[0].message, raw_output=raw)
@@ -75,7 +75,7 @@ async def stage2_decision(agent, task: dict, context: dict, *, structured_transp
 
 class OwnerRoutedProvider:
     """Prepare a minimal callback outside the coordinator's exception boundary."""
-    provider = "stage2_structured_disabled"
+    provider = "stage2_structured"
 
     def __init__(self, workflow_registry: dict, agents: dict, *, structured_transport=None):
         self.registry = workflow_registry

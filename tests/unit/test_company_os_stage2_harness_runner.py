@@ -351,7 +351,8 @@ async def test_revenue_ops_owner_route_uses_inherited_stage2_method():
 
 @pytest.mark.parametrize("mode,error", [("missing", CompanyOSTransportError), ("malformed", CompanyOSMalformedOutputError),
                                         ("bug", CompanyOSDecisionMethodDefect)])
-async def test_stage2_method_types_errors(mode, error):
+async def test_stage2_method_types_errors(mode, error, monkeypatch):
+    monkeypatch.setattr("app.agents.base_agent.claude_structured_output_available", lambda: False)
     context = {"workflow": WORKFLOW, "canonical_actions": ACTIONS,
                "canonical_agents": ["email_outreach"], "canonical_handoffs": ["orchestrator"]}
     def transport(prompt, schema):
@@ -593,7 +594,8 @@ async def test_loop_stops_at_max_attempts_on_misconfigured_retry_fixture(async_d
     assert not r.report.environment_failure
 
 
-async def test_cli_exports_commit_order_hashes_and_refuses_occupied_paths(async_db_session, tmp_path):
+@pytest.mark.parametrize("structured", [False, True])
+async def test_cli_exports_commit_order_hashes_and_refuses_occupied_paths(async_db_session, tmp_path, monkeypatch, structured):
     import hashlib
     import json
 
@@ -601,12 +603,20 @@ async def test_cli_exports_commit_order_hashes_and_refuses_occupied_paths(async_
     r = Run(async_db_session, [])
     runtime = {k: v for k, v in r.options.items() if k != "synthetic_adapters"}
     runtime.update(compliance_policy=r.world.compliance_policy, synthetic_adapter_kinds={"sendgrid": "mail"})
+    if structured:
+        r.pack["infrastructure_only"] = False
+        runtime["workflow_registry"] = {"workflows": {WORKFLOW["id"]: {"owner_agent": "email_outreach"}}}
+        # Exercise CLI owner selection and the actual Stage 2 method, never a process.
+        monkeypatch.setattr(BasePolsiaAgent, "_run_claude_structured",
+                            lambda self, prompt, schema, **kw: (native("finish", "done"), "mock envelope"))
     for name, value in (("pack.json", r.pack), ("runtime.json", runtime), ("decisions.json", {"one": [native("finish", "done")]})):
         (tmp_path / name).write_text(json.dumps(value))
     args = SimpleNamespace(provider="deterministic_mock", infrastructure_only=True, run_id="cli-test",
         fixture_pack=tmp_path / "pack.json", runtime_inputs=tmp_path / "runtime.json", mock_decisions=tmp_path / "decisions.json",
         founder_resolutions=None, driver_controls=None, events=tmp_path / "events.ndjson", native_evidence=tmp_path / "native.ndjson",
         service_rejections=tmp_path / "rejections.ndjson", database=tmp_path / "test.db")
+    if structured:
+        args.provider, args.infrastructure_only, args.mock_decisions = "stage2_structured", False, None
     assert await export(args) == 0
     raw = args.events.read_bytes()
     events = [json.loads(line) for line in raw.splitlines()]
@@ -616,7 +626,8 @@ async def test_cli_exports_commit_order_hashes_and_refuses_occupied_paths(async_
     assert args.service_rejections.read_bytes() == b""
     report = json.loads((tmp_path / "events.ndjson_driver_report.json").read_text())
     assert report["raw_sha256"] == hashlib.sha256(raw).hexdigest()
-    assert report["provider"] == "deterministic_mock" and report["infrastructure_only"] is True
+    assert report["provider"] == ("stage2_structured" if structured else "deterministic_mock")
+    assert report["infrastructure_only"] is (not structured)
     with pytest.raises(ValueError, match="unoccupied"):
         await export(args)
     assert args.events.read_bytes() == raw
@@ -660,3 +671,32 @@ async def test_cli_failure_markers_preserve_partial_evidence(async_db_session, t
     assert len(args.native_evidence.read_text().splitlines()) == len(args.events.read_text().splitlines())
     assert (tmp_path / "events.ndjson_harness_defect.json").exists() == (kind in {"preparation", "method"})
     assert (tmp_path / "events.ndjson_environment_failure.json").exists() == (kind == "transport")
+
+
+@pytest.mark.parametrize("declared", ["CompanyOSTransportError", "CompanyOSDecisionMethodDefect", "UnknownError"])
+def test_provider_failures_cannot_be_whitelisted_as_scripted(declared):
+    fixtures = pack()
+    fixtures["scripted_failure_types"] = [declared]
+    with pytest.raises(harness.FixtureAuthoringError, match="unknown scripted failure"):
+        harness.validate_pack(fixtures, {WORKFLOW["id"]: WORKFLOW}, [], REGISTRY)
+
+
+@pytest.mark.parametrize("mode,error", [
+    ("transport", CompanyOSTransportError), ("json", CompanyOSMalformedOutputError),
+    ("envelope", CompanyOSMalformedOutputError), ("defect", CompanyOSDecisionMethodDefect),
+])
+async def test_stage2_real_structured_path_types_mocked_transport_results(monkeypatch, mode, error):
+    import subprocess
+
+    monkeypatch.setattr("app.agents.base_agent.claude_structured_output_available", lambda: True)
+    def process(*args, **kwargs):
+        if mode == "transport":
+            raise subprocess.CalledProcessError(1, "synthetic", stderr="offline")
+        if mode == "defect":
+            raise RuntimeError("synthetic method defect")
+        return SimpleNamespace(stdout="not JSON" if mode == "json" else "{}")
+    monkeypatch.setattr("app.agents.base_agent.subprocess.run", process)
+    context = {"workflow": WORKFLOW, "canonical_actions": ACTIONS,
+               "canonical_agents": ["email_outreach"], "canonical_handoffs": ["orchestrator"]}
+    with pytest.raises(error):
+        await BasePolsiaAgent().run_company_os_stage2_decision({}, context)

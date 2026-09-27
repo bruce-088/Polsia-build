@@ -10,13 +10,13 @@ so nothing above this class (crew_factory, agent implementations, tests) has
 to change if a second provider (e.g. OpenAI/Codex) is added later — only
 _run_llm_turn's internals and settings.llm_provider would change.
 """
-from functools import lru_cache
 import json
 import os
 import re
 import subprocess
 import tempfile
 import time
+from functools import lru_cache
 
 from app.agents.company_os_contract import (
     CompanyOSContractError,
@@ -163,14 +163,17 @@ CONTEXT:
             raise
 
     async def run_company_os_stage2_decision(self, task: dict, context: dict, *, structured_transport=None) -> dict:
-        """Stage 2 sibling; real execution is disabled without an injected transport."""
+        """Stage 2 sibling with an injectable structured transport for tests."""
         from app.agents.company_os_stage2_provider import stage2_decision
 
         return await stage2_decision(self, task, context, structured_transport=structured_transport)
 
     def _run_claude_structured(self, prompt: str, schema: dict, *, stage2_errors: bool = False) -> tuple[dict, str]:
         """Request provider-validated JSON without parsing or repairing free text."""
-        from app.agents.company_os_stage2_provider import CompanyOSMalformedOutputError, CompanyOSTransportError
+        from app.agents.company_os_stage2_provider import (
+            CompanyOSMalformedOutputError,
+            CompanyOSTransportError,
+        )
 
         transport_error = CompanyOSTransportError if stage2_errors else CompanyOSContractError
         output_error = CompanyOSMalformedOutputError if stage2_errors else CompanyOSContractError

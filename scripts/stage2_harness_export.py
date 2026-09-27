@@ -1,6 +1,6 @@
-"""Export infrastructure-only Stage 2 events: python -m scripts.stage2_harness_export.
+"""Export Stage 2 events: python -m scripts.stage2_harness_export.
 
-Real provider execution is deliberately unavailable in this build. The CLI owns
+Provider execution requires a separately authorized run. The CLI owns
 an isolated SQLite database, commits each returned event before writing it, and
 never opens the application's configured database or constructs live adapters.
 """
@@ -17,6 +17,7 @@ from pathlib import Path
 
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
+from app.agents.company_os_stage2_provider import OwnerRoutedProvider
 from app.config import settings
 from app.models.company_os_sandbox import (
     CompanyOSSandboxApproval,
@@ -62,8 +63,13 @@ def write_line(handle, value):
 
 
 async def export(args) -> int:
-    if args.provider != "deterministic_mock" or not args.infrastructure_only:
-        raise ValueError("only explicitly infrastructure-only deterministic_mock execution is enabled")
+    mock = args.provider == "deterministic_mock"
+    if args.provider not in {"deterministic_mock", "stage2_structured"}:
+        raise ValueError("unknown decision provider")
+    if mock and (not args.infrastructure_only or not args.mock_decisions):
+        raise ValueError("deterministic_mock requires infrastructure_only and mock_decisions")
+    if not mock and (args.infrastructure_only or args.mock_decisions):
+        raise ValueError("stage2_structured cannot use infrastructure_only or mock_decisions")
     if not settings.sandbox_mode:
         raise ValueError("SANDBOX_MODE must be enabled")
     paths = [Path(p).resolve() for p in (args.events, args.native_evidence, args.service_rejections, args.database)]
@@ -74,10 +80,13 @@ async def export(args) -> int:
     if len(set(all_paths)) != len(all_paths) or any(p.exists() for p in all_paths):
         raise ValueError("output paths must be distinct and unoccupied")
     pack, runtime = read_json(args.fixture_pack), read_json(args.runtime_inputs)
-    if pack.get("infrastructure_only") is not True:
+    if mock and pack.get("infrastructure_only") is not True:
         raise ValueError("mock CLI refuses a pack not tagged infrastructure_only")
+    if not mock and pack.get("infrastructure_only") is True:
+        raise ValueError("structured provider refuses an infrastructure_only pack")
     corrections = read_json(args.founder_resolutions) if args.founder_resolutions else []
-    provider = DeterministicMockProvider(read_json(args.mock_decisions))
+    provider = (DeterministicMockProvider(read_json(args.mock_decisions)) if mock else
+                structured_provider(runtime["workflow_registry"]))
     report = HarnessReport()
     engine = None
     with ExitStack() as stack:
@@ -129,16 +138,30 @@ async def export(args) -> int:
         summary = asdict(report)
         summary["raw_sha256"] = hashlib.sha256(paths[0].read_bytes()).hexdigest()
         summary["native_sha256"] = hashlib.sha256(paths[1].read_bytes()).hexdigest()
-        summary["infrastructure_only"] = True
+        summary["infrastructure_only"] = mock
         with report_path.open("x", encoding="utf-8") as handle:
             write_line(handle, summary)
     return 1 if report.harness_defect or report.environment_failure else 0
 
 
+def structured_provider(registry):
+    """Construct role owners only; constructors perform no decision calls."""
+    from app.agents.customer_support.agent import CustomerSupportAgent
+    from app.agents.email_outreach.agent import EmailOutreachAgent
+    from app.agents.finance.agent import FinanceAgent
+    from app.agents.orchestrator.agent import OrchestratorAgent
+    from app.agents.revenue_ops.agent import RevenueOperationsAgent
+
+    agents = [cls() for cls in (CustomerSupportAgent, EmailOutreachAgent, FinanceAgent,
+                              OrchestratorAgent, RevenueOperationsAgent)]
+    return OwnerRoutedProvider(registry, {agent.agent_type: agent for agent in agents})
+
+
 def parser():
     result = argparse.ArgumentParser(description=__doc__)
-    for name in ("fixture-pack", "runtime-inputs", "run-id", "events", "native-evidence", "service-rejections", "database", "mock-decisions"):
+    for name in ("fixture-pack", "runtime-inputs", "run-id", "events", "native-evidence", "service-rejections", "database"):
         result.add_argument("--" + name, required=True)
+    result.add_argument("--mock-decisions")
     result.add_argument("--founder-resolutions")
     result.add_argument("--driver-controls")
     result.add_argument("--provider", choices=["deterministic_mock", "stage2_structured"], required=True)

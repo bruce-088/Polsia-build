@@ -17,6 +17,9 @@ Stage 2 runs Acqivo (Company Test #1) against **synthetic** people, messages and
 | `app/agents/company_os_compliance.py` | `evaluate_outbound_eligibility` (BASE-01, EMAIL-01..04 from COMPLIANCE_POLICY.md v0.1.0), `render_message` (content only from approved templates + trusted sender/contact), `is_email_execute`, evidence hashing. |
 | `app/services/company_os_sandbox_service.py` | Persistence: `create_sandbox_run`, `create_workflow_instance`, `append_sandbox_event` (schema validation, version bump only on state change, terminal handling, blocked-event invariant), `export_sandbox_event`. |
 | `app/services/company_os_stage2_inputs.py` | `build_stage2_snapshot` builds canonical contact/template snapshots; `apply_stage2_signal` applies one ordered signal; `load_stage2_inputs` preserves eager loading via both, with no invented values. |
+| `app/services/company_os_stage2_harness_runner.py` | Part B orchestration: round-robin decisions, signal barriers, separate control commands, approval lifecycle, budgets, exactly-once native/canonical export and driver report. See `docs/STAGE2_HARNESS_INTERFACE.md`. |
+| `app/agents/company_os_stage2_provider.py` | Owner-routed Stage 2 structured decisions and typed provider failure provenance; inherits the existing structured transport through `BasePolsiaAgent`. |
+| `scripts/stage2_harness_export.py` | Isolated-database CLI, commit-before-export, three evidence streams, raw hashes and failure markers. Real provider execution requires the separately authorized freeze; tests use mocked transports only. |
 | `app/agents/company_os_{workflow,policy,integration}.py` | Canonical transition validation, action policy, integration capability. |
 | `app/models/company_os_sandbox.py` | Tables: run, workflow instance, event, approval. |
 

@@ -117,6 +117,9 @@ def export_pair(event) -> tuple[dict, dict]:
 
 def validate_pack(pack: dict, workflows: dict, corrections: list, registry: dict) -> None:
     """Validate declared references, not unknowable future model outcomes."""
+    sentinels = pack.get("scripted_failure_types", [])
+    if not isinstance(sentinels, list) or any(name != "ScriptedProviderTimeout" for name in sentinels):
+        raise FixtureAuthoringError("unknown scripted failure type declaration")
     cases = {c["id"]: c for c in pack["cases"]}
     if len(cases) != len(pack["cases"]) or not cases:
         raise FixtureAuthoringError("case identities must be unique and nonempty")
@@ -280,7 +283,8 @@ def evidence_context(case: dict, consumed: list, world: SyntheticWorld) -> dict:
     requirements = {key for key, value in facts.items() if value is True}
     if isinstance(facts.get("public_source"), str) and facts["public_source"]:
         requirements.add("public evidence preserved")
-    if isinstance(facts.get("icp_score"), (int, float)) and facts.get("confidence") is not None:
+    if (type(facts.get("icp_score")) in (int, float) and math.isfinite(facts["icp_score"])
+        and type(facts.get("confidence")) in (int, float) and math.isfinite(facts["confidence"])):
         requirements.add("score and confidence recorded")
     if facts.get("meeting_confirmed") is True and str(facts.get("confirmation_ref", "")).startswith("sandbox://"):
         requirements.update({"calendar or human confirmation", "authoritative calendar or human handoff"})
