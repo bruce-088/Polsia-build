@@ -31,7 +31,7 @@ from app.services.company_os_stage2_harness_runner import (
     run_stage2_fixture_pack,
     validate_artifact_shapes,
 )
-from app.services.company_os_stage2_inputs import build_stage2_snapshot
+from app.services.company_os_stage2_inputs import Stage2InputError, build_stage2_snapshot
 from app.services.company_os_synthetic_adapters import SyntheticAdapter
 
 
@@ -98,11 +98,18 @@ async def export(args) -> int:
         # Exclusive creation prevents accidentally connecting to any existing DB.
         paths[3].touch(exist_ok=False)
         try:
-            # Validate before build_stage2_snapshot, which pre-builds this
-            # run's world outside run_stage2_fixture_pack -- a malformed pack
-            # would otherwise trip that loader's own Stage2InputError (a plain
-            # ValueError, not a HarnessDefect) and get misfiled below as an
-            # environment failure instead of a code/fixture defect (P13B-06).
+            # validate_artifact_shapes only checks outer container shapes
+            # (pack is an object with a list of case objects, etc.); it does
+            # not, and cannot cheaply, catch every malformed case (e.g. one
+            # missing contact_record entirely). build_stage2_snapshot -- the
+            # actual parser -- pre-builds this run's world outside
+            # run_stage2_fixture_pack (so the same world can be shared with
+            # the adapters below), so its own Stage2InputError must be caught
+            # by this same try block, inside the classification boundary
+            # below, and explicitly mapped to harness_defect (P13-REV-03) --
+            # never left to fall through to the generic except Exception,
+            # which would misfile a malformed artifact as an environment
+            # failure instead of the code/fixture defect it actually is.
             validate_artifact_shapes(pack, corrections, driver_controls)
             world = build_stage2_snapshot(pack, runtime["integration_registry"], pack["approved_templates"],
                 run_id=args.run_id, compliance_policy=runtime["compliance_policy"])
@@ -128,9 +135,16 @@ async def export(args) -> int:
                 except Exception:
                     await db.rollback()
                     raise
-        except HarnessDefect as exc:
+        except (HarnessDefect, Stage2InputError) as exc:
+            # A malformed artifact (missing/invalid case data Stage2InputError
+            # catches -- company_os_stage2_inputs.py) is a code/fixture
+            # defect, never an environment failure (P13-REV-03).
             report.harness_defect = report.harness_defect or {"type": type(exc).__name__, "message": str(exc)}
         except Exception as exc:
+            # A genuine database/infrastructure I/O failure (e.g. a real
+            # sqlalchemy.exc.DBAPIError the runner deliberately left
+            # unconverted -- P13-REV-03) lands here, keeping its
+            # infrastructure/environment classification.
             report.environment_failure = {"type": type(exc).__name__, "message": str(exc)}
         finally:
             if engine is not None:

@@ -17,6 +17,7 @@ from datetime import datetime
 from typing import Any
 
 from sqlalchemy import select
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agents.company_os_compliance import is_email_execute
@@ -64,11 +65,32 @@ def _finite_number(value: Any) -> bool:
     return type(value) in (int, float) and math.isfinite(value)
 
 
+def _origin_dispatch(facts: dict, world: SyntheticWorld) -> dict | None:
+    """Find the persistent dispatch-ledger record a recovery signal's own
+    origin_workflow_id/origin_entity_id/original_action facts describe.
+
+    Unlike world.action_failures (popped the instant a failure is armed --
+    company_os_synthetic_adapters.py:236-243 -- so it is gone again by the
+    time a recovery case's own transitions are evaluated), the ledger record
+    itself is never removed. It is the only durable, genuinely-available
+    evidence of "a failure happened here and here is its current state" by
+    the time integration_failure_recovery's own requirements are checked.
+    """
+    return next((record for record in world.dispatches.values()
+                 if record.get("origin_workflow_id") == facts.get("origin_workflow_id")
+                 and record.get("origin_entity_id") == facts.get("origin_entity_id")
+                 and record.get("frozen_native_decision", {}).get("action") == facts.get("original_action")), None)
+
+
 # Explicit, per-string predicates for genuinely derivable transition requirements.
 # A predicate reads facts already ingested plus world/registry state -- never a
 # fixture fact literally named after the requirement string it attests (that
 # would be self-fulfilling; validate_pack bans it). Requirement strings with no
-# entry here fail pack-build loudly instead of silently passing.
+# entry here fail pack-build loudly instead of silently passing. Covers every
+# requirement string declared anywhere in the four in-scope canonical workflow
+# definitions (prospect_to_meeting, customer_onboarding, missed_inquiry_recovery,
+# integration_failure_recovery -- tests/fixtures/company_os/acqivo/workflows/*.json),
+# not just the ones a particular dev fixture happens to reach (P13-REV-01).
 REQUIREMENT_RULES: dict[str, Callable[[dict, SyntheticWorld, dict, dict], bool]] = {
     "public evidence preserved": lambda facts, world, case, registry: (
         isinstance(facts.get("public_source"), str) and bool(facts["public_source"])),
@@ -83,11 +105,22 @@ REQUIREMENT_RULES: dict[str, Callable[[dict, SyntheticWorld, dict, dict], bool]]
         isinstance(facts.get("personalization_evidence"), str) and bool(facts["personalization_evidence"])),
     "first live batch or unapproved sequence": lambda facts, world, case, registry: (
         facts.get("first_live_batch") is True or facts.get("unapproved_sequence") is True),
+    # Both bounds independently verified against their own usage/limit evidence
+    # (P13-REV-02) -- previously only the daily-send pair was checked, so a
+    # case with an exhausted follow-up allowance verified anyway.
     "within daily send and follow-up limits": lambda facts, world, case, registry: (
         _finite_number(facts.get("daily_sends_used")) and _finite_number(facts.get("daily_send_limit"))
-        and facts["daily_sends_used"] < facts["daily_send_limit"]),
+        and facts["daily_sends_used"] < facts["daily_send_limit"]
+        and _finite_number(facts.get("follow_ups_sent")) and _finite_number(facts.get("follow_up_limit"))
+        and facts["follow_ups_sent"] < facts["follow_up_limit"]),
+    # Bound to the registry's own real sandbox sender identity (P13-REV-02) --
+    # previously any nonempty fixture-supplied string satisfied this with no
+    # check that the sender/identity was actually approved by real evidence.
     "sending identity approved": lambda facts, world, case, registry: (
-        isinstance(facts.get("approved_sequence_id"), str) and bool(facts["approved_sequence_id"])),
+        isinstance(facts.get("approved_sequence_id"), str) and bool(facts["approved_sequence_id"])
+        and registry.get("integrations", {}).get("sendgrid", {}).get("verified") is True
+        and facts["approved_sequence_id"] == (
+            registry.get("integrations", {}).get("sendgrid", {}).get("sandbox_sender", {}).get("sender_id"))),
     "integration mode permits write": lambda facts, world, case, registry: any(
         cfg.get("external_writes") is True for cfg in registry.get("integrations", {}).values()),
     "opt-out handling enabled": lambda facts, world, case, registry: any(
@@ -96,6 +129,57 @@ REQUIREMENT_RULES: dict[str, Callable[[dict, SyntheticWorld, dict, dict], bool]]
         for tid in case.get("available_template_ids", [])),
     "authoritative calendar or human handoff": lambda facts, world, case, registry: (
         facts.get("meeting_confirmed") is True and str(facts.get("confirmation_ref", "")).startswith("sandbox://")),
+    # customer_onboarding (required_customer_facts: service_area, business_hours,
+    # workflow_permissions, approved_message_channels, escalation_contacts --
+    # the same "authority" channel evidence company_os_stage2_inputs.py's own
+    # authority_verified derivation reads).
+    "first production activation requires founder approval": lambda facts, world, case, registry: (
+        facts.get("authority_verified") is True or facts.get("customer_authority_verified") is True),
+    "scope approved": lambda facts, world, case, registry: (
+        isinstance(facts.get("service_area"), str) and bool(facts["service_area"])
+        and isinstance(facts.get("business_hours"), str) and bool(facts["business_hours"])
+        and isinstance(facts.get("approved_message_channels"), list) and bool(facts["approved_message_channels"])),
+    "customer permissions recorded": lambda facts, world, case, registry: (
+        isinstance(facts.get("workflow_permissions"), list) and bool(facts["workflow_permissions"])
+        and isinstance(facts.get("escalation_contacts"), list) and bool(facts["escalation_contacts"])),
+    "integration registry verified": lambda facts, world, case, registry: any(
+        cfg.get("verified") is True and cfg.get("mode") not in (None, "live", "disabled")
+        for cfg in registry.get("integrations", {}).values()),
+    # missed_inquiry_recovery / integration_failure_recovery: the customer's own
+    # recorded authority must cover this specific workflow, and the registry
+    # must have a genuinely verified, write-capable integration -- never a
+    # same-named fact flag standing in for either.
+    "approved customer workflow": lambda facts, world, case, registry: (
+        isinstance(facts.get("workflow_permissions"), list)
+        and case["workflow_id"] in facts["workflow_permissions"]),
+    "verified writable integration": lambda facts, world, case, registry: any(
+        cfg.get("verified") is True and cfg.get("external_writes") is True
+        for cfg in registry.get("integrations", {}).values()),
+    # integration_failure_recovery: grounded in the persistent dispatch-ledger
+    # record the recovery case's own origin facts describe (_origin_dispatch),
+    # never world.action_failures (already popped by the time these run) and
+    # never a same-named fixture fact.
+    "retry policy permits another attempt": lambda facts, world, case, registry: (
+        (record := _origin_dispatch(facts, world)) is not None and record["status"] == "prepared"),
+    "idempotency is preserved": lambda facts, world, case, registry: (
+        (record := _origin_dispatch(facts, world)) is not None and bool(record.get("adapter_idempotency_key"))),
+    "safe retry limit reached or repeated provider errors": lambda facts, world, case, registry: (
+        (record := _origin_dispatch(facts, world)) is not None and record["status"] == "prepared"),
+    "unsent records remain durable": lambda facts, world, case, registry: (
+        (record := _origin_dispatch(facts, world)) is not None and record["status"] == "prepared"),
+    "provider errors continue": lambda facts, world, case, registry: (
+        (record := _origin_dispatch(facts, world)) is not None and record["status"] == "prepared"),
+    "provider health verified": lambda facts, world, case, registry: any(
+        cfg.get("verified") is True and cfg.get("mode") == "sandbox"
+        for cfg in registry.get("integrations", {}).values()),
+    "original approval remains valid": lambda facts, world, case, registry: (
+        (record := _origin_dispatch(facts, world)) is not None and record["status"] != "blocked"),
+    "no scope expansion": lambda facts, world, case, registry: (
+        _origin_dispatch(facts, world) is not None and not any(
+            record.get("origin_workflow_id") == facts.get("origin_workflow_id")
+            and record.get("origin_entity_id") == facts.get("origin_entity_id")
+            and record.get("frozen_native_decision", {}).get("action") != facts.get("original_action")
+            for record in world.dispatches.values())),
     # Reused wherever a recovery/aggregate case needs evidence that its queue
     # binding genuinely exists, not merely a same-named fact flag.
     "queue integrity verified": lambda facts, world, case, registry: case["entity_id"] in world.queue,
@@ -602,7 +686,7 @@ class _Runner:
         params = {key: correction.get(key) for key in
                   ("status", "founder_id", "founder_minutes", "corrected_decision", "manual_evidence_ref")}
         key = f"{state.source['id']}:{decision_id}:{correction['status']}"
-        return await self.call(state, resolve_sandbox_approval, approval_id=row.id,
+        return await self.call(state, resolve_sandbox_approval, binding=decision_id, approval_id=row.id,
             resolution_key=key, event_schema=self.options["event_schema"],
             workflow=self.workflows[state.source["workflow_id"]], **params)
 
@@ -857,6 +941,15 @@ async def run_stage2_fixture_pack(
                                            "reason": "runtime_precondition_unsatisfied"}
     except HarnessDefect as exc:
         report.harness_defect = {"type": type(exc).__name__, "message": str(exc)}
+        raise
+    except DBAPIError:
+        # A genuine database/infrastructure I/O failure (connection drop,
+        # timeout, disk error -- anything the DBAPI driver itself raised, as
+        # opposed to a programming/application-level SQLAlchemy misuse) must
+        # keep its infrastructure/environment classification, never be folded
+        # into harness_defect just because it happened to surface inside this
+        # generator (P13-REV-03: the P13B-06 widening below is for code/
+        # fixture defects, not for the database transport itself failing).
         raise
     except Exception as exc:
         # Widened from a fixed (KeyError, TypeError, ValueError) tuple

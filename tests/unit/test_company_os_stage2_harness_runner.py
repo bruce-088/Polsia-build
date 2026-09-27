@@ -193,8 +193,13 @@ async def test_prospect_to_meeting_full_chain_uses_genuine_derived_requirements(
     fixtures = {k: deepcopy(v) for k, v in FIXTURES.items() if k != "cases"}
     case = deepcopy(FIXTURES["cases"][0])
     case["id"] = "one"
+    # sending identity approved (P13-REV-02) now requires the fact to match
+    # the registry's own real sandbox sender identity, not any nonempty
+    # string; the daily/follow-up limit requirement now independently checks
+    # both bounds against their own usage/limit evidence.
     case["inputs"][0]["facts"].update(confidence=0.9, personalization_evidence="prior-project-notes",
-        daily_sends_used=1, daily_send_limit=50, approved_sequence_id="seq-1")
+        daily_sends_used=1, daily_send_limit=50, follow_ups_sent=0, follow_up_limit=3,
+        approved_sequence_id=REGISTRY["integrations"]["sendgrid"]["sandbox_sender"]["sender_id"])
     fixtures.update(cases=[case], infrastructure_only=True)
     decisions = [
         native("score_against_icp", "scored"),
@@ -212,6 +217,266 @@ async def test_prospect_to_meeting_full_chain_uses_genuine_derived_requirements(
     assert events[-1]["event_type"] == "terminal_outcome"
     assert r.report.outcomes["one"] == "terminal"
     assert not r.report.harness_defect and not r.report.environment_failure
+
+
+def test_requirement_rules_cover_every_string_in_all_in_scope_workflows():
+    """P13-REV-01: the round-1 fix's "fail loudly for unmapped requirements"
+    rejected ANY pack containing customer_onboarding/missed_inquiry_recovery/
+    integration_failure_recovery entirely, because their real canonical
+    workflow definitions (tests/fixtures/company_os/acqivo/workflows/*.json)
+    have several transition-requirement strings with no REQUIREMENT_RULES
+    entry -- regardless of whether a given pack's own fixture cases ever
+    reach those specific transitions. Every requirement string declared
+    anywhere in all four in-scope real workflow definitions must have a rule.
+    """
+    for workflow_id in ("prospect_to_meeting", "customer_onboarding",
+                        "missed_inquiry_recovery", "integration_failure_recovery"):
+        workflow = WORKFLOWS[workflow_id]
+        requirement_strings = {req for t in workflow["transitions"] for req in t.get("requirements", [])}
+        assert requirement_strings, f"{workflow_id} fixture has no requirement strings to prove against"
+        missing = requirement_strings - set(harness.REQUIREMENT_RULES)
+        assert not missing, f"{workflow_id} has unmapped requirement strings: {missing}"
+
+
+def test_validate_pack_accepts_real_customer_onboarding_missed_inquiry_and_recovery_workflows():
+    """P13-REV-01 regression: validate_pack must accept a pack whose case
+    uses one of the three previously-rejected real workflow definitions,
+    proving the rejection was fixed for the whole workflow, not merely for
+    the one requirement string a particular test happens to exercise.
+    """
+    for workflow_id, entity_type in (
+        ("customer_onboarding", "customer_account"),
+        ("missed_inquiry_recovery", "lead"),
+        ("integration_failure_recovery", "integration_operation"),
+    ):
+        fixtures = pack()
+        case = fixtures["cases"][0]
+        case.update(workflow_id=workflow_id, entity_type=entity_type)
+        harness.validate_pack(fixtures, {workflow_id: WORKFLOWS[workflow_id]}, [], REGISTRY)
+
+
+async def test_customer_onboarding_full_chain_uses_genuine_derived_requirements(async_db_session):
+    """P13-REV-01/02: customer_onboarding's own real requirement strings
+    ("first production activation requires founder approval", "scope
+    approved", "customer permissions recorded", "integration registry
+    verified") each get a real derivation rule grounded in the case's own
+    real authority-signal evidence (service_area/business_hours/
+    workflow_permissions/approved_message_channels/escalation_contacts/
+    authority_verified -- the same fields company_os_stage2_inputs.py's own
+    authority handling reads) and the real integration registry, driven end
+    to end through both RED founder-approval gates via the unmodified real
+    customer_onboarding.json definition.
+    """
+    workflow = WORKFLOWS["customer_onboarding"]
+    actions = [t["action"] for t in workflow["transitions"]]
+    fixtures = {k: deepcopy(v) for k, v in FIXTURES.items() if k != "cases"}
+    case = deepcopy(FIXTURES["cases"][1])
+    assert case["id"] == "sandbox-customer-fulfillment"
+    case["id"] = "one"
+    fixtures.update(cases=[case], infrastructure_only=True)
+    controls = {"one": {
+        "attempts": [
+            {"ref": "verify", "ordinal": 6, "decision_id": "D1"},
+            {"ref": "activate", "ordinal": 8, "decision_id": "D2"},
+        ],
+        "control_commands": [
+            {"id": "resolve1", "command_type": "founder_resolution", "decision_id": "D1",
+             "precondition": {"type": "approval_pending", "decision_id": "D1"}},
+            {"id": "resolve2", "command_type": "founder_resolution", "decision_id": "D2",
+             "precondition": {"type": "approval_pending", "decision_id": "D2"}},
+        ],
+    }}
+    corrections = [resolution("approved", "D1"), resolution("approved", "D2")]
+    decisions = [
+        native("send_or_prepare_intake", "intake_requested", "GREEN"),
+        native("record_customer_inputs", "intake_received", "GREEN"),
+        native("confirm_offer_scope", "scope_confirmed", "GREEN"),
+        native("review_channels_workflows_and_authority", "permissions_review", "YELLOW"),
+        native("collect_required_connection_status", "integrations_pending", "YELLOW"),
+        native("verify_integrations", "baseline_pending", "RED"),
+        native("capture_baseline_metrics", "ready_for_activation", "GREEN"),
+        native("activate_approved_workflows", "active", "RED"),
+    ]
+    r = Run(async_db_session, decisions, fixtures=fixtures, controls=controls, corrections=corrections)
+    r.workflows.clear()
+    r.workflows["customer_onboarding"] = workflow
+    r.options["canonical_actions"] = actions
+    events = await r.run()
+    assert r.report.outcomes["one"] == "terminal"
+    assert events[-1]["event_type"] == "terminal_outcome" and events[-1]["state_after"] == "active"
+    assert not r.report.harness_defect and not r.report.environment_failure
+
+
+async def test_missed_inquiry_recovery_full_chain_uses_genuine_derived_requirements(async_db_session):
+    """P13-REV-01: missed_inquiry_recovery's own real requirement strings
+    ("approved customer workflow", "verified writable integration") get a
+    real derivation rule -- the customer's own recorded workflow_permissions
+    must literally cover this workflow, and the registry must have a
+    genuinely verified, write-capable integration -- driven end to end
+    through the unmodified real missed_inquiry_recovery.json definition,
+    including its own governed email-execute transition.
+    """
+    workflow = WORKFLOWS["missed_inquiry_recovery"]
+    actions = [t["action"] for t in workflow["transitions"]]
+    fixtures = {k: deepcopy(v) for k, v in FIXTURES.items() if k != "cases"}
+    case = deepcopy(FIXTURES["cases"][0])  # prospect_to_meeting's own valid contact/consent snapshot
+    case.update(id="one", workflow_id="missed_inquiry_recovery", entity_type="lead")
+    case["inputs"] = [{
+        "delivery_id": "authority", "type": "authority",
+        "facts": {"workflow_permissions": ["missed_inquiry_recovery"]},
+    }]
+    fixtures.update(cases=[case], infrastructure_only=True)
+
+    def recovery_send(**intent):
+        return native("send_recovery_message", "sent", "YELLOW", {
+            "name": "sendgrid", "phase": "execute", "use": "acquisition_email",
+            "message": {"template_id": FIXTURES["approved_templates"][0]["template_id"], "fills": {}},
+        }, **intent)
+    decisions = [
+        native("verify_source_channel_and_customer_policy", "eligibility_check", "GREEN"),
+        native("draft_recovery_response", "response_drafted", "GREEN"),
+        native("verify_approved_template_and_channel", "ready_to_send", "YELLOW"),
+        recovery_send(),
+        native("record_reply", "engaged", "GREEN"),
+        native("qualify_using_customer_rules", "qualified", "GREEN"),
+        native("route_to_authoritative_next_step", "routed", "YELLOW"),
+    ]
+    r = Run(async_db_session, decisions, fixtures=fixtures)
+    r.workflows.clear()
+    r.workflows["missed_inquiry_recovery"] = workflow
+    r.options["canonical_actions"] = actions
+    events = await r.run()
+    assert r.report.outcomes["one"] == "terminal"
+    assert events[-1]["event_type"] == "terminal_outcome" and events[-1]["state_after"] == "routed"
+    assert not r.report.harness_defect and not r.report.environment_failure
+
+
+async def test_integration_failure_recovery_full_chain_uses_genuine_derived_requirements(async_db_session):
+    """P13-REV-01/02: integration_failure_recovery's own real requirement
+    strings are grounded in the persistent dispatch-ledger record its own
+    queued_message origin facts describe (_origin_dispatch) -- never
+    world.action_failures, which is popped the instant a failure is armed
+    (company_os_synthetic_adapters.py:236-243) and so is already gone by the
+    time this recovery case's own transitions are evaluated.
+
+    Drives the unmodified real integration_failure_recovery.json definition
+    through the driver's own advance()/drain() (the same internals
+    run_stage2_fixture_pack uses each turn -- start_internal-style direct
+    driving is the existing pattern this suite already uses for scenarios
+    that need precise turn-by-turn control, e.g.
+    test_decision_loop_covers_every_real_service_signature) against a
+    dispatch-ledger record seeded exactly as a real, prior send_outreach
+    failure would leave it: created (prepare_dispatch), then left at
+    status="prepared" because the adapter never returns a valid receipt --
+    never a fixture fact standing in for that evidence.
+    """
+    workflow = WORKFLOWS["integration_failure_recovery"]
+    actions = [t["action"] for t in workflow["transitions"]]
+    fixtures = pack()
+    case = fixtures["cases"][0]
+    case.update(workflow_id="integration_failure_recovery", entity_type="integration_operation")
+    recipient = case["contact_record"]["recipient_id"]
+    case["inputs"] = [{"delivery_id": "queue", "type": "queued_message", "facts": {
+        "entity_id": case["entity_id"], "workflow_id": "integration_failure_recovery",
+        "item_id": case["entity_id"], "recipient_id": recipient,
+        "origin_workflow_id": "prospect_to_meeting", "origin_entity_id": "origin-case",
+        "original_action": "send_outreach"}}]
+    world = build_stage2_snapshot(fixtures, REGISTRY, fixtures["approved_templates"],
+        run_id="ifr-full-chain", compliance_policy={"version": "0.1.0", "sha256": "a" * 64})
+    world.prepare_dispatch(
+        message_key="origin-msg", recipient_id=recipient, adapter_kind="mail",
+        adapter_idempotency_key="origin-key-1", origin_workflow_instance_id=999,
+        origin_state_before="ready_to_send", origin_workflow_version=0,
+        frozen_native_decision={"action": "send_outreach"}, rendered_payload={},
+        consumers={}, origin_workflow_id="prospect_to_meeting", origin_entity_id="origin-case",
+    )
+    run = await create_sandbox_run(async_db_session, run_id=world.run_id, company_slug="acqivo",
+        protocol_version="0.1.0", input_manifest={"provider": "deterministic_mock"})
+    instance = await create_workflow_instance(async_db_session, sandbox_run_id=run.id,
+        workflow_id="integration_failure_recovery", entity_type="integration_operation",
+        entity_id=case["entity_id"], initial_state=workflow["states"][0])
+    decisions = [
+        native("retry_within_safe_limit", "retry_wait", "GREEN"),
+        native("stop_retries_after_safe_limit_log_failure_and_preserve_queue", "blocked", "GREEN"),
+        native("review_provider_recovery", "recovery_review", "GREEN"),
+        native("approve_resume_on_same_verified_provider", "ready_to_resume", "YELLOW"),
+    ]
+    provider = DeterministicMockProvider({"one": decisions})
+    options = dict(policy=POLICY, integration_registry=REGISTRY, event_schema=SCHEMA,
+        canonical_agents=["email_outreach", "orchestrator"], canonical_handoffs=["orchestrator"],
+        canonical_actions=actions, synthetic_adapters={"sendgrid": SyntheticAdapter(world, "mail")})
+    report = harness.HarnessReport()
+    runner = harness._Runner(async_db_session, fixtures, world, provider,
+        {"integration_failure_recovery": workflow}, options, [], report)
+    runner.cases["one"] = harness._Case(case, instance)
+    state = runner.cases["one"]
+    events = []
+    for decision in decisions:
+        pair = await runner.advance(state)
+        assert pair is not None, report.harness_defect or report.environment_failure
+        events.append(pair[0])
+        assert pair[0]["action"] == decision["action"]
+    assert [e["state_after"] for e in events] == ["retry_wait", "blocked", "recovery_review", "ready_to_resume"]
+    assert state.outcome == "ready"
+    assert not report.harness_defect and not report.environment_failure
+
+
+def test_verified_writable_integration_and_no_scope_expansion_predicates():
+    """P13-REV-01: direct predicate proof for the two integration_failure_
+    recovery/missed_inquiry_recovery requirement strings the full-chain
+    tests above don't reach (both live on the final, governed email-execute
+    transition). "verified writable integration" is grounded in the real
+    registry, never a fixture flag; "no scope expansion" is grounded in the
+    origin dispatch record and rejects a case where a second, different-
+    action record for the same origin identity would indicate the recovery
+    smuggled in a different action than the one that originally failed.
+    """
+    world = SyntheticWorld("scope-test", datetime(2026, 9, 25, tzinfo=UTC))
+    facts = {"origin_workflow_id": "prospect_to_meeting", "origin_entity_id": "case-a",
+             "original_action": "send_outreach"}
+    assert harness.REQUIREMENT_RULES["verified writable integration"](facts, world, {}, REGISTRY) is True
+    assert harness.REQUIREMENT_RULES["verified writable integration"](facts, world, {}, {"integrations": {}}) is False
+    world.dispatches["d1"] = {"origin_workflow_id": "prospect_to_meeting", "origin_entity_id": "case-a",
+                              "frozen_native_decision": {"action": "send_outreach"}, "status": "prepared"}
+    assert harness.REQUIREMENT_RULES["no scope expansion"](facts, world, {}, REGISTRY) is True
+    # A second record for the same origin identity but a different action
+    # would mean the recovery is no longer resuming the exact action that
+    # failed -- that must never verify.
+    world.dispatches["d2"] = {"origin_workflow_id": "prospect_to_meeting", "origin_entity_id": "case-a",
+                              "frozen_native_decision": {"action": "some_other_action"}, "status": "prepared"}
+    assert harness.REQUIREMENT_RULES["no scope expansion"](facts, world, {}, REGISTRY) is False
+
+
+def test_sending_identity_approved_requires_real_registry_sender_match():
+    """P13-REV-02: "sending identity approved" was satisfied by any nonempty
+    approved_sequence_id fact with no check that the sender/identity was
+    actually approved by real evidence. It must now be bound to the
+    registry's own real, verified sandbox sender identity.
+    """
+    world = SyntheticWorld("identity-test", datetime(2026, 9, 25, tzinfo=UTC))
+    rule = harness.REQUIREMENT_RULES["sending identity approved"]
+    real_id = REGISTRY["integrations"]["sendgrid"]["sandbox_sender"]["sender_id"]
+    assert rule({"approved_sequence_id": real_id}, world, {}, REGISTRY) is True
+    # An arbitrary, unverified fixture-invented string must never verify.
+    assert rule({"approved_sequence_id": "invented-sequence-id"}, world, {}, REGISTRY) is False
+    assert rule({}, world, {}, REGISTRY) is False
+
+
+def test_daily_send_and_follow_up_limits_independently_verified():
+    """P13-REV-02: "within daily send and follow-up limits" only checked the
+    daily-send pair, ignoring follow-up limits entirely -- a case with an
+    approved daily allowance but an exhausted follow-up allowance verified
+    anyway. Both bounds must now be independently checked against their own
+    usage/limit evidence; missing evidence must leave it unverified.
+    """
+    world = SyntheticWorld("limits-test", datetime(2026, 9, 25, tzinfo=UTC))
+    rule = harness.REQUIREMENT_RULES["within daily send and follow-up limits"]
+    within_both = {"daily_sends_used": 1, "daily_send_limit": 50, "follow_ups_sent": 0, "follow_up_limit": 3}
+    assert rule(within_both, world, {}, REGISTRY) is True
+    exhausted_follow_up = {**within_both, "follow_ups_sent": 3}
+    assert rule(exhausted_follow_up, world, {}, REGISTRY) is False
+    missing_follow_up_evidence = {"daily_sends_used": 1, "daily_send_limit": 50}
+    assert rule(missing_follow_up_evidence, world, {}, REGISTRY) is False
 
 
 @pytest.mark.parametrize("status", ["approved", "modified", "rejected", "expired", "cancelled", "needs_more_evidence"])
@@ -810,6 +1075,40 @@ async def test_expected_stale_workflow_state_rejection_recorded_as_evidence(asyn
     assert r.report.service_rejections[0]["exception_type"] == "SandboxApprovalError"
 
 
+async def test_expected_resolution_conflict_rejection_recorded_as_evidence(async_db_session):
+    """P13-REV-04: _Runner.resolve did not pass binding=decision_id to
+    self.call (unlike resume, which does), so a fixture declaring an
+    expected_service_rejection for a resolve_sandbox_approval call compared
+    the required non-empty binding against None and always aborted as an
+    unexpected harness defect instead of crediting the deliberate rejection.
+    Drives resolve_sandbox_approval (via _Runner.resolve, not a raw
+    runner.call) into its own real "only pending approval may be resolved"
+    rejection -- a second, conflicting resolution attempt on an
+    already-resolved approval -- and confirms it is credited as evidence.
+    """
+    controls = approval_controls()
+    controls["one"]["expected_service_rejection"] = {"call": "resolve_sandbox_approval",
+        "exception_type": "SandboxApprovalError", "expects": "only pending approval may be resolved",
+        "binding": "D"}
+    r, runner, state = await start_internal(async_db_session, controls=controls, corrections=[resolution()])
+    r.provider.decisions["one"] = [native("pricing_change", "research", "RED")]
+    await runner.advance(state)
+    first = await runner.resolve(state, "D")
+    assert runner.record(state, first) is not None
+    # A second, conflicting resolution of the same already-resolved approval
+    # -- deliberately different founder_minutes, so it can never take the
+    # service's own identical-replay branch -- reproduces the service's real
+    # "only pending approval may be resolved" raise.
+    runner.corrections[0]["founder_minutes"] = 99
+    event = await runner.resolve(state, "D")
+    assert event is None
+    assert state.rejection_credited is True and state.outcome == "service_rejection"
+    assert r.report.service_rejections == [{"case_id": "one", "call": "resolve_sandbox_approval",
+        "exception_type": "SandboxApprovalError", "message": "only pending approval may be resolved",
+        "expected": True}]
+    assert len(await r.rows()) == 2  # approval_requested + the one successful approval_resolved
+
+
 async def test_needs_more_evidence_unblocks_via_new_decision_identity(async_db_session):
     controls = approval_controls()
     controls["one"]["attempts"].append({"ordinal": 2, "ref": "new", "decision_id": "D2"})
@@ -973,6 +1272,57 @@ async def test_cli_malformed_pack_or_controls_is_harness_defect_not_environment_
     assert await export(args) == 1
     assert (tmp_path / "events.ndjson_harness_defect.json").exists()
     assert not (tmp_path / "events.ndjson_environment_failure.json").exists()
+
+
+async def test_cli_case_missing_contact_record_is_harness_defect_not_environment_failure(async_db_session, tmp_path):
+    """P13-REV-03: validate_artifact_shapes only checks outer containers (the
+    pack is an object with a list of case objects) -- a case missing
+    contact_record entirely slips past it, then build_stage2_snapshot (the
+    CLI's own direct pre-build call, outside run_stage2_fixture_pack) raises
+    Stage2InputError, a plain ValueError that isn't a HarnessDefect. It must
+    be classified as a harness defect (a malformed fixture), never an
+    environment failure.
+    """
+    import json
+
+    from scripts.stage2_harness_export import export
+    r = Run(async_db_session, [])
+    runtime = {k: v for k, v in r.options.items() if k != "synthetic_adapters"}
+    runtime.update(compliance_policy=r.world.compliance_policy, synthetic_adapter_kinds={"sendgrid": "mail"})
+    pack_payload = deepcopy(r.pack)
+    del pack_payload["cases"][0]["contact_record"]
+    for name, value in (("pack.json", pack_payload), ("runtime.json", runtime),
+                        ("decisions.json", {"one": [native("finish", "done")]})):
+        (tmp_path / name).write_text(json.dumps(value))
+    args = SimpleNamespace(provider="deterministic_mock", infrastructure_only=True, run_id="cli-test",
+        fixture_pack=tmp_path / "pack.json", runtime_inputs=tmp_path / "runtime.json", mock_decisions=tmp_path / "decisions.json",
+        founder_resolutions=None, driver_controls=None,
+        events=tmp_path / "events.ndjson", native_evidence=tmp_path / "native.ndjson",
+        service_rejections=tmp_path / "rejections.ndjson", database=tmp_path / "test.db")
+    assert await export(args) == 1
+    assert (tmp_path / "events.ndjson_harness_defect.json").exists()
+    assert not (tmp_path / "events.ndjson_environment_failure.json").exists()
+
+
+async def test_genuine_database_error_is_not_misfiled_as_harness_defect(async_db_session, monkeypatch):
+    """P13-REV-03: the round-1 fix's widened except Exception (P13B-06) --
+    which presumes anything raised inside run_stage2_fixture_pack's own
+    generator is a code/fixture defect -- must not swallow a genuine
+    database/infrastructure I/O failure (sqlalchemy.exc.DBAPIError, the
+    DBAPI driver's own transport error, as opposed to an application-level
+    SQLAlchemy misuse) and reclassify it as a harness defect; it must keep
+    propagating unconverted so the caller can classify it as an environment
+    failure instead.
+    """
+    from sqlalchemy.exc import DBAPIError
+
+    async def broken(*a, **k):
+        raise DBAPIError("stmt", {}, Exception("connection reset"))
+    monkeypatch.setattr(harness, "coordinate_sandbox_action", broken)
+    r = Run(async_db_session, [native()])
+    with pytest.raises(DBAPIError):
+        await r.run()
+    assert r.report.harness_defect is None
 
 
 @pytest.mark.parametrize("declared", ["CompanyOSTransportError", "CompanyOSDecisionMethodDefect", "UnknownError"])
