@@ -187,6 +187,34 @@ async def _post_failure_provider_health(db: AsyncSession, record: dict | None) -
     )
 
 
+def _execute_ready(registry: dict, *, integration: str, requested_use: str | None = None,
+                    requested_scope: str | None = None) -> bool:
+    """Stage 2 execute-readiness, matching the real governed callers exactly --
+    never `evaluate_integration_capability(...).allowed` alone.
+
+    `.allowed` alone is `evaluate_integration_capability`'s own broader gate:
+    its WRITE_CAPABLE_MODES = {"sandbox", "write_limited", "live"} permits
+    execute in any of the three. But the actual governed Stage 2 callers --
+    `coordinate_sandbox_action` and `resume_sandbox_approval` -- additionally
+    require `mode == "sandbox"` specifically for phase in {"read", "execute"}
+    (and explicitly deny `mode == "live"` outright), so an integration set to
+    `live` or `write_limited` still passed `.allowed` but would be rejected by
+    the real governed path (P13-REV4-01).
+
+    `requested_scope` must also be supplied -- `evaluate_integration_capability`
+    rejects any integration with a configured non-null `scope` whenever
+    `requested_scope` is `None`, so omitting it silently fails every real,
+    correctly-scoped integration too (P13-REV4-02). The caller must derive
+    `requested_scope` from trusted customer/workflow facts, never from the
+    registry's own configured scope (that would trivially always match).
+    """
+    decision = evaluate_integration_capability(
+        registry, integration=integration, phase="execute",
+        requested_use=requested_use, requested_scope=requested_scope,
+    )
+    return decision.allowed and decision.mode == "sandbox"
+
+
 # Explicit, per-string predicates for genuinely derivable transition requirements.
 # A predicate reads facts already ingested plus world/registry state -- never a
 # fixture fact literally named after the requirement string it attests (that
@@ -256,10 +284,17 @@ REQUIREMENT_RULES: dict[str, Callable[[dict, SyntheticWorld, dict, dict, int], b
         and isinstance(facts.get("escalation_contacts"), list) and bool(facts["escalation_contacts"])),
     # Bound to the customer's own required connections (P13-REV2-02),
     # verified through the real capability evaluator rather than a hand-rolled
-    # verified+external_writes check that omitted mode (P13-REV3-02) --
-    # evaluate_integration_capability's own mode gate (WRITE_CAPABLE_MODES)
-    # is what actually determines execute readiness; disabled/documented/
-    # read_only/live all pass verified+external_writes yet cannot execute.
+    # verified+external_writes check that omitted mode (P13-REV3-02), and
+    # through _execute_ready (P13-REV4-01/02) rather than `.allowed` alone --
+    # `.allowed` permits live/write_limited execute too (WRITE_CAPABLE_MODES),
+    # but the real governed callers require mode == "sandbox" specifically;
+    # `.allowed` alone also silently fails any integration with a configured
+    # scope because no requested_scope was ever supplied. requested_scope is
+    # the case's own trusted customer_id fact -- the same customer identity
+    # "approved customer workflow"/"customer-approved timing and channel"
+    # below key their own customer lookups on -- never the registry's own
+    # configured scope copied back at it (which would trivially always
+    # match and prove nothing).
     # Every channel the customer's own approved_message_channels facts
     # declare must be served by a specific execute-capable registry
     # integration for that channel's use; an unrelated verified entry (e.g.
@@ -271,7 +306,8 @@ REQUIREMENT_RULES: dict[str, Callable[[dict, SyntheticWorld, dict, dict, int], b
         and all(
             channel in CHANNEL_INTEGRATION_USES and any(
                 (use := next(iter(set(cfg.get("desired_use", [])) & CHANNEL_INTEGRATION_USES[channel]), None)) is not None
-                and evaluate_integration_capability(registry, integration=name, phase="execute", requested_use=use).allowed
+                and _execute_ready(registry, integration=name, requested_use=use,
+                                   requested_scope=facts.get("customer_id"))
                 for name, cfg in registry.get("integrations", {}).items())
             for channel in facts["approved_message_channels"])),
     # missed_inquiry_recovery / integration_failure_recovery: the customer's own
@@ -282,11 +318,15 @@ REQUIREMENT_RULES: dict[str, Callable[[dict, SyntheticWorld, dict, dict, int], b
         (customer := world.customers.get(facts.get("customer_id"), {})).get("authority_verified") is True
         and isinstance(customer.get("workflow_permissions"), list)
         and case["workflow_id"] in customer["workflow_permissions"]),
-    # Same fix as "integration registry verified" above (P13-REV3-02): the
-    # real capability evaluator's mode gate is what determines execute
-    # readiness, not verified+external_writes alone.
+    # Same fix as "integration registry verified" above (P13-REV3-02/REV4-01/
+    # REV4-02): _execute_ready enforces the real governed callers' mode ==
+    # "sandbox" requirement (not `.allowed` alone, which also permits live/
+    # write_limited) and supplies requested_scope from the case's own
+    # trusted customer_id fact (not the registry's own configured scope,
+    # and never omitted, which would silently fail every correctly-scoped
+    # integration).
     "verified writable integration": lambda facts, world, case, registry, origin_failures: any(
-        evaluate_integration_capability(registry, integration=name, phase="execute").allowed
+        _execute_ready(registry, integration=name, requested_scope=facts.get("customer_id"))
         for name in registry.get("integrations", {})),
     # Estimate follow-up is grounded in the linked customer's recorded authority,
     # an explicit channel/time fact, and the fixture's numeric send budget.

@@ -339,6 +339,64 @@ async def test_customer_onboarding_full_chain_uses_genuine_derived_requirements(
     assert not r.report.harness_defect and not r.report.environment_failure
 
 
+@pytest.mark.parametrize("unusable_mode", ["live", "write_limited"])
+async def test_customer_onboarding_activation_never_advances_with_non_sandbox_required_integration(
+        async_db_session, unusable_mode):
+    """P13-REV4-01 regression, end to end: "integration registry verified"
+    must not certify Stage 2 readiness for "activate_approved_workflows"
+    (customer_onboarding.json's final RED transition) when the customer's
+    required sendgrid connection is set to "live" or "write_limited" --
+    evaluate_integration_capability(...).allowed alone would incorrectly
+    pass both (WRITE_CAPABLE_MODES), but the real governed callers require
+    mode == "sandbox" specifically. Drives the same real onboarding chain as
+    test_customer_onboarding_full_chain_uses_genuine_derived_requirements
+    above (which proves the sandbox-mode case correctly reaches "active"),
+    but with the registry's sendgrid mode swapped -- this case must never
+    reach "active"/"terminal" the way that one does.
+    """
+    workflow = WORKFLOWS["customer_onboarding"]
+    actions = [t["action"] for t in workflow["transitions"]]
+    fixtures = {k: deepcopy(v) for k, v in FIXTURES.items() if k != "cases"}
+    case = deepcopy(FIXTURES["cases"][1])
+    assert case["id"] == "sandbox-customer-fulfillment"
+    case["id"] = "one"
+    fixtures.update(cases=[case], infrastructure_only=True)
+    controls = {"one": {
+        "attempts": [
+            {"ref": "verify", "ordinal": 6, "decision_id": "D1"},
+            {"ref": "activate", "ordinal": 8, "decision_id": "D2"},
+        ],
+        "control_commands": [
+            {"id": "resolve1", "command_type": "founder_resolution", "decision_id": "D1",
+             "precondition": {"type": "approval_pending", "decision_id": "D1"}},
+            {"id": "resolve2", "command_type": "founder_resolution", "decision_id": "D2",
+             "precondition": {"type": "approval_pending", "decision_id": "D2"}},
+        ],
+    }}
+    corrections = [resolution("approved", "D1"), resolution("approved", "D2")]
+    decisions = [
+        native("send_or_prepare_intake", "intake_requested", "GREEN"),
+        native("record_customer_inputs", "intake_received", "GREEN"),
+        native("confirm_offer_scope", "scope_confirmed", "GREEN"),
+        native("review_channels_workflows_and_authority", "permissions_review", "YELLOW"),
+        native("collect_required_connection_status", "integrations_pending", "YELLOW"),
+        native("verify_integrations", "baseline_pending", "RED"),
+        native("capture_baseline_metrics", "ready_for_activation", "GREEN"),
+        native("activate_approved_workflows", "active", "RED"),
+    ]
+    r = Run(async_db_session, decisions, fixtures=fixtures, controls=controls, corrections=corrections)
+    r.workflows.clear()
+    r.workflows["customer_onboarding"] = workflow
+    r.options["canonical_actions"] = actions
+    non_sandbox_registry = deepcopy(REGISTRY)
+    non_sandbox_registry["integrations"]["sendgrid"]["mode"] = unusable_mode
+    r.options["integration_registry"] = non_sandbox_registry
+    events = await r.run()
+    assert r.report.outcomes["one"] != "terminal"
+    assert all(event["state_after"] != "active" for event in events)
+    assert not any(event["event_type"] == "terminal_outcome" for event in events)
+
+
 async def test_missed_inquiry_recovery_full_chain_uses_genuine_derived_requirements(async_db_session):
     """P13-REV-01: missed_inquiry_recovery's own real requirement strings
     ("approved customer workflow", "verified writable integration") get a
@@ -573,6 +631,55 @@ def test_verified_writable_integration_and_no_scope_expansion_predicates():
     assert harness.REQUIREMENT_RULES["no scope expansion"](facts, world, {}, REGISTRY, 0) is False
 
 
+def test_verified_writable_integration_rejects_live_and_write_limited_modes():
+    """P13-REV4-01: "verified writable integration" previously accepted
+    evaluate_integration_capability(...).allowed alone, but that evaluator's
+    own WRITE_CAPABLE_MODES ({"sandbox", "write_limited", "live"}) permits
+    execute in live/write_limited too -- the real governed callers
+    (coordinate_sandbox_action/resume_sandbox_approval) additionally require
+    mode == "sandbox" specifically for phase="execute" and explicitly deny
+    mode == "live" outright. Setting the only verified, write-capable
+    registry entry to "live" or "write_limited" must never verify this
+    requirement, even though it still satisfies verified+external_writes
+    and even .allowed on its own.
+    """
+    world = SyntheticWorld("scope-test-2", datetime(2026, 9, 25, tzinfo=UTC))
+    facts = {}
+    for unusable_mode in ("live", "write_limited"):
+        wrong_mode = deepcopy(REGISTRY)
+        wrong_mode["integrations"]["sendgrid"]["mode"] = unusable_mode
+        assert harness.REQUIREMENT_RULES["verified writable integration"](
+            facts, world, {}, wrong_mode, 0) is False
+
+
+def test_verified_writable_integration_requires_matching_requested_scope():
+    """P13-REV4-02: neither predicate ever supplied requested_scope, and
+    evaluate_integration_capability rejects any integration with a
+    configured non-null scope whenever requested_scope is None -- a
+    verified sandbox integration correctly restricted to an authorized
+    customer scope would be wrongly reported unavailable. requested_scope
+    must be derived from the case's own trusted customer_id fact (never
+    copied back from the registry's own configured scope, which would
+    trivially always match and prove nothing).
+    """
+    world = SyntheticWorld("scope-test-3", datetime(2026, 9, 25, tzinfo=UTC))
+    scoped = deepcopy(REGISTRY)
+    scoped["integrations"]["sendgrid"]["scope"] = "c-syn-01"
+    # The case's own customer_id fact matches the integration's configured
+    # scope -- the real coordinator would allow this exact request, so
+    # readiness must hold.
+    assert harness.REQUIREMENT_RULES["verified writable integration"](
+        {"customer_id": "c-syn-01"}, world, {}, scoped, 0) is True
+    # A different customer's request against the same scoped integration
+    # must never verify -- the real coordinator would reject it.
+    assert harness.REQUIREMENT_RULES["verified writable integration"](
+        {"customer_id": "some-other-customer"}, world, {}, scoped, 0) is False
+    # No customer_id fact at all (requested_scope stays None) against a
+    # scoped integration must also fail closed, matching the real evaluator.
+    assert harness.REQUIREMENT_RULES["verified writable integration"](
+        {}, world, {}, scoped, 0) is False
+
+
 def test_qualify_requirement_rejects_below_threshold_score():
     rule = harness.REQUIREMENT_RULES["score and confidence recorded"]
     assert rule({"icp_score": 6, "confidence": 0.91}, None, {}, {}, 0) is False
@@ -644,6 +751,36 @@ def test_integration_registry_verified_binds_to_customers_required_channels():
         wrong_mode = deepcopy(REGISTRY)
         wrong_mode["integrations"]["sendgrid"]["mode"] = unusable_mode
         assert rule({"approved_message_channels": ["email"]}, world, {}, wrong_mode, 0) is False
+    # P13-REV4-01: `.allowed` alone (WRITE_CAPABLE_MODES) permits execute in
+    # live/write_limited too, unlike disabled/documented/read_only above --
+    # but the real governed callers (coordinate_sandbox_action/
+    # resume_sandbox_approval) require mode == "sandbox" specifically for
+    # execute and explicitly deny "live" outright. live/write_limited must
+    # never verify this requirement even though .allowed alone would be True.
+    for unusable_mode in ("live", "write_limited"):
+        wrong_mode = deepcopy(REGISTRY)
+        wrong_mode["integrations"]["sendgrid"]["mode"] = unusable_mode
+        assert rule({"approved_message_channels": ["email"]}, world, {}, wrong_mode, 0) is False
+
+
+def test_integration_registry_verified_requires_matching_requested_scope():
+    """P13-REV4-02: neither predicate ever supplied requested_scope, and
+    evaluate_integration_capability rejects any integration with a
+    configured non-null scope whenever requested_scope is None. Once the
+    customer's required sendgrid connection has a configured scope,
+    "integration registry verified" must only hold when the case's own
+    trusted customer_id fact matches it -- never when it's absent or
+    belongs to a different customer.
+    """
+    rule = harness.REQUIREMENT_RULES["integration registry verified"]
+    world = SyntheticWorld("registry-scope-test", datetime(2026, 9, 25, tzinfo=UTC))
+    scoped = deepcopy(REGISTRY)
+    scoped["integrations"]["sendgrid"]["scope"] = "c-syn-01"
+    assert rule({"approved_message_channels": ["email"], "customer_id": "c-syn-01"},
+                world, {}, scoped, 0) is True
+    assert rule({"approved_message_channels": ["email"], "customer_id": "some-other-customer"},
+                world, {}, scoped, 0) is False
+    assert rule({"approved_message_channels": ["email"]}, world, {}, scoped, 0) is False
 
 
 @pytest.mark.asyncio
