@@ -634,6 +634,16 @@ def test_integration_registry_verified_binds_to_customers_required_channels():
     assert rule({"approved_message_channels": ["carrier_pigeon"]}, world, {}, REGISTRY, 0) is False
     assert rule({"approved_message_channels": []}, world, {}, REGISTRY, 0) is False
     assert rule({}, world, {}, REGISTRY, 0) is False
+    # P13-REV3-02: verified+external_writes alone previously certified
+    # readiness even when the integration's own mode cannot execute --
+    # evaluate_integration_capability's mode gate (WRITE_CAPABLE_MODES =
+    # {sandbox, write_limited, live}) is what actually determines execute
+    # readiness; disabled/documented/read_only cannot, regardless of
+    # verified/external_writes.
+    for unusable_mode in ("disabled", "documented", "read_only"):
+        wrong_mode = deepcopy(REGISTRY)
+        wrong_mode["integrations"]["sendgrid"]["mode"] = unusable_mode
+        assert rule({"approved_message_channels": ["email"]}, world, {}, wrong_mode, 0) is False
 
 
 @pytest.mark.asyncio
@@ -652,6 +662,48 @@ async def test_origin_failure_count_is_bound_to_dispatch_not_just_action():
     ]
     db = SimpleNamespace(scalars=AsyncMock(return_value=events))
     assert await harness._origin_failure_count(db, origin) == 2
+
+
+@pytest.mark.asyncio
+async def test_origin_failure_count_counts_recovery_instance_failures_too(async_db_session):
+    """P13-REV3-01: execute_dispatch registers a recovery instance as a
+    consumer of the SAME dispatch record as the origin -- its own
+    coordinator/approval calls persist failure_detected events under the
+    RECOVERY instance's workflow_instance_id, not the origin's. Scoping the
+    count query by origin_workflow_instance_id silently dropped every
+    recovery-path failure on a shared dispatch. Must count by dispatch_id
+    alone, across every consumer instance.
+    """
+    run = await create_sandbox_run(async_db_session, run_id="cross-instance-count", company_slug="acqivo",
+        protocol_version="0.1.0", input_manifest={"provider": "deterministic_mock"})
+    origin = await create_workflow_instance(async_db_session, sandbox_run_id=run.id,
+        workflow_id="prospect_to_meeting", entity_type="prospect", entity_id="origin-case",
+        initial_state="sent")
+    recovery = await create_workflow_instance(async_db_session, sandbox_run_id=run.id,
+        workflow_id="integration_failure_recovery", entity_type="integration_operation",
+        entity_id="recovery-case", initial_state="dispatch_failed")
+    record = {"origin_workflow_instance_id": origin.id, "dispatch_id": "shared-dispatch",
+              "frozen_native_decision": {"action": "send_outreach"}}
+
+    async def persist(instance_id, sequence, event_id):
+        async_db_session.add(CompanyOSSandboxEvent(
+            sandbox_run_id=run.id, workflow_instance_id=instance_id,
+            event_id=event_id, sequence=sequence, idempotency_key=f"{event_id}:key",
+            primary_classification="acquisition", event_type="failure_detected", result="failed",
+            risk_level="GREEN", state_before="scored", state_after="scored", external_side_effect=False,
+            payload={"action": "resume_recovery", "metadata": {"gate": "integration",
+                     "dispatch_id": "shared-dispatch", "dispatch_attempted": True}},
+            native_decision=None, native_failure={"type": "SyntheticCapabilityError"},
+        ))
+        await async_db_session.flush()
+
+    # One failure on the origin instance, then one on the recovery instance
+    # (a different instance id AND a different consumer action) -- both must
+    # count toward the same dispatch's failure history.
+    await persist(origin.id, 1, "origin-fail-1")
+    assert await harness._origin_failure_count(async_db_session, record) == 1
+    await persist(recovery.id, 2, "recovery-fail-1")
+    assert await harness._origin_failure_count(async_db_session, record) == 2
 
 
 def test_origin_failure_count_grounds_retry_predicates(async_db_session):

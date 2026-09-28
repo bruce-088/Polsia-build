@@ -21,6 +21,7 @@ from sqlalchemy.exc import DataError, DBAPIError, IntegrityError, ProgrammingErr
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agents.company_os_compliance import EMAIL_USES, is_email_execute
+from app.agents.company_os_integration import evaluate_integration_capability
 from app.agents.company_os_stage2_provider import ScriptedProviderTimeout
 from app.config import settings
 from app.models.company_os_sandbox import CompanyOSSandboxApproval, CompanyOSSandboxEvent
@@ -124,17 +125,21 @@ async def _origin_failure_count(db: AsyncSession, record: dict | None) -> int:
     the adapter's own failure. So dispatch-ledger status alone can never
     distinguish "never attempted" from "failed five times," which is exactly
     what let one prepared record satisfy every retry-count-shaped requirement
-    at once. Each real failure the origin instance's own coordinator call
-    persists is a separate, immutable failure_detected event row, scoped by
-    the origin's own workflow_instance_id and the action that failed --
-    never derived from a fixture fact or from world.action_failures (already
-    popped by the time integration_failure_recovery's own transitions run).
+    at once. Each real failure any legitimate consumer's own coordinator call
+    persists is a separate, immutable failure_detected event row.
+
+    Scoped by dispatch_id alone (P13-REV3-01) -- never by workflow_instance_id
+    or action. execute_dispatch registers recovery instances as consumers of
+    the SAME dispatch record, and their own coordinator/approval calls persist
+    failures under the recovery instance's id and its own consumer_decision
+    action, not the origin's. dispatch_id itself is already a run-scoped
+    fingerprint (SyntheticWorld.dispatch_id: fingerprint(run_id, message_key)),
+    so matching on it alone is exact -- restricting to origin_workflow_instance_id
+    silently ignored every recovery-path failure on the same shared dispatch.
     """
     if record is None or not record.get("dispatch_id"):
         return 0
-    action = (record.get("frozen_native_decision") or {}).get("action")
     events = await db.scalars(select(CompanyOSSandboxEvent).where(
-        CompanyOSSandboxEvent.workflow_instance_id == record["origin_workflow_instance_id"],
         CompanyOSSandboxEvent.event_type == "failure_detected",
     ))
     return sum(
@@ -142,7 +147,6 @@ async def _origin_failure_count(db: AsyncSession, record: dict | None) -> int:
         if event.payload.get("metadata", {}).get("gate") in {"integration", "approval_resume"}
         and event.payload.get("metadata", {}).get("dispatch_attempted") is True
         and event.payload.get("metadata", {}).get("dispatch_id") == record.get("dispatch_id")
-        and event.payload.get("action") == action
     )
 
 
@@ -156,11 +160,14 @@ async def _post_failure_provider_health(db: AsyncSession, record: dict | None) -
     provider = ((record.get("frozen_native_decision") or {}).get("integration") or {}).get("name")
     if not provider:
         return False
-    origin_events = await db.scalars(select(CompanyOSSandboxEvent).where(
-        CompanyOSSandboxEvent.workflow_instance_id == record["origin_workflow_instance_id"],
+    # Scoped by dispatch_id alone, matching _origin_failure_count above
+    # (P13-REV3-01) -- a recovery-instance failure on the same dispatch must
+    # count too, and a later recovery-instance failure after a successful
+    # origin-instance health observation must still leave health unverified.
+    all_events = await db.scalars(select(CompanyOSSandboxEvent).where(
         CompanyOSSandboxEvent.event_type == "failure_detected",
     ))
-    failures = [event for event in origin_events
+    failures = [event for event in all_events
                 if event.payload.get("metadata", {}).get("gate") in {"integration", "approval_resume"}
                 and event.payload.get("metadata", {}).get("dispatch_attempted") is True
                 and event.payload.get("metadata", {}).get("dispatch_id") == record["dispatch_id"]]
@@ -247,9 +254,14 @@ REQUIREMENT_RULES: dict[str, Callable[[dict, SyntheticWorld, dict, dict, int], b
     "customer permissions recorded": lambda facts, world, case, registry, origin_failures: (
         isinstance(facts.get("workflow_permissions"), list) and bool(facts["workflow_permissions"])
         and isinstance(facts.get("escalation_contacts"), list) and bool(facts["escalation_contacts"])),
-    # Bound to the customer's own required connections (P13-REV2-02) --
-    # every channel the customer's own approved_message_channels facts
-    # declare must be served by a specific verified, write-capable registry
+    # Bound to the customer's own required connections (P13-REV2-02),
+    # verified through the real capability evaluator rather than a hand-rolled
+    # verified+external_writes check that omitted mode (P13-REV3-02) --
+    # evaluate_integration_capability's own mode gate (WRITE_CAPABLE_MODES)
+    # is what actually determines execute readiness; disabled/documented/
+    # read_only/live all pass verified+external_writes yet cannot execute.
+    # Every channel the customer's own approved_message_channels facts
+    # declare must be served by a specific execute-capable registry
     # integration for that channel's use; an unrelated verified entry (e.g.
     # a verified read-only imap connection) can never satisfy an email
     # requirement, and an unrecognized channel with no established
@@ -258,9 +270,9 @@ REQUIREMENT_RULES: dict[str, Callable[[dict, SyntheticWorld, dict, dict, int], b
         isinstance(facts.get("approved_message_channels"), list) and bool(facts["approved_message_channels"])
         and all(
             channel in CHANNEL_INTEGRATION_USES and any(
-                cfg.get("verified") is True and cfg.get("external_writes") is True
-                and set(cfg.get("desired_use", [])) & CHANNEL_INTEGRATION_USES[channel]
-                for cfg in registry.get("integrations", {}).values())
+                (use := next(iter(set(cfg.get("desired_use", [])) & CHANNEL_INTEGRATION_USES[channel]), None)) is not None
+                and evaluate_integration_capability(registry, integration=name, phase="execute", requested_use=use).allowed
+                for name, cfg in registry.get("integrations", {}).items())
             for channel in facts["approved_message_channels"])),
     # missed_inquiry_recovery / integration_failure_recovery: the customer's own
     # recorded authority must cover this specific workflow, and the registry
@@ -270,9 +282,12 @@ REQUIREMENT_RULES: dict[str, Callable[[dict, SyntheticWorld, dict, dict, int], b
         (customer := world.customers.get(facts.get("customer_id"), {})).get("authority_verified") is True
         and isinstance(customer.get("workflow_permissions"), list)
         and case["workflow_id"] in customer["workflow_permissions"]),
+    # Same fix as "integration registry verified" above (P13-REV3-02): the
+    # real capability evaluator's mode gate is what determines execute
+    # readiness, not verified+external_writes alone.
     "verified writable integration": lambda facts, world, case, registry, origin_failures: any(
-        cfg.get("verified") is True and cfg.get("external_writes") is True
-        for cfg in registry.get("integrations", {}).values()),
+        evaluate_integration_capability(registry, integration=name, phase="execute").allowed
+        for name in registry.get("integrations", {})),
     # Estimate follow-up is grounded in the linked customer's recorded authority,
     # an explicit channel/time fact, and the fixture's numeric send budget.
     "customer-approved timing and channel": lambda facts, world, case, registry, origin_failures: (
