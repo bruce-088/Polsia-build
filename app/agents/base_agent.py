@@ -183,6 +183,7 @@ CONTEXT:
             )
         command = [
             "claude", "-p", prompt, "--output-format", "json",
+            "--model", "claude-sonnet-5-5",
             "--json-schema", json.dumps(schema, separators=(",", ":")),
         ]
         try:
