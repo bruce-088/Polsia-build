@@ -403,3 +403,39 @@ async def test_pending_dispatch_with_different_message_content_does_not_reconcil
     reviewed = await resume(db, approval, adapter)
     assert reviewed.payload["event_type"] == "failure_detected"
     assert "unfinished dispatch differs" in reviewed.payload["error"]
+
+
+@pytest.mark.asyncio
+async def test_modified_correction_with_hard_deny_flag_is_validated_before_reconciling(async_db_session):
+    """S2P13-R29-01: a founder correction that keeps action/state/message
+    identical to an already-executed, unrelated direct dispatch but adds a
+    hard-denied policy flag must still be rejected by policy evaluation --
+    the reconciliation shortcut must never bypass validation of the
+    founder's OWN effective decision in favor of reusing a ledger entry."""
+    db = async_db_session
+    _, instance = await setup(db, initial_state="scored")
+    adapter = SyntheticAdapter(eligible_world(), "mail")
+    outreach = native(
+        action="send_outreach", state="sent", risk="YELLOW",
+        integration={"name": "sandbox_mail", "phase": "execute", "use": "acquisition_email"},
+        limit_name="max_discount_percent", requested_total=20,
+    )
+    requested = await invoke(db, instance, outreach, adapter=adapter, key="delivery-a")
+    approval = await db.scalar(select(CompanyOSSandboxApproval).where(
+        CompanyOSSandboxApproval.request_event_id == requested.id))
+    # An already-executed direct dispatch, identical action/state/message.
+    record = adapter.world.prepare_dispatch(
+        message_key="direct-same-everything", recipient_id=instance.entity_id, adapter_kind="mail",
+        adapter_idempotency_key="direct-same-everything-key",
+        origin_workflow_instance_id=instance.id, origin_state_before=instance.current_state,
+        origin_workflow_version=instance.version, frozen_native_decision=outreach,
+        rendered_payload={}, consumers={},
+    )
+    record.update(status="executed", receipt="sandbox://mail/same-everything-receipt")
+    register_consumer(record, instance, outreach, approval_id=None)
+    corrected = deepcopy(outreach)
+    corrected["policy_intent"]["policy_flags"] = ["bypass_opt_out"]
+    await resolve(db, approval, "modified", corrected_decision=corrected)
+    blocked = await resume(db, approval, adapter)
+    assert blocked.payload["event_type"] == "failure_detected"
+    assert "cannot override policy block" in blocked.payload["error"]

@@ -43,7 +43,6 @@ from app.services.company_os_sandbox_coordinator import (
     SyntheticAdapter,
     _append,
     _compliance_event,
-    _reconcile_event,
     _review_event,
     _validate_native,
 )
@@ -269,32 +268,17 @@ async def resume_sandbox_approval(
                 or retargeted_onto_direct):
             pending[0].world.review_blocked_recipients.add(pending[1]["recipient_id"])
             return await _record_review("unfinished dispatch differs from approved action; recipient requires review")
-        effective = deepcopy(pending[1]["consumers"][instance.id]["consumer_decision"])
-        if pending[1]["status"] == "executed":
-            changes_draft = (approval.status == "modified"
-                              and effective.get("drafted_content") != original.get("drafted_content"))
-            if changes_draft and effective.get("drafted_content") is not None:
-                run = await db.get(CompanyOSSandboxRun, instance.sandbox_run_id)
-                world = find_world_for_run(synthetic_adapters, run.run_id)
-                draft_error = validate_drafted_content_template(effective["drafted_content"], world)
-                if draft_error is not None:
-                    return await _record_review(draft_error)
-            event = await _reconcile_event(
-                db, instance, instance.version, resume_key, event_schema, workflow,
-                request.payload["evidence_refs"], pending[1], snapshot, canonical_agents,
-                canonical_handoffs, canonical_actions,
-                approval={"decision_id": approval.decision_id, "status": approval.status},
-                autonomy_class=approval.autonomy_class, original=original,
-                extra_metadata={"founder_id": approval.founder_id,
-                                "approval_request_event_id": request.event_id,
-                                **({"founder_corrected_decision": effective} if approval.status == "modified" else {})},
-                suppress_draft_ref=not changes_draft,
-                draft_content_source=(effective if changes_draft else None),
-            )
-            approval.resume_event_id = event.id
-            approval.resume_key = resume_key
-            await db.flush()
-            return event
+        # The founder's own `effective` decision stays authoritative -- it is
+        # NEVER discarded or replaced with the dispatch's frozen content, even
+        # though the physical-field match above confirms this ledger entry is
+        # safe to reuse. `effective` still has to pass every gate below
+        # (_validate_native, transition, policy, draft-template) exactly like
+        # a fresh resume would; only AFTER that does execute_dispatch's own
+        # `existing.status == "executed"` short-circuit (dispatch.py:256-260)
+        # reuse the receipt without re-sending. Reconciling via a shortcut
+        # here, before validation, let a correction's new policy flags or
+        # drafted_content be silently discarded in favor of already-validated
+        # (but now possibly stale) frozen content (S2P13-R29-01).
     receipt: str | None = None
     transition = None
     integration = None
