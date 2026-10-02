@@ -18,6 +18,7 @@ from app.agents.company_os_stage2_provider import (
     CompanyOSMalformedOutputError,
     CompanyOSTransportError,
     OwnerRoutedProvider,
+    stage2_decision,
 )
 from app.config import settings
 from app.models.company_os_sandbox import CompanyOSSandboxApproval, CompanyOSSandboxEvent
@@ -1881,3 +1882,61 @@ async def test_stage2_real_structured_path_types_mocked_transport_results(monkey
                "canonical_agents": ["email_outreach"], "canonical_handoffs": ["orchestrator"]}
     with pytest.raises(error):
         await BasePolsiaAgent().run_company_os_stage2_decision({}, context)
+
+
+def _record_provider_context(provider):
+    seen = []
+    original = provider.prepare
+
+    def prepare(context):
+        seen.append(deepcopy(context.get("prior_founder_resolutions", "<absent>")))
+        return original(context)
+    provider.prepare = prepare
+    return seen
+
+
+@pytest.mark.parametrize("status", ["approved", "rejected", "expired", "cancelled"])
+async def test_provider_sees_resolved_founder_history_on_next_decision(async_db_session, status):
+    provider = DeterministicMockProvider({"one": [native("pricing_change", "research", "RED"), native("finish", "done")]})
+    seen = _record_provider_context(provider)
+    r = Run(async_db_session, [], controls=approval_controls(), corrections=[resolution(status)], provider=provider)
+    await r.run()
+    assert seen == [[], [{"decision_id": "D", "action": "pricing_change", "status": status}]]
+
+
+async def test_pending_founder_request_is_not_listed_as_resolved(async_db_session):
+    r = Run(async_db_session, [native("pricing_change", "research", "RED"), native("finish", "done")],
+            controls=approval_controls(), corrections=[resolution("rejected")])
+    await r.run()
+    row = await async_db_session.scalar(select(CompanyOSSandboxApproval))
+    instance = SimpleNamespace(id=row.workflow_instance_id, sandbox_run_id=row.sandbox_run_id)
+    assert await harness.prior_approval_resolutions(async_db_session, instance) == [
+        {"decision_id": "D", "action": "pricing_change", "status": "rejected"}]
+    row.status = "pending"
+    await async_db_session.flush()
+    assert await harness.prior_approval_resolutions(async_db_session, instance) == []
+
+
+async def test_founder_history_stays_out_of_persisted_snapshot_and_fingerprint(async_db_session):
+    r = Run(async_db_session, [native("pricing_change", "research", "RED"), native("finish", "done")],
+            controls=approval_controls(), corrections=[resolution("rejected")])
+    await r.run()
+    row = await async_db_session.scalar(select(CompanyOSSandboxApproval))
+    assert "prior_founder_resolutions" not in row.input_snapshot
+    context = await harness.evidence_context(r.pack["cases"][0], [], r.world, REGISTRY, async_db_session)
+    assert "prior_founder_resolutions" not in context
+
+
+async def test_stage2_prompt_carries_founder_history_and_no_repeat_instruction():
+    history = [{"decision_id": "D", "action": "pricing_change", "status": "rejected"}]
+    context = {"workflow": WORKFLOW, "canonical_actions": ACTIONS, "canonical_agents": ["email_outreach"],
+               "canonical_handoffs": ["orchestrator"], "prior_founder_resolutions": history}
+    prompts = []
+
+    def transport(prompt, schema):
+        prompts.append(prompt)
+        return native(), "raw"
+    agent = SimpleNamespace(agent_type="email_outreach", company_os_instructions="instructions")
+    await stage2_decision(agent, {"case_id": "one"}, context, structured_transport=transport)
+    assert '"prior_founder_resolutions": [{"decision_id": "D", "action": "pricing_change", "status": "rejected"}]' in prompts[0]
+    assert "do not request that same action again" in prompts[0]

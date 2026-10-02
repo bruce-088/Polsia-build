@@ -84,7 +84,9 @@ async def stage2_decision(agent, task: dict, context: dict, *, structured_transp
                   "this action genuinely needs verified consent/authority; set limit_name and requested_total only "
                   "when a policy limit genuinely bounds this action's full size; set policy_flags to any policy "
                   "labels this action genuinely matches. Never claim a mode, limit, or flag unsupported by the "
-                  "supplied evidence. Return only the schema object.\n"
+                  "supplied evidence. If prior_founder_resolutions shows an action was rejected, expired or "
+                  "cancelled, do not request that same action again; choose a different permitted action or "
+                  "finish. Return only the schema object.\n"
                   + json.dumps({"task": task, "context": context}, allow_nan=False))
         if structured_transport is None:
             payload, raw = agent._run_claude_structured(prompt, schema, stage2_errors=True)

@@ -755,6 +755,15 @@ async def decision_fingerprint(case: dict, consumed: list, world: SyntheticWorld
     return hashlib.sha256(json.dumps(relevant, sort_keys=True, default=str).encode()).hexdigest()
 
 
+async def prior_approval_resolutions(db: AsyncSession, instance) -> list[dict]:
+    rows = await db.scalars(select(CompanyOSSandboxApproval).where(
+        CompanyOSSandboxApproval.workflow_instance_id == instance.id,
+        CompanyOSSandboxApproval.sandbox_run_id == instance.sandbox_run_id,
+        CompanyOSSandboxApproval.status != "pending",
+    ).order_by(CompanyOSSandboxApproval.id))
+    return [{"decision_id": r.decision_id, "action": r.action, "status": r.status} for r in rows]
+
+
 @dataclass
 class _Case:
     source: dict
@@ -1073,6 +1082,9 @@ class _Runner:
             snapshot["primary_classification"] = CLASSIFICATIONS[state.source["workflow_id"]]
             if attempt.get("decision_id"):
                 snapshot["approval_decision_id"] = attempt["decision_id"]
+            # Provider-only: added after the snapshot copy so the coordinator's
+            # synthetic_input, persisted input_snapshot and replay stay unchanged.
+            context["prior_founder_resolutions"] = await prior_approval_resolutions(self.db, state.instance)
             if attempt.get("scripted_failure"):
                 sentinel = ScriptedProviderTimeout("fixture-scripted provider timeout")
 
