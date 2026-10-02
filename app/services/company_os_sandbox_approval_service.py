@@ -240,12 +240,13 @@ async def resume_sandbox_approval(
         frozen = pending_consumer["consumer_decision"]
         frozen_integration = frozen.get("integration") or {}
         approved_integration = effective.get("integration") or {}
-        # The integration comparison must include the actual message content
-        # (template_id/fills), not just name/phase/use -- otherwise a founder
-        # correction that changes only the message could still reconcile
-        # against an unrelated pending dispatch (same action/state/integration
-        # identity) carrying the OLD content, misattributing what was actually
-        # sent. policy_intent is deliberately excluded: fields like limit_name/
+        # The integration comparison must include scope and the actual message
+        # content (template_id/fills), not just name/phase/use -- otherwise a
+        # founder correction that changes only the scope or message could
+        # still reconcile against an unrelated pending dispatch (same action/
+        # state/integration identity) carrying OLD content or a DIFFERENT
+        # scope, misattributing what was actually sent/authorized.
+        # policy_intent is deliberately excluded: fields like limit_name/
         # requested_total legitimately differ between how an action was
         # escalated for founder approval and a plain direct attempt of the
         # same physical send -- they describe why escalation happened, not
@@ -264,7 +265,7 @@ async def resume_sandbox_approval(
         if (any(frozen.get(k) != effective.get(k) for k in ("action", "state_after"))
                 or not isinstance(approved_integration, dict)
                 or any(frozen_integration.get(k) != approved_integration.get(k)
-                       for k in ("name", "phase", "use", "message"))
+                       for k in ("name", "phase", "use", "scope", "message"))
                 or retargeted_onto_direct):
             pending[0].world.review_blocked_recipients.add(pending[1]["recipient_id"])
             return await _record_review("unfinished dispatch differs from approved action; recipient requires review")
