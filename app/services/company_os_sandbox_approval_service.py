@@ -237,12 +237,24 @@ async def resume_sandbox_approval(
     except SyntheticCapabilityError as exc:
         return await _record_review(str(exc))
     if pending:
-        frozen = pending[1]["consumers"][instance.id]["consumer_decision"]
+        pending_consumer = pending[1]["consumers"][instance.id]
+        frozen = pending_consumer["consumer_decision"]
         frozen_integration = frozen.get("integration") or {}
         approved_integration = effective.get("integration") or {}
+        # A modified correction that retargets the action must never be allowed to
+        # "launder" an unrelated direct (approval_id=None) dispatch into its own
+        # resume -- that dispatch was never gated by this approval's own policy
+        # checks. Only a direct dispatch matching the approval's ORIGINAL,
+        # uncorrected action is a legitimate same-lineage reconciliation target.
+        retargeted_onto_direct = (
+            pending_consumer.get("approval_id") is None
+            and approval.status == "modified"
+            and effective.get("action") != original.get("action")
+        )
         if (any(frozen.get(k) != effective.get(k) for k in ("action", "state_after"))
                 or not isinstance(approved_integration, dict)
-                or any(frozen_integration.get(k) != approved_integration.get(k) for k in ("name", "phase", "use"))):
+                or any(frozen_integration.get(k) != approved_integration.get(k) for k in ("name", "phase", "use"))
+                or retargeted_onto_direct):
             pending[0].world.review_blocked_recipients.add(pending[1]["recipient_id"])
             return await _record_review("unfinished dispatch differs from approved action; recipient requires review")
         effective = deepcopy(pending[1]["consumers"][instance.id]["consumer_decision"])

@@ -461,6 +461,11 @@ def _validate_native(
                 raise SandboxCoordinatorError("native integration message is invalid")
         if request["phase"] == "execute" and request.get("use") in EMAIL_USES and "message" not in request:
             raise SandboxCoordinatorError("email execution requires template_id and fills")
+        if native.get("drafted_content") is not None and request["phase"] == "execute":
+            raise SandboxCoordinatorError(
+                "drafted_content cannot coexist with an execute-phase integration -- "
+                "drafted_content is evidence for a later send, never the send itself"
+            )
 
 
 async def _append(

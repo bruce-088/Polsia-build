@@ -86,9 +86,10 @@ async def test_resolution_and_resume_copy_never_mint_their_own_duplicate_ref(asy
     db = async_db_session
     _, instance = await setup(db, initial_state="scored")
     adapter = Adapter()
+    # Pure policy-limit escalation (no integration at all) -- drafted_content
+    # cannot coexist with an execute-phase integration (S2P13-R27-02).
     output = {**native(
-        action="send_outreach", state="sent", risk="YELLOW",
-        integration={"name": "sandbox_mail", "phase": "execute", "use": "acquisition_email"},
+        action="score_against_icp", state="scored", risk="YELLOW",
         limit_name="max_discount_percent", requested_total=20,
     ), "drafted_content": deepcopy(DRAFT)}
     requested = await invoke(db, instance, output, adapter=adapter)
@@ -110,8 +111,7 @@ async def test_founder_correction_mints_a_fresh_ref_distinct_from_the_original(a
     _, instance = await setup(db, initial_state="scored")
     adapter = Adapter()
     output = {**native(
-        action="send_outreach", state="sent", risk="YELLOW",
-        integration={"name": "sandbox_mail", "phase": "execute", "use": "acquisition_email"},
+        action="score_against_icp", state="scored", risk="YELLOW",
         limit_name="max_discount_percent", requested_total=20,
     ), "drafted_content": deepcopy(DRAFT)}
     requested = await invoke(db, instance, output, adapter=adapter)
@@ -135,8 +135,7 @@ async def test_resume_rejects_corrected_draft_with_unknown_template(async_db_ses
     _, instance = await setup(db, initial_state="scored")
     adapter = Adapter()
     output = {**native(
-        action="send_outreach", state="sent", risk="YELLOW",
-        integration={"name": "sandbox_mail", "phase": "execute", "use": "acquisition_email"},
+        action="score_against_icp", state="scored", risk="YELLOW",
         limit_name="max_discount_percent", requested_total=20,
     ), "drafted_content": deepcopy(DRAFT)}
     requested = await invoke(db, instance, output, adapter=adapter)
@@ -149,6 +148,26 @@ async def test_resume_rejects_corrected_draft_with_unknown_template(async_db_ses
     assert failure.payload["event_type"] == "failure_detected"
     assert "drafted_content" in failure.payload["error"]
     assert own_ref(failure) not in failure.payload.get("evidence_refs", [])
+
+
+@pytest.mark.asyncio
+async def test_drafted_content_cannot_coexist_with_an_execute_phase_integration(async_db_session):
+    """S2P13-R27-02: a decision must never claim drafted_content as evidence for
+    content while a DIFFERENT execute-phase integration.message is what actually
+    gets sent -- the two could silently diverge (e.g. a founder correcting one
+    but not the other). drafted_content is evidence for a later send, never the
+    send itself."""
+    _, instance = await setup(async_db_session, initial_state="scored")
+    output = native(
+        action="send_outreach", state="sent", risk="YELLOW",
+        integration={"name": "sandbox_mail", "phase": "execute", "use": "acquisition_email"},
+        limit_name="max_discount_percent", requested_total=20,
+    )
+    output["drafted_content"] = deepcopy(DRAFT)
+    event = await invoke(async_db_session, instance, output, adapter=Adapter())
+    assert event.payload["metadata"]["gate"] == "contract"
+    assert event.payload["result"] == "failed"
+    assert "drafted_content" in event.payload["error"]
 
 
 # --- Decision B: literal action checked alongside action_type ---------------
@@ -305,3 +324,46 @@ async def test_closed_competing_approvals_prepared_dispatch_does_not_block_resum
     )
     assert pending is None
     assert instance.entity_id not in world.review_blocked_recipients
+
+
+@pytest.mark.asyncio
+async def test_modified_correction_cannot_launder_an_unrelated_direct_dispatch(async_db_session):
+    """S2P13-R27-01: a founder correction that retargets the action must never be
+    allowed to reconcile against an unrelated, already-executed direct dispatch
+    for a DIFFERENT original action -- that dispatch was never gated by this
+    approval's own policy/transition checks, and the early reconciliation branch
+    bypasses them entirely."""
+    db = async_db_session
+    _, instance = await setup(db, initial_state="scored")
+    adapter = SyntheticAdapter(eligible_world(), "mail")
+    outreach = native(
+        action="send_outreach", state="sent", risk="YELLOW",
+        integration={"name": "sandbox_mail", "phase": "execute", "use": "acquisition_email"},
+        limit_name="max_discount_percent", requested_total=20,
+    )
+    requested = await invoke(db, instance, outreach, adapter=adapter, key="delivery-a")
+    approval = await db.scalar(select(CompanyOSSandboxApproval).where(
+        CompanyOSSandboxApproval.request_event_id == requested.id))
+    # An unrelated, already-executed direct send for a DIFFERENT action, same recipient.
+    followup = native(
+        action="send_followup", state="sent", risk="YELLOW",
+        integration={"name": "sandbox_mail", "phase": "execute", "use": "acquisition_email"},
+    )
+    record = adapter.world.prepare_dispatch(
+        message_key="direct-followup", recipient_id=instance.entity_id, adapter_kind="mail",
+        adapter_idempotency_key="direct-followup-key",
+        origin_workflow_instance_id=instance.id, origin_state_before=instance.current_state,
+        origin_workflow_version=instance.version, frozen_native_decision=followup,
+        rendered_payload={}, consumers={},
+    )
+    record.update(status="executed", receipt="sandbox://mail/direct-followup-receipt")
+    register_consumer(record, instance, followup, approval_id=None)
+    corrected = {**outreach, "action": "send_followup"}
+    await resolve_sandbox_approval(
+        db, approval_id=approval.id, status="modified", founder_id="founder-1",
+        founder_minutes=2.5, resolution_key="resolve-1", event_schema=EVENT_SCHEMA,
+        workflow=WORKFLOW, corrected_decision=corrected,
+    )
+    reviewed = await resume(db, approval, adapter)
+    assert reviewed.payload["event_type"] == "failure_detected"
+    assert "unfinished dispatch differs" in reviewed.payload["error"]
