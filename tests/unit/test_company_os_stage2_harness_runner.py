@@ -1920,11 +1920,15 @@ async def test_pending_founder_request_is_not_listed_as_resolved(async_db_sessio
 async def test_founder_history_stays_out_of_persisted_snapshot_and_fingerprint(async_db_session):
     r = Run(async_db_session, [native("pricing_change", "research", "RED"), native("finish", "done")],
             controls=approval_controls(), corrections=[resolution("rejected")])
+    case = r.pack["cases"][0]
+    before = await harness.decision_fingerprint(case, [], r.world, REGISTRY, async_db_session)
     await r.run()
     row = await async_db_session.scalar(select(CompanyOSSandboxApproval))
+    assert row.status == "rejected"
     assert "prior_founder_resolutions" not in row.input_snapshot
-    context = await harness.evidence_context(r.pack["cases"][0], [], r.world, REGISTRY, async_db_session)
+    context = await harness.evidence_context(case, [], r.world, REGISTRY, async_db_session)
     assert "prior_founder_resolutions" not in context
+    assert await harness.decision_fingerprint(case, [], r.world, REGISTRY, async_db_session) == before
 
 
 async def test_stage2_prompt_carries_founder_history_and_no_repeat_instruction():
