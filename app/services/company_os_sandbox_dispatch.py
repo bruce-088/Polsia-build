@@ -261,6 +261,7 @@ async def execute_dispatch(
                 frozen_int = record["frozen_native_decision"].get("integration") or {}
                 approved_int = native.get("integration") or {}
                 if (record["frozen_native_decision"].get("action") != native.get("action")
+                        or record["frozen_native_decision"].get("state_after") != native.get("state_after")
                         or any(frozen_int.get(k) != approved_int.get(k)
                                for k in ("name", "phase", "use", "scope", "message"))):
                     world.review_blocked_recipients.add(record["recipient_id"])

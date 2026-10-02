@@ -534,6 +534,55 @@ async def test_queue_item_executed_dispatch_receipt_rejected_on_approval_resume_
 
 
 @pytest.mark.asyncio
+async def test_queue_item_executed_dispatch_receipt_rejected_on_approval_resume_state_after_mismatch(async_db_session):
+    """S2P13-R31-01 (state_after parity): the R31-01 guard must also check state_after,
+    matching the parallel guard in approval_service. A frozen dispatch with state_after='scored'
+    (no-op transition) and an approval with state_after='sent' share the same action and all
+    integration fields, but differ on state_after -- the receipt must be rejected."""
+    db = async_db_session
+    _, instance = await setup(db, initial_state="scored")
+    adapter = SyntheticAdapter(eligible_world(), "mail")
+    outreach = native(
+        action="send_outreach", state="sent", risk="YELLOW",
+        integration={"name": "sandbox_mail", "phase": "execute", "use": "acquisition_email"},
+        limit_name="max_discount_percent", requested_total=20,
+    )
+    requested = await invoke(db, instance, outreach, adapter=adapter, key="delivery-a")
+    approval = await db.scalar(select(CompanyOSSandboxApproval).where(
+        CompanyOSSandboxApproval.request_event_id == requested.id))
+
+    # Frozen dispatch carries state_after="scored" (same state, no transition) but
+    # otherwise identical action and integration to the approval's decision.
+    noop_decision = deepcopy(outreach)
+    noop_decision["state_after"] = "scored"
+    record = adapter.world.prepare_dispatch(
+        message_key="queue-item-r31-state", recipient_id=instance.entity_id, adapter_kind="mail",
+        adapter_idempotency_key="queue-item-r31-state-key",
+        origin_workflow_instance_id=instance.id, origin_state_before=instance.current_state,
+        origin_workflow_version=instance.version, frozen_native_decision=noop_decision,
+        rendered_payload={}, consumers={},
+        origin_workflow_id=instance.workflow_id, origin_entity_id=instance.entity_id,
+    )
+    record.update(status="executed", receipt="sandbox://mail/noop-state-receipt")
+    adapter.world.queue["io-r31-state"] = {
+        "item_id": "io-r31-state", "entity_id": "io-r31-state",
+        "recipient_id": instance.entity_id,
+        "origin_workflow_id": instance.workflow_id,
+        "origin_entity_id": instance.entity_id,
+        "original_action": "send_outreach",
+        "workflow_id": "integration_failure_recovery",
+        "status": "queued",
+        "dispatch_id": record["dispatch_id"],
+        "original_adapter_key": None,
+    }
+
+    await resolve(db, approval)  # plain approval, effective=original, state_after="sent"
+    result = await resume(db, approval, adapter)
+    assert result.payload["event_type"] == "failure_detected"
+    assert "queued dispatch receipt mismatch" in result.payload["error"]
+
+
+@pytest.mark.asyncio
 async def test_rolled_back_approval_with_executed_dispatch_blocks_direct_coordinator_reconciliation(async_db_session):
     """S2P13-R31-02: if a resolve+resume transaction rolls back, the approval row
     reverts to 'pending' but the world retains the executed dispatch. A later direct
