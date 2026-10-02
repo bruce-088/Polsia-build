@@ -22,7 +22,11 @@ from app.agents.company_os_integration import (
     evaluate_integration_capability,
     validate_integration_registry,
 )
-from app.agents.company_os_policy import CompanyOSPolicyError, evaluate_action_policy
+from app.agents.company_os_policy import (
+    CompanyOSPolicyError,
+    evaluate_action_policy,
+    trusted_action_type_vocabulary,
+)
 from app.agents.company_os_workflow import (
     CompanyOSWorkflowError,
     require_valid_transition,
@@ -53,6 +57,8 @@ from app.services.company_os_sandbox_dispatch import (
 from app.services.company_os_synthetic_adapters import (
     SyntheticCapabilityError,
     SyntheticComplianceBlock,
+    find_world_for_run,
+    validate_drafted_content_template,
 )
 
 STATUSES = {
@@ -131,6 +137,7 @@ async def resolve_sandbox_approval(
         integration=None, category="founder_resolution", error=None,
         autonomy_class=autonomy, founder_minutes=founder_minutes,
         metadata_extra={"founder_id": founder_id, **({"corrected_decision": corrected_decision} if corrected_decision is not None else {})},
+        suppress_draft_ref=True,
     )
     approval.status = status
     approval.founder_id = founder_id
@@ -215,7 +222,7 @@ async def resume_sandbox_approval(
         return event
 
     try:
-        pending = await find_dispatch(db, instance, synthetic_adapters, approval_id=approval.id, snapshot=snapshot, registry=integration_registry)
+        pending = await find_dispatch(db, instance, synthetic_adapters, approval_id=approval.id, snapshot=snapshot, registry=integration_registry, action=effective.get("action"))
     except DispatchBlocked as exc:
         event = await _compliance_event(
             db, instance, instance.version, f"{resume_key}:failure:{approval.failure_attempt_count + 1}",
@@ -240,6 +247,14 @@ async def resume_sandbox_approval(
             return await _record_review("unfinished dispatch differs from approved action; recipient requires review")
         effective = deepcopy(pending[1]["consumers"][instance.id]["consumer_decision"])
         if pending[1]["status"] == "executed":
+            changes_draft = (approval.status == "modified"
+                              and effective.get("drafted_content") != original.get("drafted_content"))
+            if changes_draft and effective.get("drafted_content") is not None:
+                run = await db.get(CompanyOSSandboxRun, instance.sandbox_run_id)
+                world = find_world_for_run(synthetic_adapters, run.run_id)
+                draft_error = validate_drafted_content_template(effective["drafted_content"], world)
+                if draft_error is not None:
+                    return await _record_review(draft_error)
             event = await _reconcile_event(
                 db, instance, instance.version, resume_key, event_schema, workflow,
                 request.payload["evidence_refs"], pending[1], snapshot, canonical_agents,
@@ -249,6 +264,8 @@ async def resume_sandbox_approval(
                 extra_metadata={"founder_id": approval.founder_id,
                                 "approval_request_event_id": request.event_id,
                                 **({"founder_corrected_decision": effective} if approval.status == "modified" else {})},
+                suppress_draft_ref=not changes_draft,
+                draft_content_source=(effective if changes_draft else None),
             )
             approval.resume_event_id = event.id
             approval.resume_key = resume_key
@@ -259,8 +276,17 @@ async def resume_sandbox_approval(
     integration = None
     reason: str | None = None
     failure_category = "approval_resume"
+    changes_draft = False
     try:
         _validate_native(effective, instance, workflow, canonical_agents, canonical_handoffs, canonical_actions)
+        changes_draft = (approval.status == "modified"
+                          and effective.get("drafted_content") != original.get("drafted_content"))
+        if changes_draft and effective.get("drafted_content") is not None:
+            run = await db.get(CompanyOSSandboxRun, instance.sandbox_run_id)
+            world = find_world_for_run(synthetic_adapters, run.run_id)
+            draft_error = validate_drafted_content_template(effective["drafted_content"], world)
+            if draft_error is not None:
+                raise SandboxApprovalError(draft_error)
         if effective["state_after"] != instance.current_state:
             transition = require_valid_transition(
                 workflow, current_state=instance.current_state,
@@ -275,10 +301,11 @@ async def resume_sandbox_approval(
             intent["authority_verified"] = snapshot.get("authority_verified") is True
         if intent.get("requires_consent"):
             intent["consent_verified"] = snapshot.get("consent_verified") is True
-        if intent.get("action_type") != effective["action"] or intent.get("risk_level") != effective["risk_level"]:
+        if (intent.get("action_type") not in trusted_action_type_vocabulary(policy, effective["action"])
+                or intent.get("risk_level") != effective["risk_level"]):
             raise SandboxApprovalError("corrected policy intent mismatches action or risk")
         intent["founder_approval_status"] = "approved"
-        policy_result = evaluate_action_policy(intent, policy)
+        policy_result = evaluate_action_policy(intent, policy, effective["action"])
         if policy_result.disposition != "allow":
             raise SandboxApprovalError("founder resolution cannot override policy block")
         request_integration = effective["integration"]
@@ -359,6 +386,7 @@ async def resume_sandbox_approval(
             integration=integration, category=failure_category, error=reason,
             autonomy_class=approval.autonomy_class, founder_minutes=0,
             metadata_extra={**dispatch_metadata, "approval_id": approval.id, "attempt": approval.failure_attempt_count + 1},
+            suppress_draft_ref=True,
         )
         approval.last_failure_event_id = event.id
         approval.failure_attempt_count += 1
@@ -381,6 +409,8 @@ async def resume_sandbox_approval(
             compliance=compliance_evidence,
             metadata_extra={**dispatch_metadata, "founder_id": approval.founder_id, "approval_request_event_id": request.event_id,
                             **({"founder_corrected_decision": effective} if approval.status == "modified" else {})},
+            suppress_draft_ref=not changes_draft,
+            draft_content_source=(effective if changes_draft else None),
         )
         approval.resume_event_id = event.id
         approval.resume_key = resume_key

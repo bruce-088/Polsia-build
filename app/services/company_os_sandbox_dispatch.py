@@ -18,7 +18,7 @@ from app.agents.company_os_compliance import (
     registered_channel,
     render_message,
 )
-from app.models.company_os_sandbox import CompanyOSSandboxEvent, CompanyOSSandboxRun
+from app.models.company_os_sandbox import CompanyOSSandboxApproval, CompanyOSSandboxEvent, CompanyOSSandboxRun
 from app.services.company_os_synthetic_adapters import (
     SyntheticCapabilityError,
     SyntheticComplianceBlock,
@@ -55,7 +55,7 @@ async def consumer_events(db, instance) -> list[CompanyOSSandboxEvent]:
     )))
 
 
-async def find_dispatch(db, instance, adapters, *, approval_id=None, snapshot=None, registry=None):
+async def find_dispatch(db, instance, adapters, *, approval_id=None, snapshot=None, registry=None, action=None):
     events = await consumer_events(db, instance)
     run = await db.get(CompanyOSSandboxRun, instance.sandbox_run_id)
     candidates = []
@@ -65,12 +65,40 @@ async def find_dispatch(db, instance, adapters, *, approval_id=None, snapshot=No
         if not isinstance(world, SyntheticWorld) or world.run_id != run.run_id or id(world) in seen:
             continue
         seen.add(id(world))
-        for record in world.dispatches.values():
-            if record["status"] == "blocked":
-                continue
-            consumer = record["consumers"].get(instance.id)
-            if not consumer or any(is_completion(e, record["dispatch_id"]) for e in events):
-                continue
+        instance_records = [
+            (record, consumer)
+            for record in world.dispatches.values()
+            if record["status"] != "blocked"
+            and (consumer := record["consumers"].get(instance.id)) is not None
+            and not any(is_completion(e, record["dispatch_id"]) for e in events)
+        ]
+        my_recipient = None
+        if approval_id is not None and action is not None and snapshot is not None:
+            try:
+                my_recipient, _ = resolve_recipient(world, instance, snapshot, action)
+            except SyntheticComplianceBlock:
+                my_recipient = None  # cannot resolve my own target -- no additional scope to add
+        own_recipients = {
+            record["recipient_id"] for record, consumer in instance_records
+            if approval_id is None or consumer.get("approval_id") in (None, approval_id)
+        }
+        if my_recipient is not None:
+            own_recipients.add(my_recipient)
+        for record, consumer in instance_records:
+            other_id = consumer.get("approval_id")
+            # None means "no owning approval" (a direct send) -- reconcilable by any
+            # approval on this recipient, never a foreign-approval conflict. Only a
+            # different, concrete approval_id is a genuine competing claim.
+            if approval_id is not None and other_id is not None and other_id != approval_id:
+                if record["recipient_id"] not in own_recipients:
+                    continue  # unrelated recipient on this instance -- not a conflict
+                if record["status"] == "executed":
+                    world.review_blocked_recipients.add(record["recipient_id"])
+                    continue
+                other = await db.get(CompanyOSSandboxApproval, other_id)
+                if other is None or other.status in {"pending", "approved", "modified"}:
+                    raise SyntheticCapabilityError("conflicting_prepared_dispatch_pending_resolution")
+                continue  # other approval is terminal/closed -- its prepared dispatch is abandoned
             if (consumer["expected_state_before"] != instance.current_state
                     or consumer["expected_version"] != instance.version):
                 world.review_blocked_recipients.add(record["recipient_id"])

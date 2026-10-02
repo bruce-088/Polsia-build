@@ -23,7 +23,11 @@ from app.agents.company_os_integration import (
     evaluate_integration_capability,
     validate_integration_registry,
 )
-from app.agents.company_os_policy import CompanyOSPolicyError, evaluate_action_policy
+from app.agents.company_os_policy import (
+    CompanyOSPolicyError,
+    evaluate_action_policy,
+    trusted_action_type_vocabulary,
+)
 from app.agents.company_os_workflow import (
     CompanyOSWorkflowError,
     require_valid_transition,
@@ -48,6 +52,9 @@ from app.services.company_os_sandbox_service import append_sandbox_event
 from app.services.company_os_synthetic_adapters import (
     SyntheticCapabilityError,
     SyntheticComplianceBlock,
+    compute_ref,
+    find_world_for_run,
+    validate_drafted_content_template,
 )
 
 
@@ -204,6 +211,12 @@ async def coordinate_sandbox_action(
                              canonical_handoffs, canonical_actions)
         except SandboxCoordinatorError as exc:
             denial = ("contract", str(exc))
+        if denial is None and native.get("drafted_content") is not None:
+            run = await db.get(CompanyOSSandboxRun, instance.sandbox_run_id)
+            world = find_world_for_run(synthetic_adapters, run.run_id)
+            draft_error = validate_drafted_content_template(native["drafted_content"], world)
+            if draft_error is not None:
+                denial = ("contract", draft_error)
         if denial is None:
             if native["state_after"] != instance.current_state:
                 try:
@@ -230,11 +243,12 @@ async def coordinate_sandbox_action(
                 ) if transition else set()
                 if missing_requirements:
                     denial = ("transition", "canonical transition requirements lack evidence")
-                elif intent.get("action_type") != native["action"] or intent.get("risk_level") != native["risk_level"]:
+                elif (intent.get("action_type") not in trusted_action_type_vocabulary(policy, native["action"])
+                      or intent.get("risk_level") != native["risk_level"]):
                     denial = ("contract", "policy intent does not match native action and risk")
                 else:
                     try:
-                        decision = evaluate_action_policy(intent, policy)
+                        decision = evaluate_action_policy(intent, policy, native["action"])
                     except (CompanyOSPolicyError, TypeError, ValueError) as exc:
                         denial = ("policy", str(exc))
             if denial is None and decision is not None and decision.disposition == "block":
@@ -292,9 +306,18 @@ async def coordinate_sandbox_action(
             if outstanding is not None:
                 denial = ("approval", "action already has an unresolved founder request")
             else:
+                run = await db.get(CompanyOSSandboxRun, instance.sandbox_run_id)
+                prior_events = await db.scalars(select(CompanyOSSandboxEvent).where(
+                    CompanyOSSandboxEvent.workflow_instance_id == instance.id,
+                ).order_by(CompanyOSSandboxEvent.sequence))
+                merged_refs = list(evidence_refs)
+                for row in prior_events:
+                    own_ref = compute_ref(run.run_id, "input", f"draft:{row.event_id}")
+                    if own_ref in (row.payload.get("evidence_refs") or []) and own_ref not in merged_refs:
+                        merged_refs.append(own_ref)
                 event = await _append(
                 db, instance, expected_version, idempotency_key, event_schema,
-                workflow, evidence_refs, native, native_failure,
+                workflow, merged_refs, native, native_failure,
                 event_type="approval_requested", result="escalated",
                 risk="RED", action=native["action"], agent=native["agent_type"],
                 classification="approval_queue", state_after=instance.current_state,
@@ -391,13 +414,23 @@ async def coordinate_sandbox_action(
     )
 
 
+def validate_drafted_content_shape(value: Any) -> None:
+    if (not isinstance(value, dict) or set(value) != {"template_id", "fills"}
+            or not isinstance(value.get("template_id"), str) or not value["template_id"]
+            or not isinstance(value.get("fills"), dict)
+            or any(not isinstance(k, str) or not isinstance(v, str) for k, v in value["fills"].items())):
+        raise SandboxCoordinatorError("native drafted_content is invalid")
+
+
 def _validate_native(
     native: dict[str, Any], instance: CompanyOSWorkflowInstance,
     workflow: dict[str, Any], agents: list[str], handoffs: list[str], actions: list[str],
 ) -> None:
     required = {"action", "risk_level", "state_after", "agent_type", "handoff_to", "policy_intent", "integration"}
-    if native.keys() != required:
+    if not (required <= native.keys() <= required | {"drafted_content"}):
         raise SandboxCoordinatorError("native decision has missing or unexpected fields")
+    if native.get("drafted_content") is not None:
+        validate_drafted_content_shape(native["drafted_content"])
     if not all(isinstance(native[key], str) for key in ("action", "agent_type", "handoff_to", "risk_level", "state_after")):
         raise SandboxCoordinatorError("native action, owner, risk, and state must be strings")
     if native["action"] not in actions or native["agent_type"] not in agents or native["handoff_to"] not in handoffs:
@@ -440,9 +473,20 @@ async def _append(
     error: str | None, autonomy_class: str | None = None,
     founder_minutes: float = 0, metadata_extra: dict[str, Any] | None = None,
     compliance: dict[str, Any] | None = None,
+    suppress_draft_ref: bool = False, draft_content_source: dict[str, Any] | None = None,
 ) -> CompanyOSSandboxEvent:
+    event_id = str(uuid4())
+    content_source = draft_content_source if draft_content_source is not None else native
+    if (not suppress_draft_ref and content_source is not None
+            and content_source.get("drafted_content")
+            and result in {"escalated", "executed_in_sandbox", "observed"}):
+        run = await db.get(CompanyOSSandboxRun, instance.sandbox_run_id)
+        own_ref = compute_ref(run.run_id, "input", f"draft:{event_id}")
+        if own_ref not in refs:
+            refs = [*refs, own_ref]
+        metadata_extra = {**(metadata_extra or {}), "draft_content": content_source["drafted_content"]}
     payload = {
-        "schema_version": "0.1.0", "event_id": str(uuid4()),
+        "schema_version": "0.1.0", "event_id": event_id,
         "occurred_at": datetime.now(UTC).isoformat(),
         "primary_classification": classification,
         "workflow_id": instance.workflow_id, "entity_type": instance.entity_type,
@@ -504,6 +548,7 @@ async def _reconcile_event(
     db, instance, version, key, schema, workflow, refs, record, snapshot,
     agents, handoffs, actions, *, approval=None, autonomy_class=None,
     original=None, extra_metadata=None,
+    suppress_draft_ref: bool = True, draft_content_source: dict[str, Any] | None = None,
 ):
     native = deepcopy(record["consumers"][instance.id]["consumer_decision"])
     _validate_native(native, instance, workflow, agents, handoffs, actions)
@@ -527,6 +572,7 @@ async def _reconcile_event(
         approval=approval, integration=integration, category="reconciliation", error=None,
         autonomy_class=autonomy_class,
         metadata_extra={**metadata_for(record), "reconciled": True, **(extra_metadata or {})},
+        suppress_draft_ref=suppress_draft_ref, draft_content_source=draft_content_source,
     )
 
 

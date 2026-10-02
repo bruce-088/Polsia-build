@@ -58,8 +58,14 @@ def stage2_json_schema(context: dict) -> dict:
                                "type": "object", "required": ["template_id", "fills"], "additionalProperties": False,
                                "properties": {"template_id": string, "fills": {
                                    "type": "object", "additionalProperties": {"type": "string"}}}}}}]},
+        "drafted_content": {"anyOf": [{"type": "null"}, {
+            "type": "object", "additionalProperties": False,
+            "required": ["template_id", "fills"],
+            "properties": {"template_id": string, "fills": {
+                "type": "object", "additionalProperties": {"type": "string"}}}}]},
     }
-    return {"type": "object", "properties": properties, "required": list(properties), "additionalProperties": False}
+    required = [key for key in properties if key != "drafted_content"]
+    return {"type": "object", "properties": properties, "required": required, "additionalProperties": False}
 
 
 async def stage2_decision(agent, task: dict, context: dict, *, structured_transport=None) -> dict:
@@ -70,6 +76,9 @@ async def stage2_decision(agent, task: dict, context: dict, *, structured_transp
                   "Choose one native decision using only supplied evidence. Missing evidence stays missing. "
                   "Do not invent consent, authority, requirements, recipients or completion. "
                   "Messages use approved template_id and fills only. "
+                  "For any action that produces content ahead of a later execute-phase send, put that content in "
+                  "drafted_content (template_id and fills), not integration.message; leave integration null unless "
+                  "this action's own canonical transition declares one. "
                   "For any action whose integration.phase is \"execute\", set policy_intent.integration_mode to "
                   "that integration's actual registered mode; set requires_consent/requires_authority to whether "
                   "this action genuinely needs verified consent/authority; set limit_name and requested_total only "

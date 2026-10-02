@@ -671,9 +671,13 @@ def validate_pack(pack: dict, workflows: dict, corrections: list, registry: dict
             raise FixtureAuthoringError("manual evidence requires an executable status and sandbox reference")
         if (row["status"] == "modified") != (row.get("corrected_decision") is not None):
             raise FixtureAuthoringError("only modified resolution carries corrected_decision")
-        if row.get("corrected_decision") is not None and set(row["corrected_decision"]) != {
+        required_native_fields = {
             "action", "risk_level", "state_after", "agent_type", "handoff_to", "policy_intent", "integration"
-        }:
+        }
+        if row.get("corrected_decision") is not None and not (
+            required_native_fields <= set(row["corrected_decision"])
+            <= required_native_fields | {"drafted_content"}
+        ):
             raise FixtureAuthoringError("corrected decision must have the seven native fields")
         if row["status"] == "modified" and pack.get("infrastructure_only") is not True:
             intent = row["corrected_decision"].get("policy_intent")

@@ -27,6 +27,11 @@ class SyntheticComplianceBlock(SyntheticCapabilityError):
     """Defense-in-depth refusal; never an integration failure."""
 
 
+def compute_ref(run_id: str, category: str, key: str) -> str:
+    digest = hashlib.sha256(f"{run_id}:{category}:{key}".encode()).hexdigest()[:24]
+    return f"sandbox://{run_id}/{category}/{digest}"
+
+
 @dataclass
 class SyntheticWorld:
     """Run-scoped synthetic entities and immutable evidence references."""
@@ -66,8 +71,7 @@ class SyntheticWorld:
             raise SyntheticCapabilityError("sandbox mode required")
 
     def _ref(self, category: str, key: str) -> str:
-        digest = hashlib.sha256(f"{self.run_id}:{category}:{key}".encode()).hexdigest()[:24]
-        return f"sandbox://{self.run_id}/{category}/{digest}"
+        return compute_ref(self.run_id, category, key)
 
     def ingest_opt_out(self, facts: dict[str, Any]) -> None:
         """Retain every available identity, including unresolved STOP signals."""
@@ -241,6 +245,31 @@ class SyntheticWorld:
         if identity in self.action_failures:
             self.inject_failure(adapter_kind, adapter_key,
                                 after_effect=self.action_failures.pop(identity))
+
+
+def find_world_for_run(adapters: dict[str, Any], run_id: str) -> SyntheticWorld | None:
+    return next(
+        (getattr(a, "world", None) for a in adapters.values()
+         if isinstance(getattr(a, "world", None), SyntheticWorld)
+         and getattr(a, "world").run_id == run_id),
+        None,
+    )
+
+
+def validate_drafted_content_template(drafted_content: dict, world: SyntheticWorld | None) -> str | None:
+    """Fail closed: no trusted world, unknown/unapproved template, or unrenderable content."""
+    if world is None:
+        return "drafted_content requires a trusted template registry"
+    template = world.templates.get(drafted_content["template_id"])
+    if (template is None or not template.get("approved_at")
+            or template.get("revoked_at") is not None
+            or not template.get("subject_accuracy_verified")):
+        return "drafted_content references unapproved or unknown template"
+    try:
+        render_message(drafted_content, template, {}, {})
+    except ComplianceContentError as exc:
+        return f"drafted_content is not renderable: {exc}"
+    return None
 
 
 class SyntheticAdapter:

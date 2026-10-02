@@ -48,14 +48,25 @@ def _string_set(policy: dict[str, Any], field: str) -> set[str]:
     return set(value)
 
 
-def evaluate_action_policy(intent: dict[str, Any], policy: dict[str, Any]) -> PolicyDecision:
+def trusted_action_type_vocabulary(policy: dict[str, Any], action: str) -> set[str]:
+    """The literal action itself, plus every category this policy already treats as authoritative."""
+    return ({action} | _string_set(policy, "hard_denies")
+            | _string_set(policy, "non_approvable_blocks") | _string_set(policy, "red_action_types"))
+
+
+def evaluate_action_policy(intent: dict[str, Any], policy: dict[str, Any], action: str) -> PolicyDecision:
     """Evaluate one complete requested action without executing or repairing it.
 
     ``requested_total`` is the full action size. A caller may not submit only a
-    smaller first step to evade a configured bound.
+    smaller first step to evade a configured bound. ``action`` is the literal
+    action being taken -- checked alongside ``action_type`` so a decision cannot
+    evade a hard-deny or RED backstop by declaring a different, merely-trusted
+    category for the same literal action.
     """
     if not isinstance(intent, dict) or not isinstance(policy, dict):
         raise CompanyOSPolicyError("intent and policy must be objects")
+    if not isinstance(action, str) or not action:
+        raise CompanyOSPolicyError("action must be a non-empty string")
 
     action_type = intent.get("action_type")
     requested_risk = intent.get("risk_level")
@@ -73,8 +84,8 @@ def evaluate_action_policy(intent: dict[str, Any], policy: dict[str, Any]) -> Po
     flags = intent.get("policy_flags", [])
     if not isinstance(flags, list) or any(not isinstance(item, str) for item in flags):
         raise CompanyOSPolicyError("intent.policy_flags must be a list of strings")
-    matched_blocks = sorted({action_type, *flags} & (hard_denies | non_approvable))
-    effective_risk: RiskLevel = "RED" if action_type in red_actions else requested_risk
+    matched_blocks = sorted({action_type, action, *flags} & (hard_denies | non_approvable))
+    effective_risk: RiskLevel = "RED" if action_type in red_actions or action in red_actions else requested_risk
 
     if matched_blocks:
         return PolicyDecision(
@@ -128,9 +139,9 @@ def evaluate_action_policy(intent: dict[str, Any], policy: dict[str, Any]) -> Po
     return PolicyDecision("allow", effective_risk, requires_founder, tuple(reasons))
 
 
-def require_action_allowed(intent: dict[str, Any], policy: dict[str, Any]) -> PolicyDecision:
+def require_action_allowed(intent: dict[str, Any], policy: dict[str, Any], action: str) -> PolicyDecision:
     """Fail closed at an execution boundary unless the policy returns allow."""
-    decision = evaluate_action_policy(intent, policy)
+    decision = evaluate_action_policy(intent, policy, action)
     if decision.disposition != "allow":
         raise CompanyOSPolicyError(
             f"action is not authorized: {decision.disposition}: {', '.join(decision.reasons)}"
