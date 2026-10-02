@@ -475,3 +475,105 @@ async def test_pending_dispatch_with_different_integration_scope_does_not_reconc
     reviewed = await resume(db, approval, adapter)
     assert reviewed.payload["event_type"] == "failure_detected"
     assert "unfinished dispatch differs" in reviewed.payload["error"]
+
+
+@pytest.mark.asyncio
+async def test_queue_item_executed_dispatch_receipt_rejected_on_approval_resume_message_mismatch(async_db_session):
+    """S2P13-R31-01: an approval resume that reaches an already-executed queue-item
+    dispatch via execute_dispatch's queue path (bypassing find_dispatch, which only
+    returns candidates for dispatches that already have a consumer for this approval)
+    must reject the receipt if the approval's effective decision differs from the
+    frozen dispatch decision in message content."""
+    db = async_db_session
+    _, instance = await setup(db, initial_state="scored")
+    adapter = SyntheticAdapter(eligible_world(), "mail")
+    outreach = native(
+        action="send_outreach", state="sent", risk="YELLOW",
+        integration={"name": "sandbox_mail", "phase": "execute", "use": "acquisition_email"},
+        limit_name="max_discount_percent", requested_total=20,
+    )
+    requested = await invoke(db, instance, outreach, adapter=adapter, key="delivery-a")
+    approval = await db.scalar(select(CompanyOSSandboxApproval).where(
+        CompanyOSSandboxApproval.request_event_id == requested.id))
+
+    # Inject a queue item linked to this workflow/entity/action with an already-executed
+    # dispatch carrying the ORIGINAL message. find_dispatch returns None because no
+    # consumer for this approval_id has been registered yet; execute_dispatch's queue
+    # path finds the dispatch, registers the new consumer, and must compare before reuse.
+    original_decision = deepcopy(outreach)
+    original_decision["integration"]["message"] = deepcopy(DRAFT)
+    record = adapter.world.prepare_dispatch(
+        message_key="queue-item-r31-01", recipient_id=instance.entity_id, adapter_kind="mail",
+        adapter_idempotency_key="queue-item-r31-01-key",
+        origin_workflow_instance_id=instance.id, origin_state_before=instance.current_state,
+        origin_workflow_version=instance.version, frozen_native_decision=original_decision,
+        rendered_payload={}, consumers={},
+        origin_workflow_id=instance.workflow_id, origin_entity_id=instance.entity_id,
+    )
+    record.update(status="executed", receipt="sandbox://mail/original-r31-receipt")
+    # A recovery queue item whose dispatch is already executed; no consumer registered yet.
+    adapter.world.queue["io-r31-01"] = {
+        "item_id": "io-r31-01", "entity_id": "io-r31-01",
+        "recipient_id": instance.entity_id,
+        "origin_workflow_id": instance.workflow_id,
+        "origin_entity_id": instance.entity_id,
+        "original_action": "send_outreach",
+        "workflow_id": "integration_failure_recovery",
+        "status": "queued",
+        "dispatch_id": record["dispatch_id"],
+        "original_adapter_key": None,
+    }
+
+    # Approve with a correction that changes the fills -- different message from frozen.
+    corrected = deepcopy(outreach)
+    corrected["integration"]["message"] = {"template_id": "approved", "fills": {"name": "Someone Else"}}
+    await resolve(db, approval, "modified", corrected_decision=corrected)
+    result = await resume(db, approval, adapter)
+    assert result.payload["event_type"] == "failure_detected"
+    assert "queued dispatch receipt mismatch" in result.payload["error"]
+
+
+@pytest.mark.asyncio
+async def test_rolled_back_approval_with_executed_dispatch_blocks_direct_coordinator_reconciliation(async_db_session):
+    """S2P13-R31-02: if a resolve+resume transaction rolls back, the approval row
+    reverts to 'pending' but the world retains the executed dispatch. A later direct
+    coordinator call must not take the _reconcile_event path (recording completion
+    without founder gates). _awaiting_resume must return True for a 'pending' approval
+    bound to an executed dispatch."""
+    db = async_db_session
+    _, instance = await setup(db, initial_state="scored")
+    adapter = SyntheticAdapter(eligible_world(), "mail")
+    outreach = native(
+        action="send_outreach", state="sent", risk="YELLOW",
+        integration={"name": "sandbox_mail", "phase": "execute", "use": "acquisition_email"},
+        limit_name="max_discount_percent", requested_total=20,
+    )
+    # Escalate to create a pending approval.
+    requested = await invoke(db, instance, outreach, adapter=adapter, key="delivery-a")
+    approval = await db.scalar(select(CompanyOSSandboxApproval).where(
+        CompanyOSSandboxApproval.request_event_id == requested.id))
+    assert approval.status == "pending"
+
+    # Simulate the rollback: leave the approval as "pending" but inject an executed
+    # dispatch in the world with a consumer bound to this approval (as would exist in
+    # memory after a rolled-back resolve+resume that had already called execute_dispatch).
+    executed_record = adapter.world.prepare_dispatch(
+        message_key="rolledback-resume-dispatch", recipient_id=instance.entity_id, adapter_kind="mail",
+        adapter_idempotency_key="rolledback-resume-key",
+        origin_workflow_instance_id=instance.id, origin_state_before=instance.current_state,
+        origin_workflow_version=instance.version, frozen_native_decision=outreach,
+        rendered_payload={}, consumers={},
+    )
+    executed_record.update(status="executed", receipt="sandbox://mail/rolledback-receipt")
+    register_consumer(executed_record, instance, outreach, approval_id=approval.id)
+    await db.commit()
+
+    # Direct coordinator call -- before fix, _awaiting_resume returns False for a
+    # "pending" approval, so the coordinator takes _reconcile_event and records
+    # completion without founder gates. After fix, _awaiting_resume returns True and
+    # the coordinator correctly detects the outstanding unresolved approval.
+    result = await invoke(db, instance, outreach, adapter=adapter, key="delivery-b", version=0)
+    assert result.payload["result"] != "executed_in_sandbox", (
+        "direct reconciliation recorded completion without founder resolution"
+    )
+    assert "approval resume" in (result.payload.get("error") or "")

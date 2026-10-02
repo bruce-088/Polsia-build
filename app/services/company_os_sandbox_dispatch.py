@@ -251,6 +251,22 @@ async def execute_dispatch(
             if record["recipient_id"] != recipient or record["adapter_kind"] != adapter.kind:
                 raise SyntheticCapabilityError("queued dispatch identity differs")
             register_consumer(record, instance, native, approval_id=approval_id)
+            # An approval resume for a queue-bound item arrives here with no prior
+            # consumer entry (find_dispatch skips dispatches whose consumer set has no
+            # entry for the incoming approval_id). If the queue item's dispatch is
+            # already executed, verify the approval's decision against the frozen one
+            # before reusing its receipt -- the mismatch check in approval_service only
+            # fires on find_dispatch candidates, so this path has no other guard.
+            if approval_id is not None and record["status"] == "executed":
+                frozen_int = record["frozen_native_decision"].get("integration") or {}
+                approved_int = native.get("integration") or {}
+                if (record["frozen_native_decision"].get("action") != native.get("action")
+                        or any(frozen_int.get(k) != approved_int.get(k)
+                               for k in ("name", "phase", "use", "scope", "message"))):
+                    world.review_blocked_recipients.add(record["recipient_id"])
+                    raise SyntheticCapabilityError(
+                        "queued dispatch receipt mismatch: approved decision differs from executed dispatch"
+                    )
     if record is not None:
         metadata.update(metadata_for(record))
         if record["status"] == "executed":

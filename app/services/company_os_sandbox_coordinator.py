@@ -587,7 +587,11 @@ async def _awaiting_resume(db, instance, record) -> bool:
     approval_id = consumer.get("approval_id")
     if approval_id is not None:
         approval = await db.get(CompanyOSSandboxApproval, approval_id, populate_existing=True)
-        if approval is not None and approval.status in ("approved", "modified") and approval.resume_event_id is None:
+        # Block direct-path reconciliation for any unresolved, non-terminal approval,
+        # including "pending". A rolled-back resolve+resume transaction leaves the
+        # approval row as "pending" while the world retains the executed dispatch;
+        # treating that as safely reconcilable without founder gates is the R31-02 gap.
+        if approval is not None and approval.status in ("pending", "approved", "modified") and approval.resume_event_id is None:
             return True
     return await _has_unresumed_approval(db, instance, consumer["consumer_decision"]["action"])
 
