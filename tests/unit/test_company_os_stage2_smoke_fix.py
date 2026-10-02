@@ -367,3 +367,39 @@ async def test_modified_correction_cannot_launder_an_unrelated_direct_dispatch(a
     reviewed = await resume(db, approval, adapter)
     assert reviewed.payload["event_type"] == "failure_detected"
     assert "unfinished dispatch differs" in reviewed.payload["error"]
+
+
+@pytest.mark.asyncio
+async def test_pending_dispatch_with_different_message_content_does_not_reconcile(async_db_session):
+    """S2P13-R28-01: a pending dispatch matching on action/state/integration
+    identity but carrying DIFFERENT message content must not reconcile --
+    otherwise the resume event could attribute content that was never
+    actually sent to the founder's approval."""
+    db = async_db_session
+    _, instance = await setup(db, initial_state="scored")
+    adapter = SyntheticAdapter(eligible_world(), "mail")
+    outreach = native(
+        action="send_outreach", state="sent", risk="YELLOW",
+        integration={"name": "sandbox_mail", "phase": "execute", "use": "acquisition_email"},
+        limit_name="max_discount_percent", requested_total=20,
+    )
+    requested = await invoke(db, instance, outreach, adapter=adapter, key="delivery-a")
+    approval = await db.scalar(select(CompanyOSSandboxApproval).where(
+        CompanyOSSandboxApproval.request_event_id == requested.id))
+    # An unrelated direct send for the SAME action/state/integration identity
+    # but DIFFERENT message content.
+    different_content = deepcopy(outreach)
+    different_content["integration"]["message"] = {"template_id": "approved", "fills": {"name": "Someone Else"}}
+    record = adapter.world.prepare_dispatch(
+        message_key="direct-same-action", recipient_id=instance.entity_id, adapter_kind="mail",
+        adapter_idempotency_key="direct-same-action-key",
+        origin_workflow_instance_id=instance.id, origin_state_before=instance.current_state,
+        origin_workflow_version=instance.version, frozen_native_decision=different_content,
+        rendered_payload={}, consumers={},
+    )
+    record.update(status="executed", receipt="sandbox://mail/different-content-receipt")
+    register_consumer(record, instance, different_content, approval_id=None)
+    await resolve(db, approval)
+    reviewed = await resume(db, approval, adapter)
+    assert reviewed.payload["event_type"] == "failure_detected"
+    assert "unfinished dispatch differs" in reviewed.payload["error"]
