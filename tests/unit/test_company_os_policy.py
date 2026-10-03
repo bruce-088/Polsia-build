@@ -131,3 +131,46 @@ def test_unknown_bound_escalates_and_execution_boundary_fails_closed(policy):
     assert evaluate_action_policy(intent, policy, "issue_credit").disposition == "requires_founder"
     with pytest.raises(CompanyOSPolicyError, match="not authorized"):
         require_action_allowed(intent, policy, "issue_credit")
+
+
+def _flagged(flags, **extra):
+    return {"action_type": "draft_message", "risk_level": "GREEN", "external_write": False,
+            "policy_flags": flags, **extra}
+
+
+def test_red_class_policy_flag_escalates_a_green_action(policy):
+    result = evaluate_action_policy(_flagged(["pricing_change"]), policy, "draft_message")
+    assert result.disposition == "requires_founder"
+    assert result.effective_risk == "RED"
+    assert any("pricing_change" in reason for reason in result.reasons)
+
+
+def test_all_red_flags_are_named_sorted(policy):
+    result = evaluate_action_policy(
+        _flagged(["pricing_change", "first_live_integration_activation"]), policy, "draft_message")
+    assert "first_live_integration_activation, pricing_change" in result.reasons[-1]
+
+
+@pytest.mark.parametrize("flags", [[], ["first_live_batch"], ["discount_above_approved_ceiling"]])
+def test_flags_outside_red_vocabulary_stay_advisory(policy, flags):
+    result = evaluate_action_policy(_flagged(flags), policy, "draft_message")
+    assert result.disposition == "allow"
+    assert result.effective_risk == "GREEN"
+
+
+def test_hard_deny_flag_still_blocks_even_with_a_red_flag(policy):
+    result = evaluate_action_policy(_flagged(["pricing_change", "bypass_opt_out"]), policy, "draft_message")
+    assert result.disposition == "block"
+    assert result.founder_approval_required is False
+
+
+def test_founder_approved_flagged_action_re_evaluates_to_allow(policy):
+    result = evaluate_action_policy(
+        _flagged(["pricing_change"], founder_approval_status="approved"), policy, "draft_message")
+    assert result.disposition == "allow"
+    assert result.founder_approval_required is True
+
+
+def test_malformed_flags_still_raise(policy):
+    with pytest.raises(CompanyOSPolicyError):
+        evaluate_action_policy(_flagged("pricing_change"), policy, "draft_message")

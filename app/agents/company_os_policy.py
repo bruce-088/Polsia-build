@@ -85,7 +85,10 @@ def evaluate_action_policy(intent: dict[str, Any], policy: dict[str, Any], actio
     if not isinstance(flags, list) or any(not isinstance(item, str) for item in flags):
         raise CompanyOSPolicyError("intent.policy_flags must be a list of strings")
     matched_blocks = sorted({action_type, action, *flags} & (hard_denies | non_approvable))
-    effective_risk: RiskLevel = "RED" if action_type in red_actions or action in red_actions else requested_risk
+    red_flags = sorted(set(flags) & red_actions)
+    effective_risk: RiskLevel = (
+        "RED" if action_type in red_actions or action in red_actions or red_flags else requested_risk
+    )
 
     if matched_blocks:
         return PolicyDecision(
@@ -99,6 +102,8 @@ def evaluate_action_policy(intent: dict[str, Any], policy: dict[str, Any], actio
     requires_founder = effective_risk == "RED"
     if requires_founder:
         reasons.append("RED action requires founder approval")
+    if red_flags:
+        reasons.append(f"RED policy flag requires founder approval: {', '.join(red_flags)}")
 
     limit_name = intent.get("limit_name")
     if limit_name is not None:

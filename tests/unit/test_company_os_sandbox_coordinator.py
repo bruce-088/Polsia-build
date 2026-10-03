@@ -215,6 +215,25 @@ async def test_model_claimed_founder_approval_cannot_authorize_red(async_db_sess
 
 
 @pytest.mark.asyncio
+async def test_green_action_with_red_class_flag_needs_approval_and_resumes_when_approved(async_db_session):
+    _, instance = await setup(async_db_session)
+    output = native(policy_flags=["pricing_change"])
+    unscripted = await invoke(async_db_session, instance, output, synthetic_input={
+        "evidence_refs": ["sandbox://input/p-1"], "primary_classification": "acquisition"})
+    assert unscripted.payload["error"] == "pending approval requires a decision ID"
+    assert instance.current_state == "research"
+    requested = await invoke(async_db_session, instance, output, key="delivery-2")
+    assert requested.payload["event_type"] == "approval_requested"
+    assert instance.current_state == "research"
+    approval = await async_db_session.scalar(select(CompanyOSSandboxApproval).where(
+        CompanyOSSandboxApproval.request_event_id == requested.id))
+    await resolve(async_db_session, approval)
+    resumed = await resume(async_db_session, approval)
+    assert resumed.payload["event_type"] == "transition_completed"
+    assert instance.current_state == "scored"
+
+
+@pytest.mark.asyncio
 async def test_yellow_bound_stops_and_sandbox_adapter_executes_only_when_allowed(async_db_session):
     _, instance = await setup(async_db_session, initial_state="scored")
     adapter = Adapter()
