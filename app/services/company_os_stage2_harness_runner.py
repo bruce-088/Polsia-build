@@ -931,6 +931,16 @@ class _Runner:
         self.recorded.append(pair[0])
         self.activity += 1
         state.outcome = classify_outcome(pair[0])
+        if (state.outcome == "approval_collision"
+                and pair[0].get("error") == "pending approval requires a decision ID"
+                and not any(a["ordinal"] >= state.attempts for a in state.source.get("attempts", []))
+                and await self.db.scalar(select(CompanyOSSandboxApproval.id).where(
+                    CompanyOSSandboxApproval.workflow_instance_id == state.instance.id,
+                    CompanyOSSandboxApproval.sandbox_run_id == state.instance.sandbox_run_id,
+                    CompanyOSSandboxApproval.action == pair[0]["action"],
+                ).limit(1)) is None):
+            # A new founder-gated request after the scripted flow ended; still a failure, not a collision.
+            state.outcome = "unscripted_founder_request"
         if state.outcome == "ready":
             fingerprint = await decision_fingerprint(state.source, state.consumed, self.world,
                                                self.options["integration_registry"], self.db)

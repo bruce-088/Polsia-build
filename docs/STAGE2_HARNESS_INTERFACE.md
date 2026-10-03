@@ -138,7 +138,13 @@ compliance/policy block or a credited service rejection, each the deliberate
 success criterion of its own coverage bucket, not a defect. Every other
 non-terminal outcome (a waiting/defect/collision/budget-exhaustion/unconsumed
 signal or command) gets a `failures` entry, so nothing that kept a case from
-reaching terminal is visible only in `outcomes`. A retry/founder-resolution
+reaching terminal is visible only in `outcomes`. `unscripted_founder_request`
+is such a failure: once a case's scripted attempts are exhausted the real
+provider proposed a new founder-gated action that has no approval row and no
+scripted decision ID (nothing executed). It is distinct from
+`approval_collision`, which covers re-requesting an action that already has an
+approval row, an unresolved request, or a scripted ordinal missing its
+decision ID. A retry/founder-resolution
 control command dropped by budget exhaustion (marked consumed without ever
 dispatching) is reported explicitly as `dropped_commands`, distinct from
 `commands` (truly unconsumed ones), inside the same `unconsumed_control_command`

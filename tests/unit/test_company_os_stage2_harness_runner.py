@@ -1539,7 +1539,57 @@ async def test_decision_loop_covers_every_real_service_signature(async_db_sessio
             r.provider.decisions["one"].append(decision)
             pair = await runner.advance(state)
     assert harness.classify_outcome(pair[0]) == outcome
-    assert state.outcome == outcome
+    # Pure classification stays approval_collision; only the driver, knowing the scripted flow is
+    # exhausted and the action has no approval row, renames it.
+    assert state.outcome == ("unscripted_founder_request" if scenario == "missing_decision" else outcome)
+
+
+def test_unscripted_founder_request_is_still_a_reported_failure():
+    assert "unscripted_founder_request" not in harness.NEVER_A_FAILURE
+
+
+@pytest.mark.parametrize("variant", ["rejected_row_exists", "scripted_ordinal_without_decision_id"])
+async def test_collisions_that_are_not_unscripted_requests_keep_approval_collision(async_db_session, variant):
+    r, runner, state = await start_internal(async_db_session, controls=approval_controls(), corrections=[resolution()])
+    decision = native("pricing_change", "research", "RED")
+    r.provider.decisions["one"] = [decision]
+    r.provider.positions.clear()
+    if variant == "scripted_ordinal_without_decision_id":
+        state.source["attempts"] = [{"ordinal": 1, "ref": "no-id"}]
+        pair = await runner.advance(state)
+    else:
+        pair = await runner.advance(state)
+        assert pair[0]["event_type"] == "approval_requested"
+        approval = await runner.approval(state, "D")
+        await runner.call(state, resolve_sandbox_approval, approval_id=approval.id, status="rejected",
+            founder_id="synthetic-founder", founder_minutes=0, resolution_key="resolve",
+            event_schema=SCHEMA, workflow=r.workflows[WORKFLOW["id"]])
+        state.outcome = "ready"
+        state.source["attempts"] = [a for a in state.source["attempts"] if a["ordinal"] < 2]
+        r.provider.decisions["one"].append(decision)
+        pair = await runner.advance(state)
+    assert pair[0]["error"] == "pending approval requires a decision ID"
+    assert state.outcome == "approval_collision"
+
+
+async def test_new_gated_action_after_a_resolved_one_is_unscripted_founder_request(async_db_session):
+    r, runner, state = await start_internal(async_db_session, controls=approval_controls(), corrections=[resolution()])
+    runner.options["policy"] = {**POLICY, "red_action_types": ["pricing_change", "classify_reply"]}
+    r.provider.decisions["one"] = [native("pricing_change", "research", "RED")]
+    r.provider.positions.clear()
+    pair = await runner.advance(state)
+    assert pair[0]["event_type"] == "approval_requested"
+    approval = await runner.approval(state, "D")
+    await runner.call(state, resolve_sandbox_approval, approval_id=approval.id, status="approved",
+        founder_id="synthetic-founder", founder_minutes=0, resolution_key="resolve",
+        event_schema=SCHEMA, workflow=r.workflows[WORKFLOW["id"]])
+    state.outcome = "ready"
+    r.provider.decisions["one"].append(native("classify_reply", "research", "RED"))
+    pair = await runner.advance(state)
+    assert pair[0]["action"] == "classify_reply"
+    assert pair[0]["error"] == "pending approval requires a decision ID"
+    assert harness.classify_outcome(pair[0]) == "approval_collision"
+    assert state.outcome == "unscripted_founder_request"
 
 
 async def test_expected_stale_workflow_state_rejection_recorded_as_evidence(async_db_session):
