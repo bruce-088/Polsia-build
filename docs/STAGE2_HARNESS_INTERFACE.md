@@ -134,8 +134,8 @@ defect, never an environment failure.
 `outcomes` is the authoritative per-case final classification. `failures`
 additionally lists every case whose final outcome was not `terminal`, except
 for the run's intentionally-scored non-terminal endpoints -- a
-compliance/policy block or a credited service rejection, each the deliberate
-success criterion of its own coverage bucket, not a defect. Every other
+compliance/policy block, a credited service rejection, or a completed approval
+script (`script_complete`), each a deliberate endpoint, not a defect. Every other
 non-terminal outcome (a waiting/defect/collision/budget-exhaustion/unconsumed
 signal or command) gets a `failures` entry, so nothing that kept a case from
 reaching terminal is visible only in `outcomes`. `unscripted_founder_request`
@@ -144,7 +144,23 @@ provider proposed a new founder-gated action that has no approval row and no
 scripted decision ID (nothing executed). It is distinct from
 `approval_collision`, which covers re-requesting an action that already has an
 approval row, an unresolved request, or a scripted ordinal missing its
-decision ID. A retry/founder-resolution
+decision ID.
+
+`script_complete` is the one exception among these: an `unscripted_founder_request`
+becomes `script_complete` (and is not a failure) only when the case's driver-control
+entry is a pure approval-lifecycle script -- keys limited to `attempts` and
+`control_commands`, attempts limited to `ordinal`/`ref`/`decision_id`, every command a
+`founder_resolution`, no `expected_service_rejection` -- and that script has fully run:
+all commands done and none dropped, no resume due, every signal ingested, at least one
+approval row, every row `approved`/`modified`/`rejected`/`expired`/`cancelled`, and every
+`approved`/`modified` row resumed and followed by a later `transition_completed` event
+(the approved action actually ran). The provider's final blocked request stays in the
+event log and the existing metrics. Retry, replay, rejection-expectation, signal, mixed,
+and no-script cases never receive it, and `needs_more_evidence` or unresumed approvals
+keep the failure outcome. It exists because every approval-case fixture carries an
+over-ceiling discount request that `prospect_to_meeting` has no transition to decide.
+
+A retry/founder-resolution
 control command dropped by budget exhaustion (marked consumed without ever
 dispatching) is reported explicitly as `dropped_commands`, distinct from
 `commands` (truly unconsumed ones), inside the same `unconsumed_control_command`

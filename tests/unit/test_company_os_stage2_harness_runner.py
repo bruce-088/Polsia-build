@@ -1462,7 +1462,7 @@ async def start_internal(db, *, controls=None, corrections=None):
     runner = harness._Runner(db, r.pack, r.world, r.provider, r.workflows, options, r.corrections, r.report)
     case = deepcopy(r.pack["cases"][0])
     case.update((controls or {}).get("one", {}))
-    state = harness._Case(case, instance)
+    state = harness._Case(case, instance, control=deepcopy((controls or {}).get("one")))
     runner.cases["one"] = state
     return r, runner, state
 
@@ -1590,6 +1590,104 @@ async def test_new_gated_action_after_a_resolved_one_is_unscripted_founder_reque
     assert pair[0]["error"] == "pending approval requires a decision ID"
     assert harness.classify_outcome(pair[0]) == "approval_collision"
     assert state.outcome == "unscripted_founder_request"
+
+
+def _script_complete_run(db, status, decisions):
+    controls = approval_controls()
+    r = Run(db, decisions, controls=controls, corrections=[resolution(status)])
+    r.options["policy"] = {**POLICY, "red_action_types": ["pricing_change", "classify_reply"]}
+    return r
+
+
+def test_script_complete_is_never_a_failure():
+    assert "script_complete" in harness.NEVER_A_FAILURE
+
+
+async def test_approved_script_then_send_then_unrelated_request_is_script_complete(async_db_session):
+    r = _script_complete_run(async_db_session, "approved", [native("pricing_change", "research", "RED"),
+        native(), native("classify_reply", "scored", "RED")])
+    await r.run()
+    assert r.report.outcomes["one"] == "script_complete"
+    assert not r.report.failures
+
+
+async def test_rejected_script_then_unrelated_request_is_script_complete(async_db_session):
+    r = _script_complete_run(async_db_session, "rejected", [native("pricing_change", "research", "RED"),
+        native("classify_reply", "research", "RED")])
+    await r.run()
+    assert r.report.outcomes["one"] == "script_complete"
+    assert not r.report.failures
+
+
+async def test_unrelated_request_right_after_approval_resume_stays_a_failure(async_db_session):
+    r = _script_complete_run(async_db_session, "approved", [native("pricing_change", "research", "RED"),
+        native("classify_reply", "research", "RED")])
+    await r.run()
+    assert r.report.outcomes["one"] == "unscripted_founder_request"
+    assert r.report.failures == [{"case_id": "one", "outcome": "unscripted_founder_request"}]
+
+
+async def _completed_rejected_state(db):
+    r, runner, state = await start_internal(db, controls=approval_controls(), corrections=[resolution("rejected")])
+    runner.options["policy"] = {**POLICY, "red_action_types": ["pricing_change", "classify_reply"]}
+    r.provider.decisions["one"] = [native("pricing_change", "research", "RED")]
+    r.provider.positions.clear()
+    await runner.advance(state)
+    approval = await runner.approval(state, "D")
+    await runner.call(state, resolve_sandbox_approval, approval_id=approval.id, status="rejected",
+        founder_id="synthetic-founder", founder_minutes=0, resolution_key="resolve",
+        event_schema=SCHEMA, workflow=r.workflows[WORKFLOW["id"]])
+    state.commands_done.add("resolve")
+    runner.ingested.update(i["delivery_id"] for i in state.source["inputs"])
+    return runner, state, approval
+
+
+@pytest.mark.parametrize("variant", [
+    "baseline", "no_control", "retry_after_rejection", "replay_attempt", "service_rejection_declared",
+    "extra_control_key", "non_founder_command", "no_commands", "command_not_done", "dropped_command",
+    "resume_due", "pending_signal", "outstanding_evidence_request", "pending_approval", "approved_not_resumed"])
+async def test_script_complete_predicate_is_a_positive_allowlist(async_db_session, variant):
+    runner, state, approval = await _completed_rejected_state(async_db_session)
+    expected = variant == "baseline"
+    if variant == "no_control":
+        state.control = None
+    elif variant == "retry_after_rejection":
+        state.control = {"attempts": [*state.control["attempts"], {"ordinal": 2, "ref": "timeout",
+            "scripted_failure": "ScriptedProviderTimeout"}],
+            "control_commands": [*state.control["control_commands"], {"id": "retry", "command_type": "retry",
+            "precondition": {"type": "failed_attempt_persisted", "attempt_ref": "timeout"}}]}
+        state.commands_done.add("retry")
+    elif variant == "replay_attempt":
+        state.control["attempts"][0]["replay_of"] = "earlier"
+    elif variant == "service_rejection_declared":
+        state.control["expected_service_rejection"] = {"call": "resume_sandbox_approval"}
+        state.rejection_credited = True
+    elif variant == "extra_control_key":
+        state.control["signals"] = []
+    elif variant == "non_founder_command":
+        state.control["control_commands"][0]["command_type"] = "retry"
+    elif variant == "no_commands":
+        state.control["control_commands"] = []
+    elif variant == "command_not_done":
+        state.commands_done.clear()
+    elif variant == "dropped_command":
+        state.dropped_commands.append("resolve")
+    elif variant == "resume_due":
+        state.resume_due = "resolve"
+    elif variant == "pending_signal":
+        runner.ingested.clear()
+    elif variant in {"outstanding_evidence_request", "pending_approval", "approved_not_resumed"}:
+        approval.status = {"outstanding_evidence_request": "needs_more_evidence", "pending_approval": "pending",
+                           "approved_not_resumed": "approved"}[variant]
+        await async_db_session.flush()
+    assert await runner.script_complete(state) is expected
+
+
+async def test_script_complete_is_refused_when_no_approval_row_exists(async_db_session):
+    runner, state, approval = await _completed_rejected_state(async_db_session)
+    await async_db_session.delete(approval)
+    await async_db_session.flush()
+    assert await runner.script_complete(state) is False
 
 
 async def test_expected_stale_workflow_state_rejection_recorded_as_evidence(async_db_session):

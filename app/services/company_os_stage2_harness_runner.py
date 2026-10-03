@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.exc import DataError, DBAPIError, IntegrityError, ProgrammingError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -65,12 +65,13 @@ CLASSIFICATIONS = {
     "stale_lead_reactivation": "stale_lead_reactivation", "integration_failure_recovery": "failure_recovery",
 }
 # Outcomes the closing report never lists as a failure: "terminal" is success;
-# compliance/policy blocks and a declared service rejection are each the
-# deliberately-scored endpoint of their own coverage bucket, not a defect.
+# compliance/policy blocks, a declared service rejection and a completed
+# approval-lifecycle script are each the deliberately-scored endpoint of their
+# own coverage bucket, not a defect.
 # Every other non-terminal final outcome (waiting/defect/collision/etc.) gets a
 # failures entry unless a more specific one (budget, unconsumed signal/command)
 # already covers it. See docs/STAGE2_HARNESS_INTERFACE.md.
-NEVER_A_FAILURE = {"terminal", "compliance_blocked", "policy_blocked", "service_rejection"}
+NEVER_A_FAILURE = {"terminal", "compliance_blocked", "policy_blocked", "service_rejection", "script_complete"}
 
 
 def _finite_number(value: Any) -> bool:
@@ -781,6 +782,7 @@ class _Case:
     attempt_keys: dict = field(default_factory=dict)
     resume_due: str | None = None
     rejection_credited: bool = False
+    control: dict | None = None
 
 
 class _Runner:
@@ -923,6 +925,44 @@ class _Runner:
         approval = await self.db.get(CompanyOSSandboxApproval, approval_id)
         return approval is not None and approval.decision_id == binding
 
+    async def script_complete(self, state):
+        """True only for a fully executed approval-lifecycle script.
+
+        Reads the original driver-control entry (state.control), not the merged
+        fixture case, and is a positive allowlist: any retry, replay, rejection
+        expectation, signal, or non-founder-resolution command keeps its failure
+        outcome. Approved/modified rows must also be followed by a completed
+        transition, so an unrelated request right after the approval cannot
+        stand in for the approved action having run.
+        """
+        control = state.control
+        if not control or set(control) - {"attempts", "control_commands"}:
+            return False
+        commands = control.get("control_commands", [])
+        if (not commands or any(set(a) - {"ordinal", "ref", "decision_id"} for a in control.get("attempts", []))
+                or any(c.get("command_type") != "founder_resolution" for c in commands)):
+            return False
+        if (any(c["id"] not in state.commands_done for c in commands) or state.dropped_commands
+                or state.resume_due is not None
+                or any(i["delivery_id"] not in self.ingested for i in state.source["inputs"])):
+            return False
+        rows = list(await self.db.scalars(select(CompanyOSSandboxApproval).where(
+            CompanyOSSandboxApproval.workflow_instance_id == state.instance.id,
+            CompanyOSSandboxApproval.sandbox_run_id == state.instance.sandbox_run_id)))
+        if not rows or any(r.status not in {"approved", "modified", "rejected", "expired", "cancelled"} for r in rows):
+            return False
+        resumed = [r for r in rows if r.status in {"approved", "modified"}]
+        if any(r.resume_event_id is None for r in resumed):
+            return False
+        if resumed:
+            last_resume = await self.db.scalar(select(func.max(CompanyOSSandboxEvent.sequence)).where(
+                CompanyOSSandboxEvent.id.in_([r.resume_event_id for r in resumed])))
+            return await self.db.scalar(select(CompanyOSSandboxEvent.id).where(
+                CompanyOSSandboxEvent.workflow_instance_id == state.instance.id,
+                CompanyOSSandboxEvent.event_type == "transition_completed",
+                CompanyOSSandboxEvent.sequence > last_resume).limit(1)) is not None
+        return True
+
     async def record(self, state, event):
         if event is None or event.event_id in self.exported:
             return None
@@ -941,6 +981,8 @@ class _Runner:
                 ).limit(1)) is None):
             # A new founder-gated request after the scripted flow ended; still a failure, not a collision.
             state.outcome = "unscripted_founder_request"
+            if await self.script_complete(state):
+                state.outcome = "script_complete"
         if state.outcome == "ready":
             fingerprint = await decision_fingerprint(state.source, state.consumed, self.world,
                                                self.options["integration_registry"], self.db)
@@ -1154,12 +1196,14 @@ async def run_stage2_fixture_pack(
         ids = {case["id"] for case in pack["cases"]}
         if set(controls) - ids:
             raise FixtureAuthoringError("controls reference an unknown case")
+        driver_control = {}
         for case in pack["cases"]:
             if set(case) & {"attempts", "control_commands", "expected_service_rejection"}:
                 raise FixtureAuthoringError("attempts, commands and expectations belong in driver_controls")
             control = controls.get(case["id"], {})
             if set(control) - {"attempts", "control_commands", "expected_service_rejection"}:
                 raise FixtureAuthoringError("unknown driver control field")
+            driver_control[case["id"]] = deepcopy(control)
             case.update(control)
         validate_pack(pack, workflows, corrections, integration_registry)
         if world is None:
@@ -1184,7 +1228,7 @@ async def run_stage2_fixture_pack(
             workflow = workflows[case["workflow_id"]]
             instance = await create_workflow_instance(db, sandbox_run_id=run.id, workflow_id=case["workflow_id"],
                 entity_type=case["entity_type"], entity_id=case["entity_id"], initial_state=workflow["states"][0])
-            runner.cases[case["id"]] = _Case(case, instance)
+            runner.cases[case["id"]] = _Case(case, instance, control=driver_control[case["id"]])
         while True:
             before = runner.activity
             await runner.drain()
