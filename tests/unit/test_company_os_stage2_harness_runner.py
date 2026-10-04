@@ -2107,3 +2107,20 @@ async def test_stage2_prompt_integration_requirement_is_precondition_not_instruc
     assert "leave integration null unless this action's own canonical transition declares one" in prompts[0]
     assert "is a precondition to verify, not a reason to set integration" in prompts[0]
     assert 'has its own "integration" key' in prompts[0]
+
+
+async def test_stage2_prompt_approval_request_states_target_state_after():
+    context = {"workflow": WORKFLOW, "canonical_actions": ACTIONS, "canonical_agents": ["email_outreach"],
+               "canonical_handoffs": ["orchestrator"]}
+    prompts = []
+
+    def transport(prompt, schema):
+        prompts.append(prompt)
+        return native(), "raw"
+    agent = SimpleNamespace(agent_type="email_outreach", company_os_instructions="instructions")
+    await stage2_decision(agent, {"case_id": "one"}, context, structured_transport=transport)
+    assert ("state_after is always the state this action's canonical transition moves to, "
+            "even when the action needs founder approval") in prompts[0]
+    assert "the current state is never a valid state_after for a transition action" in prompts[0]
+    assert "is a precondition to verify, not a reason to set integration" in prompts[0]
+    assert "leave integration null unless this action's own canonical transition declares one" in prompts[0]
