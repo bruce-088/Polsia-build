@@ -2092,3 +2092,18 @@ async def test_stage2_prompt_carries_founder_history_and_no_repeat_instruction()
     await stage2_decision(agent, {"case_id": "one"}, context, structured_transport=transport)
     assert '"prior_founder_resolutions": [{"decision_id": "D", "action": "pricing_change", "status": "rejected"}]' in prompts[0]
     assert "do not request that same action again" in prompts[0]
+
+
+async def test_stage2_prompt_integration_requirement_is_precondition_not_instruction():
+    context = {"workflow": WORKFLOW, "canonical_actions": ACTIONS, "canonical_agents": ["email_outreach"],
+               "canonical_handoffs": ["orchestrator"]}
+    prompts = []
+
+    def transport(prompt, schema):
+        prompts.append(prompt)
+        return native(), "raw"
+    agent = SimpleNamespace(agent_type="email_outreach", company_os_instructions="instructions")
+    await stage2_decision(agent, {"case_id": "one"}, context, structured_transport=transport)
+    assert "leave integration null unless this action's own canonical transition declares one" in prompts[0]
+    assert "is a precondition to verify, not a reason to set integration" in prompts[0]
+    assert 'has its own "integration" key' in prompts[0]
