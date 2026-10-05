@@ -2124,3 +2124,78 @@ async def test_stage2_prompt_approval_request_states_target_state_after():
     assert "the current state is never a valid state_after for a transition action" in prompts[0]
     assert "is a precondition to verify, not a reason to set integration" in prompts[0]
     assert "leave integration null unless this action's own canonical transition declares one" in prompts[0]
+
+
+DEAD_END = {**WORKFLOW, "states": ["research", "parked", "shelved", "done"], "terminal_states": ["done"], "transitions": [
+    {"from": "research", "to": "parked", "action": "score_against_icp", "risk_level": "GREEN"},
+    {"from": "research", "to": "done", "action": "finish", "risk_level": "GREEN"}]}
+STALLED = [native("score_against_icp", "parked")] * 3
+
+
+def waiting(state="parked", **extra):
+    return {"one": {"expected_wait": {"final_state": state}, **extra}}
+
+
+async def test_declared_dead_end_wait_is_a_scored_endpoint_not_a_failure(async_db_session):
+    r = Run(async_db_session, STALLED, controls=waiting(), workflow=DEAD_END)
+    await r.run()
+    assert r.report.outcomes["one"] == "expected_wait"
+    assert r.report.expected_waits == [{"case_id": "one", "final_state": "parked"}]
+    assert not r.report.failures
+
+
+async def test_undeclared_dead_end_wait_is_still_a_failure(async_db_session):
+    r = Run(async_db_session, STALLED, workflow=DEAD_END)
+    await r.run()
+    assert r.report.outcomes["one"] == "waiting_on_evidence"
+    assert r.report.failures == [{"case_id": "one", "outcome": "waiting_on_evidence"}]
+    assert r.report.expected_waits == []
+
+
+async def test_declared_wait_in_a_different_final_state_is_still_a_failure(async_db_session):
+    r = Run(async_db_session, STALLED, controls=waiting("shelved"), workflow=DEAD_END)
+    await r.run()
+    assert r.report.outcomes["one"] == "waiting_on_evidence"
+    assert r.report.failures == [{"case_id": "one", "outcome": "waiting_on_evidence"}]
+    assert r.report.expected_waits == []
+
+
+async def test_declared_wait_does_not_excuse_a_pending_signal(async_db_session):
+    fixtures = pack()
+    fixtures["cases"][0]["inputs"].append({"delivery_id": "late", "type": "reply", "facts": {}, "after": ["event:one:finish:transition_completed:1"]})
+    r = Run(async_db_session, STALLED, fixtures=fixtures, controls=waiting(), workflow=DEAD_END)
+    await r.run()
+    assert r.report.outcomes["one"] != "expected_wait"
+    assert r.report.failures and r.report.expected_waits == []
+
+
+async def test_declared_wait_does_not_excuse_an_unconsumed_command(async_db_session):
+    controls = waiting(**approval_controls()["one"])
+    r = Run(async_db_session, STALLED, controls=controls, corrections=[resolution()], workflow=DEAD_END)
+    await r.run()
+    assert r.report.outcomes["one"] != "expected_wait"
+    assert any(f["outcome"] == "unconsumed_control_command" for f in r.report.failures)
+    assert r.report.expected_waits == []
+
+
+@pytest.mark.parametrize("declaration", [
+    {"final_state": "done"}, {"final_state": "nowhere"}, {"final_state": "research"},
+    {"final_state": "parked", "reason": "x"}, {}, "parked", {"final_state": 3}, None])
+async def test_invalid_expected_wait_declaration_is_a_fixture_authoring_error(async_db_session, declaration):
+    r = Run(async_db_session, STALLED, controls={"one": {"expected_wait": declaration}}, workflow=DEAD_END)
+    with pytest.raises(harness.FixtureAuthoringError, match="expected_wait"):
+        await r.run()
+
+
+async def test_expected_wait_inside_a_fixture_case_is_rejected(async_db_session):
+    fixtures = pack()
+    fixtures["cases"][0]["expected_wait"] = {"final_state": "parked"}
+    r = Run(async_db_session, STALLED, fixtures=fixtures, workflow=DEAD_END)
+    with pytest.raises(harness.FixtureAuthoringError, match="belong in driver_controls"):
+        await r.run()
+
+
+async def test_script_complete_still_accepts_an_unrelated_expected_wait_control(async_db_session):
+    runner, state, _ = await _completed_rejected_state(async_db_session)
+    state.control["expected_wait"] = {"final_state": "research"}
+    assert await runner.script_complete(state) is True

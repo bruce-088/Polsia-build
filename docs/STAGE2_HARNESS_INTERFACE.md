@@ -146,10 +146,18 @@ scripted decision ID (nothing executed). It is distinct from
 approval row, an unresolved request, or a scripted ordinal missing its
 decision ID.
 
+`expected_wait` is the other scored endpoint: a driver-control entry may declare
+`"expected_wait": {"final_state": "<state>"}` for a case whose workflow has no canonical
+transition out of that non-terminal state. The harness rejects a declaration naming an
+unknown, terminal or outbound-transition state, and rejects `expected_wait` inside a fixture
+case. A `waiting_on_evidence` outcome becomes `expected_wait` (and is not a failure) only
+when the case ended in exactly that state with no pending signal or command and no other
+failure; it is listed in `expected_waits`. Any other outcome stays a failure.
+
 `script_complete` is the one exception among these: an `unscripted_founder_request`
 becomes `script_complete` (and is not a failure) only when the case's driver-control
-entry is a pure approval-lifecycle script -- keys limited to `attempts` and
-`control_commands`, attempts limited to `ordinal`/`ref`/`decision_id`, every command a
+entry is a pure approval-lifecycle script -- keys limited to `attempts`, `control_commands` and
+`expected_wait`, attempts limited to `ordinal`/`ref`/`decision_id`, every command a
 `founder_resolution`, no `expected_service_rejection` -- and that script has fully run:
 all commands done and none dropped, no resume due, every signal ingested, at least one
 approval row, every row `approved`/`modified`/`rejected`/`expired`/`cancelled`, and every

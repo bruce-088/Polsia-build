@@ -71,7 +71,9 @@ CLASSIFICATIONS = {
 # Every other non-terminal final outcome (waiting/defect/collision/etc.) gets a
 # failures entry unless a more specific one (budget, unconsumed signal/command)
 # already covers it. See docs/STAGE2_HARNESS_INTERFACE.md.
-NEVER_A_FAILURE = {"terminal", "compliance_blocked", "policy_blocked", "service_rejection", "script_complete"}
+NEVER_A_FAILURE = {"terminal", "compliance_blocked", "policy_blocked", "service_rejection", "script_complete",
+                   "expected_wait"}
+CONTROL_FIELDS = {"attempts", "control_commands", "expected_service_rejection", "expected_wait"}
 
 
 def _finite_number(value: Any) -> bool:
@@ -409,6 +411,7 @@ class HarnessReport:
     provider: str = "deterministic_mock"
     outcomes: dict = field(default_factory=dict)
     service_rejections: list = field(default_factory=list)
+    expected_waits: list = field(default_factory=list)
     harness_defect: dict | None = None
     environment_failure: dict | None = None
     pending: dict = field(default_factory=dict)
@@ -484,6 +487,20 @@ def validate_artifact_shapes(fixture_pack: Any, founder_resolutions: Any, driver
         not isinstance(value, dict) for value in driver_controls.values()
     )):
         raise FixtureAuthoringError("driver controls must be an object of case-keyed control objects")
+
+
+def validate_expected_wait(case_id: str, declaration: Any, workflow: dict | None) -> None:
+    """A declared wait is only legitimate in a non-terminal state no canonical transition leaves."""
+    if (not isinstance(declaration, dict) or set(declaration) != {"final_state"}
+            or not isinstance(declaration["final_state"], str)):
+        raise FixtureAuthoringError(f"{case_id}: expected_wait must be an object with only a final_state string")
+    state = declaration["final_state"]
+    if workflow is None or state not in workflow["states"]:
+        raise FixtureAuthoringError(f"{case_id}: expected_wait final_state is not a workflow state")
+    if state in workflow.get("terminal_states", []):
+        raise FixtureAuthoringError(f"{case_id}: expected_wait final_state must not be terminal")
+    if any(t["from"] == state for t in workflow["transitions"]):
+        raise FixtureAuthoringError(f"{case_id}: expected_wait final_state has an outbound canonical transition")
 
 
 def validate_pack(pack: dict, workflows: dict, corrections: list, registry: dict) -> None:
@@ -936,7 +953,7 @@ class _Runner:
         stand in for the approved action having run.
         """
         control = state.control
-        if not control or set(control) - {"attempts", "control_commands"}:
+        if not control or set(control) - {"attempts", "control_commands", "expected_wait"}:
             return False
         commands = control.get("control_commands", [])
         if (not commands or any(set(a) - {"ordinal", "ref", "decision_id"} for a in control.get("attempts", []))
@@ -1198,11 +1215,13 @@ async def run_stage2_fixture_pack(
             raise FixtureAuthoringError("controls reference an unknown case")
         driver_control = {}
         for case in pack["cases"]:
-            if set(case) & {"attempts", "control_commands", "expected_service_rejection"}:
+            if set(case) & CONTROL_FIELDS:
                 raise FixtureAuthoringError("attempts, commands and expectations belong in driver_controls")
             control = controls.get(case["id"], {})
-            if set(control) - {"attempts", "control_commands", "expected_service_rejection"}:
+            if set(control) - CONTROL_FIELDS:
                 raise FixtureAuthoringError("unknown driver control field")
+            if "expected_wait" in control:
+                validate_expected_wait(case["id"], control["expected_wait"], workflows.get(case["workflow_id"]))
             driver_control[case["id"]] = deepcopy(control)
             case.update(control)
         validate_pack(pack, workflows, corrections, integration_registry)
@@ -1267,6 +1286,12 @@ async def run_stage2_fixture_pack(
                 report.failures.append({"case_id": case_id, "outcome": "unconsumed_signal",
                                         "signals": pending_signals})
                 reported = True
+            # A declared dead-end wait (validated against the workflow) is a scored endpoint.
+            declared = state.source.get("expected_wait")
+            if (not reported and declared and state.outcome == "waiting_on_evidence"
+                    and state.instance.current_state == declared["final_state"]):
+                report.outcomes[case_id] = "expected_wait"
+                report.expected_waits.append({"case_id": case_id, "final_state": declared["final_state"]})
             # Every other non-terminal final outcome gets a failures entry too
             # (P13B-11), unless it's one of the run's intentionally-scored
             # non-terminal endpoints (compliance/policy block, a credited
