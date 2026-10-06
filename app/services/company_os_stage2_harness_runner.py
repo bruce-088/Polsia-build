@@ -73,6 +73,7 @@ CLASSIFICATIONS = {
 # already covers it. See docs/STAGE2_HARNESS_INTERFACE.md.
 NEVER_A_FAILURE = {"terminal", "compliance_blocked", "policy_blocked", "service_rejection", "script_complete",
                    "expected_wait"}
+REQUIREMENTS_REFUSAL = "canonical transition requirements lack evidence"
 CONTROL_FIELDS = {"attempts", "control_commands", "expected_service_rejection", "expected_wait"}
 
 
@@ -440,7 +441,7 @@ def classify_outcome(payload: dict) -> str:
     if kind == "failure_detected":
         if gate == "transition" and result in {"blocked", "failed"}:
             return ("waiting_on_evidence" if result == "blocked" and
-                    payload.get("error") == "canonical transition requirements lack evidence" else "transition_defect")
+                    payload.get("error") == REQUIREMENTS_REFUSAL else "transition_defect")
         outcomes = {
             ("approval", "blocked"): "approval_collision", ("approval_resume", "blocked"): "resume_defect",
             ("contract", "failed"): "native_decision_defect", ("policy", "blocked"): "policy_blocked",
@@ -490,17 +491,38 @@ def validate_artifact_shapes(fixture_pack: Any, founder_resolutions: Any, driver
 
 
 def validate_expected_wait(case_id: str, declaration: Any, workflow: dict | None) -> None:
-    """A declared wait is only legitimate in a non-terminal state no canonical transition leaves."""
-    if (not isinstance(declaration, dict) or set(declaration) != {"final_state"}
-            or not isinstance(declaration["final_state"], str)):
-        raise FixtureAuthoringError(f"{case_id}: expected_wait must be an object with only a final_state string")
+    """A declared wait is legitimate in a non-terminal state with no outbound canonical transition,
+    or (with blocked_action) in a state whose only outbound transition needs evidence."""
+    if (not isinstance(declaration, dict) or set(declaration) not in ({"final_state"}, {"final_state", "blocked_action"})
+            or not all(isinstance(v, str) for v in declaration.values())):
+        raise FixtureAuthoringError(
+            f"{case_id}: expected_wait must be an object with a final_state string and an optional blocked_action string")
     state = declaration["final_state"]
     if workflow is None or state not in workflow["states"]:
         raise FixtureAuthoringError(f"{case_id}: expected_wait final_state is not a workflow state")
     if state in workflow.get("terminal_states", []):
         raise FixtureAuthoringError(f"{case_id}: expected_wait final_state must not be terminal")
-    if any(t["from"] == state for t in workflow["transitions"]):
-        raise FixtureAuthoringError(f"{case_id}: expected_wait final_state has an outbound canonical transition")
+    outbound = [t for t in workflow["transitions"] if t["from"] == state]
+    if "blocked_action" not in declaration:
+        if outbound:
+            raise FixtureAuthoringError(f"{case_id}: expected_wait final_state has an outbound canonical transition")
+        return
+    if len(outbound) != 1 or outbound[0]["action"] != declaration["blocked_action"]:
+        raise FixtureAuthoringError(
+            f"{case_id}: expected_wait blocked_action must be the only outbound canonical transition from final_state")
+    if not outbound[0].get("requirements"):
+        raise FixtureAuthoringError(f"{case_id}: expected_wait blocked_action transition declares no requirements")
+
+
+def wait_evidenced(declared: dict, event: dict | None) -> bool:
+    """A blocked_action wait is only credited when the service itself refused that action last."""
+    if "blocked_action" not in declared:
+        return True
+    return (isinstance(event, dict) and event.get("event_type") == "failure_detected"
+            and event.get("action") == declared["blocked_action"] and event.get("result") == "blocked"
+            and (event.get("metadata") or {}).get("gate") == "transition"
+            and event.get("state_before") == event.get("state_after") == declared["final_state"]
+            and event.get("error") == REQUIREMENTS_REFUSAL)
 
 
 def validate_pack(pack: dict, workflows: dict, corrections: list, registry: dict) -> None:
@@ -793,6 +815,7 @@ class _Case:
     retries: int = 0
     outcome: str = "ready"
     last_progress: tuple | None = None
+    last_event: dict | None = None
     blocked_fingerprint: str | None = None
     retry_key: str | None = None
     attempt_events: dict = field(default_factory=dict)
@@ -987,6 +1010,7 @@ class _Runner:
         self.exported.add(event.event_id)
         self.recorded.append(pair[0])
         self.activity += 1
+        state.last_event = pair[0]
         state.outcome = classify_outcome(pair[0])
         if (state.outcome == "approval_collision"
                 and pair[0].get("error") == "pending approval requires a decision ID"
@@ -1289,9 +1313,10 @@ async def run_stage2_fixture_pack(
             # A declared dead-end wait (validated against the workflow) is a scored endpoint.
             declared = state.source.get("expected_wait")
             if (not reported and declared and state.outcome == "waiting_on_evidence"
-                    and state.instance.current_state == declared["final_state"]):
+                    and state.instance.current_state == declared["final_state"]
+                    and wait_evidenced(declared, state.last_event)):
                 report.outcomes[case_id] = "expected_wait"
-                report.expected_waits.append({"case_id": case_id, "final_state": declared["final_state"]})
+                report.expected_waits.append({"case_id": case_id, **declared})
             # Every other non-terminal final outcome gets a failures entry too
             # (P13B-11), unless it's one of the run's intentionally-scored
             # non-terminal endpoints (compliance/policy block, a credited

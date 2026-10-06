@@ -2199,3 +2199,83 @@ async def test_script_complete_still_accepts_an_unrelated_expected_wait_control(
     runner, state, _ = await _completed_rejected_state(async_db_session)
     state.control["expected_wait"] = {"final_state": "research"}
     assert await runner.script_complete(state) is True
+
+
+GATED = {**WORKFLOW, "states": ["research", "gated", "done"], "terminal_states": ["done"], "transitions": [
+    {"from": "research", "to": "gated", "action": "score_against_icp", "risk_level": "GREEN"},
+    {"from": "gated", "to": "done", "action": "book_or_handoff_meeting", "risk_level": "GREEN",
+     "requirements": ["authoritative calendar or human handoff"]}]}
+REFUSED = [native("score_against_icp", "gated")] + [native("book_or_handoff_meeting", "done")] * 3
+BLOCKED_WAIT = {"final_state": "gated", "blocked_action": "book_or_handoff_meeting"}
+
+
+def blocked(declaration=BLOCKED_WAIT):
+    return {"one": {"expected_wait": declaration}}
+
+
+async def test_blocked_action_wait_is_credited_only_with_the_services_own_refusal(async_db_session):
+    r = Run(async_db_session, REFUSED, controls=blocked(), workflow=GATED)
+    events = await r.run()
+    assert events[-1]["event_type"] == "failure_detected"
+    assert events[-1]["error"] == "canonical transition requirements lack evidence"
+    assert r.report.outcomes["one"] == "expected_wait"
+    assert r.report.expected_waits == [{"case_id": "one", **BLOCKED_WAIT}]
+    assert not r.report.failures
+
+
+async def test_blocked_action_wait_is_a_failure_when_undeclared(async_db_session):
+    r = Run(async_db_session, REFUSED, workflow=GATED)
+    await r.run()
+    assert r.report.outcomes["one"] == "waiting_on_evidence"
+    assert r.report.failures == [{"case_id": "one", "outcome": "waiting_on_evidence"}]
+    assert r.report.expected_waits == []
+
+
+async def test_blocked_action_wait_is_a_failure_when_the_last_event_is_not_the_refusal(async_db_session):
+    stalled = [native("score_against_icp", "gated")] * 4
+    r = Run(async_db_session, stalled, controls=blocked(), workflow=GATED)
+    events = await r.run()
+    assert events[-1]["event_type"] != "failure_detected"
+    assert r.report.outcomes["one"] == "waiting_on_evidence"
+    assert r.report.failures == [{"case_id": "one", "outcome": "waiting_on_evidence"}]
+    assert r.report.expected_waits == []
+
+
+async def test_blocked_action_wait_does_not_excuse_a_pending_signal(async_db_session):
+    fixtures = pack()
+    fixtures["cases"][0]["inputs"].append({"delivery_id": "late", "type": "reply", "facts": {},
+        "after": ["event:one:book_or_handoff_meeting:transition_completed:1"]})
+    r = Run(async_db_session, REFUSED, fixtures=fixtures, controls=blocked(), workflow=GATED)
+    await r.run()
+    assert r.report.outcomes["one"] != "expected_wait"
+    assert r.report.failures and r.report.expected_waits == []
+
+
+@pytest.mark.parametrize("mutation", [
+    {"event_type": "transition_attempted"}, {"action": "score_against_icp"}, {"result": "failed"},
+    {"metadata": {"gate": "policy"}}, {"metadata": None}, {"state_before": "research"}, {"state_after": "research"},
+    {"error": "something else"}, {"error": None}])
+def test_wait_evidenced_rejects_anything_but_the_exact_requirements_refusal(mutation):
+    refusal = {"event_type": "failure_detected", "action": "book_or_handoff_meeting", "result": "blocked",
+               "metadata": {"gate": "transition"}, "state_before": "gated", "state_after": "gated",
+               "error": "canonical transition requirements lack evidence"}
+    assert harness.wait_evidenced(BLOCKED_WAIT, refusal) is True
+    assert harness.wait_evidenced(BLOCKED_WAIT, {**refusal, **mutation}) is False
+    assert harness.wait_evidenced(BLOCKED_WAIT, None) is False
+    assert harness.wait_evidenced({"final_state": "gated"}, None) is True
+
+
+@pytest.mark.parametrize("declaration, workflow", [
+    ({**BLOCKED_WAIT, "reason": "x"}, GATED), ({"final_state": "gated", "blocked_action": 3}, GATED),
+    ({"final_state": "gated", "blocked_action": "finish"}, GATED),
+    ({"final_state": "gated", "blocked_action": "nowhere"}, GATED),
+    ({"final_state": "done", "blocked_action": "book_or_handoff_meeting"}, GATED),
+    ({"final_state": "gated"}, GATED),
+    ({"final_state": "parked", "blocked_action": "score_against_icp"}, DEAD_END),
+    ({"final_state": "research", "blocked_action": "score_against_icp"}, DEAD_END),
+    ({"final_state": "scored", "blocked_action": "send_outreach"}, WORKFLOW),
+    ({"final_state": "research", "blocked_action": "score_against_icp"}, GATED)])
+async def test_invalid_blocked_action_declaration_is_a_fixture_authoring_error(async_db_session, declaration, workflow):
+    r = Run(async_db_session, REFUSED, controls=blocked(declaration), workflow=workflow)
+    with pytest.raises(harness.FixtureAuthoringError, match="expected_wait"):
+        await r.run()

@@ -154,6 +154,14 @@ case. A `waiting_on_evidence` outcome becomes `expected_wait` (and is not a fail
 when the case ended in exactly that state with no pending signal or command and no other
 failure; it is listed in `expected_waits`. Any other outcome stays a failure.
 
+A declaration may also carry `"blocked_action": "<action>"` for a state whose only outbound
+canonical transition is that action and declares requirements (a meeting-ready hand-off waiting
+for confirmation). The wait is then credited only when the case's last recorded event is the
+service's own refusal of that action: a `failure_detected` event, gate `transition`, result
+`blocked`, state unchanged at `final_state`, error `canonical transition requirements lack
+evidence`. The declaration never excuses an action the service accepted; the `expected_waits`
+row carries both keys.
+
 `script_complete` is the one exception among these: an `unscripted_founder_request`
 becomes `script_complete` (and is not a failure) only when the case's driver-control
 entry is a pure approval-lifecycle script -- keys limited to `attempts`, `control_commands` and
