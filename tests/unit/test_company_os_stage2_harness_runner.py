@@ -2126,6 +2126,23 @@ async def test_stage2_prompt_approval_request_states_target_state_after():
     assert "leave integration null unless this action's own canonical transition declares one" in prompts[0]
 
 
+async def test_stage2_prompt_execute_phase_integration_excludes_drafted_content():
+    context = {"workflow": WORKFLOW, "canonical_actions": ACTIONS, "canonical_agents": ["email_outreach"],
+               "canonical_handoffs": ["orchestrator"]}
+    prompts, schemas = [], []
+
+    def transport(prompt, schema):
+        prompts.append(prompt)
+        schemas.append(schema)
+        return native(), "raw"
+    agent = SimpleNamespace(agent_type="email_outreach", company_os_instructions="instructions")
+    await stage2_decision(agent, {"case_id": "one"}, context, structured_transport=transport)
+    assert ("When this action's own integration.phase is \"execute\", leave drafted_content null: the message "
+            "belongs only in integration.message, and drafted_content is never sent together with an "
+            "execute-phase integration.") in prompts[0]
+    assert "drafted_content" in schemas[0]["properties"] and "drafted_content" not in schemas[0]["required"]
+
+
 DEAD_END = {**WORKFLOW, "states": ["research", "parked", "shelved", "done"], "terminal_states": ["done"], "transitions": [
     {"from": "research", "to": "parked", "action": "score_against_icp", "risk_level": "GREEN"},
     {"from": "research", "to": "done", "action": "finish", "risk_level": "GREEN"}]}
