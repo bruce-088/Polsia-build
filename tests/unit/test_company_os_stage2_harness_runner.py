@@ -1628,6 +1628,10 @@ async def test_unrelated_request_right_after_approval_resume_stays_a_failure(asy
 
 
 async def _completed_rejected_state(db):
+    return (await _completed_rejected_run(db))[1:]
+
+
+async def _completed_rejected_run(db):
     r, runner, state = await start_internal(db, controls=approval_controls(), corrections=[resolution("rejected")])
     runner.options["policy"] = {**POLICY, "red_action_types": ["pricing_change", "classify_reply"]}
     r.provider.decisions["one"] = [native("pricing_change", "research", "RED")]
@@ -1639,16 +1643,16 @@ async def _completed_rejected_state(db):
         event_schema=SCHEMA, workflow=r.workflows[WORKFLOW["id"]])
     state.commands_done.add("resolve")
     runner.ingested.update(i["delivery_id"] for i in state.source["inputs"])
-    return runner, state, approval
+    return r, runner, state, approval
 
 
-@pytest.mark.parametrize("variant", [
+SCRIPT_VARIANTS = [
     "baseline", "no_control", "retry_after_rejection", "replay_attempt", "service_rejection_declared",
     "extra_control_key", "non_founder_command", "no_commands", "command_not_done", "dropped_command",
-    "resume_due", "pending_signal", "outstanding_evidence_request", "pending_approval", "approved_not_resumed"])
-async def test_script_complete_predicate_is_a_positive_allowlist(async_db_session, variant):
-    runner, state, approval = await _completed_rejected_state(async_db_session)
-    expected = variant == "baseline"
+    "resume_due", "pending_signal", "outstanding_evidence_request", "pending_approval", "approved_not_resumed"]
+
+
+async def _apply_script_variant(db, runner, state, approval, variant):
     if variant == "no_control":
         state.control = None
     elif variant == "retry_after_rejection":
@@ -1679,8 +1683,35 @@ async def test_script_complete_predicate_is_a_positive_allowlist(async_db_sessio
     elif variant in {"outstanding_evidence_request", "pending_approval", "approved_not_resumed"}:
         approval.status = {"outstanding_evidence_request": "needs_more_evidence", "pending_approval": "pending",
                            "approved_not_resumed": "approved"}[variant]
-        await async_db_session.flush()
-    assert await runner.script_complete(state) is expected
+        await db.flush()
+
+
+@pytest.mark.parametrize("variant", SCRIPT_VARIANTS)
+async def test_script_complete_predicate_is_a_positive_allowlist(async_db_session, variant):
+    runner, state, approval = await _completed_rejected_state(async_db_session)
+    await _apply_script_variant(async_db_session, runner, state, approval, variant)
+    assert await runner.script_complete(state) is (variant == "baseline")
+
+
+@pytest.mark.parametrize("variant", SCRIPT_VARIANTS)
+async def test_no_progress_tail_follows_the_script_complete_predicate(async_db_session, variant):
+    r, runner, state, approval = await _completed_rejected_run(async_db_session)
+    await _apply_script_variant(async_db_session, runner, state, approval, variant)
+    runner.options["policy"] = POLICY
+    if variant == "pending_signal":
+        async def keep_signal_pending():
+            return None
+        runner.drain = keep_signal_pending
+    r.provider.decisions["one"].extend([TAIL, TAIL])
+    state.outcome = "ready"
+    before = len(runner.recorded)
+    await runner.advance(state)
+    assert state.outcome == "ready"
+    await runner.advance(state)
+    assert [e["action"] for e in runner.recorded[before:]] == ["classify_reply", "classify_reply"]
+    expected = "script_complete" if variant == "baseline" else "waiting_on_evidence"
+    assert state.outcome == expected
+    assert runner.report.outcomes["one"] == expected
 
 
 async def test_script_complete_is_refused_when_no_approval_row_exists(async_db_session):
@@ -2327,7 +2358,8 @@ def _tail_run(db, status, decisions, controls=None):
 async def test_rejected_script_then_repeated_allowed_decision_is_script_complete(async_db_session):
     r = _tail_run(async_db_session, "rejected", [native("pricing_change", "research", "RED"), TAIL, TAIL, TAIL])
     r.options["policy"] = {**POLICY, "red_action_types": ["pricing_change"]}
-    await r.run()
+    events = await r.run()
+    assert [e["action"] for e in events].count("classify_reply") >= 2
     assert r.report.outcomes["one"] == "script_complete"
     assert not r.report.failures
 
@@ -2337,7 +2369,8 @@ async def test_approved_resumed_and_completed_script_then_repeat_is_script_compl
     r = _tail_run(async_db_session, "approved", [native("pricing_change", "research", "RED"), native(),
                                                   after, after, after])
     r.options["policy"] = {**POLICY, "red_action_types": ["pricing_change"]}
-    await r.run()
+    events = await r.run()
+    assert [e["action"] for e in events].count("classify_reply") >= 2
     assert r.report.outcomes["one"] == "script_complete"
     assert not r.report.failures
 
@@ -2345,33 +2378,7 @@ async def test_approved_resumed_and_completed_script_then_repeat_is_script_compl
 async def test_no_progress_tail_without_a_completed_transition_after_approval_stays_a_failure(async_db_session):
     r = _tail_run(async_db_session, "approved", [native("pricing_change", "research", "RED"), TAIL, TAIL, TAIL])
     r.options["policy"] = {**POLICY, "red_action_types": ["pricing_change"]}
-    await r.run()
-    assert r.report.outcomes["one"] != "script_complete"
-    assert r.report.failures
-
-
-async def test_no_progress_tail_after_needs_more_evidence_stays_a_failure(async_db_session):
-    r = _tail_run(async_db_session, "needs_more_evidence", [native("pricing_change", "research", "RED"),
-                                                             TAIL, TAIL, TAIL])
-    r.options["policy"] = {**POLICY, "red_action_types": ["pricing_change"]}
-    await r.run()
-    assert r.report.outcomes["one"] != "script_complete"
-    assert r.report.failures
-
-
-async def test_no_progress_tail_with_a_retry_control_stays_a_failure(async_db_session):
-    controls = approval_controls()
-    controls["one"]["control_commands"].append({"id": "retry", "command_type": "retry",
-        "precondition": {"type": "failed_attempt_persisted", "attempt_ref": "first"}})
-    r = _tail_run(async_db_session, "rejected", [native("pricing_change", "research", "RED"), TAIL, TAIL, TAIL],
-                  controls)
-    r.options["policy"] = {**POLICY, "red_action_types": ["pricing_change"]}
-    await r.run()
-    assert r.report.outcomes["one"] != "script_complete"
-
-
-async def test_no_progress_tail_without_a_control_entry_stays_a_failure(async_db_session):
-    r = Run(async_db_session, [TAIL, TAIL, TAIL])
-    await r.run()
+    events = await r.run()
+    assert [e["action"] for e in events].count("classify_reply") >= 2
     assert r.report.outcomes["one"] == "waiting_on_evidence"
     assert r.report.failures == [{"case_id": "one", "outcome": "waiting_on_evidence"}]
