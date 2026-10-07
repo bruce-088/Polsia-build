@@ -1029,7 +1029,7 @@ class _Runner:
                                                self.options["integration_registry"], self.db)
             progress = (event.state_before, pair[0]["action"], event.state_after, fingerprint)
             if progress == state.last_progress:
-                state.outcome = "waiting_on_evidence"
+                state.outcome = "script_complete" if await self.script_complete(state) else "waiting_on_evidence"
             state.last_progress = progress
         if state.outcome == "provider_failure":
             failure_type = (event.native_failure or {}).get("type")

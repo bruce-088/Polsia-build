@@ -176,6 +176,12 @@ and no-script cases never receive it, and `needs_more_evidence` or unresumed app
 keep the failure outcome. It exists because every approval-case fixture carries an
 over-ceiling discount request that `prospect_to_meeting` has no transition to decide.
 
+The same unchanged predicate also applies when the provider's tail decision, after the
+script has fully run, is an allowed non-transition decision that repeats without progress:
+that no-progress stall is `script_complete` instead of `waiting_on_evidence`. The repeated
+decisions stay in the event log. A case whose script has not fully run, or that has no
+approval-lifecycle control entry, keeps `waiting_on_evidence`.
+
 A retry/founder-resolution
 control command dropped by budget exhaustion (marked consumed without ever
 dispatching) is reported explicitly as `dropped_commands`, distinct from

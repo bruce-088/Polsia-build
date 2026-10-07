@@ -95,6 +95,10 @@ async def stage2_decision(agent, task: dict, context: dict, *, structured_transp
                   "labels this action genuinely matches. Never claim a mode, limit, or flag unsupported by the "
                   "supplied evidence. If prior_founder_resolutions shows an action was rejected, expired or "
                   "cancelled, do not request that same action again; choose a different permitted action. "
+                  "For an action that has a canonical transition from the current state, risk_level and "
+                  "policy_intent.risk_level are that canonical transition's risk_level; express consent, "
+                  "authority or eligibility concerns through requires_consent, requires_authority and "
+                  "policy_flags, never by changing risk_level. "
                   "Return only the schema object.\n"
                   + json.dumps({"task": task, "context": context}, allow_nan=False))
         if structured_transport is None:

@@ -2143,6 +2143,25 @@ async def test_stage2_prompt_execute_phase_integration_excludes_drafted_content(
     assert "drafted_content" in schemas[0]["properties"] and "drafted_content" not in schemas[0]["required"]
 
 
+async def test_stage2_prompt_pins_risk_level_to_the_canonical_transition_risk():
+    context = {"workflow": WORKFLOW, "canonical_actions": ACTIONS, "canonical_agents": ["email_outreach"],
+               "canonical_handoffs": ["orchestrator"]}
+    prompts, schemas = [], []
+
+    def transport(prompt, schema):
+        prompts.append(prompt)
+        schemas.append(schema)
+        return native(), "raw"
+    agent = SimpleNamespace(agent_type="email_outreach", company_os_instructions="instructions")
+    await stage2_decision(agent, {"case_id": "one"}, context, structured_transport=transport)
+    sentence = ("For an action that has a canonical transition from the current state, risk_level and "
+                "policy_intent.risk_level are that canonical transition's risk_level; express consent, "
+                "authority or eligibility concerns through requires_consent, requires_authority and "
+                "policy_flags, never by changing risk_level. Return only the schema object.")
+    assert sentence in prompts[0]
+    assert "drafted_content" in schemas[0]["properties"] and "drafted_content" not in schemas[0]["required"]
+
+
 DEAD_END = {**WORKFLOW, "states": ["research", "parked", "shelved", "done"], "terminal_states": ["done"], "transitions": [
     {"from": "research", "to": "parked", "action": "score_against_icp", "risk_level": "GREEN"},
     {"from": "research", "to": "done", "action": "finish", "risk_level": "GREEN"}]}
@@ -2296,3 +2315,63 @@ async def test_invalid_blocked_action_declaration_is_a_fixture_authoring_error(a
     r = Run(async_db_session, REFUSED, controls=blocked(declaration), workflow=workflow)
     with pytest.raises(harness.FixtureAuthoringError, match="expected_wait"):
         await r.run()
+
+
+TAIL = native("classify_reply", "research")
+
+
+def _tail_run(db, status, decisions, controls=None):
+    return Run(db, decisions, controls=controls or approval_controls(), corrections=[resolution(status)])
+
+
+async def test_rejected_script_then_repeated_allowed_decision_is_script_complete(async_db_session):
+    r = _tail_run(async_db_session, "rejected", [native("pricing_change", "research", "RED"), TAIL, TAIL, TAIL])
+    r.options["policy"] = {**POLICY, "red_action_types": ["pricing_change"]}
+    await r.run()
+    assert r.report.outcomes["one"] == "script_complete"
+    assert not r.report.failures
+
+
+async def test_approved_resumed_and_completed_script_then_repeat_is_script_complete(async_db_session):
+    after = native("classify_reply", "scored")
+    r = _tail_run(async_db_session, "approved", [native("pricing_change", "research", "RED"), native(),
+                                                  after, after, after])
+    r.options["policy"] = {**POLICY, "red_action_types": ["pricing_change"]}
+    await r.run()
+    assert r.report.outcomes["one"] == "script_complete"
+    assert not r.report.failures
+
+
+async def test_no_progress_tail_without_a_completed_transition_after_approval_stays_a_failure(async_db_session):
+    r = _tail_run(async_db_session, "approved", [native("pricing_change", "research", "RED"), TAIL, TAIL, TAIL])
+    r.options["policy"] = {**POLICY, "red_action_types": ["pricing_change"]}
+    await r.run()
+    assert r.report.outcomes["one"] != "script_complete"
+    assert r.report.failures
+
+
+async def test_no_progress_tail_after_needs_more_evidence_stays_a_failure(async_db_session):
+    r = _tail_run(async_db_session, "needs_more_evidence", [native("pricing_change", "research", "RED"),
+                                                             TAIL, TAIL, TAIL])
+    r.options["policy"] = {**POLICY, "red_action_types": ["pricing_change"]}
+    await r.run()
+    assert r.report.outcomes["one"] != "script_complete"
+    assert r.report.failures
+
+
+async def test_no_progress_tail_with_a_retry_control_stays_a_failure(async_db_session):
+    controls = approval_controls()
+    controls["one"]["control_commands"].append({"id": "retry", "command_type": "retry",
+        "precondition": {"type": "failed_attempt_persisted", "attempt_ref": "first"}})
+    r = _tail_run(async_db_session, "rejected", [native("pricing_change", "research", "RED"), TAIL, TAIL, TAIL],
+                  controls)
+    r.options["policy"] = {**POLICY, "red_action_types": ["pricing_change"]}
+    await r.run()
+    assert r.report.outcomes["one"] != "script_complete"
+
+
+async def test_no_progress_tail_without_a_control_entry_stays_a_failure(async_db_session):
+    r = Run(async_db_session, [TAIL, TAIL, TAIL])
+    await r.run()
+    assert r.report.outcomes["one"] == "waiting_on_evidence"
+    assert r.report.failures == [{"case_id": "one", "outcome": "waiting_on_evidence"}]
