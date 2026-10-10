@@ -2351,8 +2351,9 @@ async def test_invalid_blocked_action_declaration_is_a_fixture_authoring_error(a
 TAIL = native("classify_reply", "research")
 
 
-def _tail_run(db, status, decisions, controls=None):
-    return Run(db, decisions, controls=controls or approval_controls(), corrections=[resolution(status)])
+def _tail_run(db, status, decisions, controls=None, workflow=None):
+    return Run(db, decisions, controls=controls or approval_controls(), corrections=[resolution(status)],
+               workflow=workflow)
 
 
 async def test_rejected_script_then_repeated_allowed_decision_is_script_complete(async_db_session):
@@ -2382,3 +2383,123 @@ async def test_no_progress_tail_without_a_completed_transition_after_approval_st
     assert [e["action"] for e in events].count("classify_reply") >= 2
     assert r.report.outcomes["one"] == "waiting_on_evidence"
     assert r.report.failures == [{"case_id": "one", "outcome": "waiting_on_evidence"}]
+
+
+REFUSAL = native("score_against_icp", "scored")
+
+
+def _requiring(workflow, index=0):
+    workflow = deepcopy(workflow)
+    workflow["transitions"][index]["requirements"] = ["authoritative calendar or human handoff"]
+    return workflow
+
+
+def _refusal_event(**mutation):
+    event = {"event_type": "failure_detected", "action": "score_against_icp", "result": "blocked",
+             "metadata": {"gate": "transition"}, "state_before": "research", "state_after": "research",
+             "error": "canonical transition requirements lack evidence"}
+    return {**event, **mutation}
+
+
+@pytest.mark.parametrize("mutation", [
+    {"event_type": "transition_attempted"}, {"result": "failed"}, {"metadata": {"gate": "policy"}},
+    {"metadata": None}, {"error": "something else"}, {"error": None}])
+def test_is_requirements_refusal_is_the_exact_service_refusal(mutation):
+    assert harness.is_requirements_refusal(_refusal_event()) is True
+    assert harness.is_requirements_refusal(_refusal_event(**mutation)) is False
+    assert harness.is_requirements_refusal(None) is False
+
+
+@pytest.mark.parametrize("variant", SCRIPT_VARIANTS)
+async def test_requirements_refusal_tail_follows_the_script_complete_predicate(async_db_session, variant):
+    r, runner, state, approval = await _completed_rejected_run(async_db_session)
+    await _apply_script_variant(async_db_session, runner, state, approval, variant)
+    runner.options["policy"] = POLICY
+    r.workflows[WORKFLOW["id"]]["transitions"][0]["requirements"] = ["absent fact"]
+    if variant == "pending_signal":
+        async def keep_signal_pending():
+            return None
+        runner.drain = keep_signal_pending
+    r.provider.decisions["one"].append(REFUSAL)
+    state.outcome = "ready"
+    before = len(runner.recorded)
+    await runner.advance(state)
+    assert [harness.is_requirements_refusal(e) for e in runner.recorded[before:]] == [True]
+    expected = "script_complete" if variant == "baseline" else "waiting_on_evidence"
+    assert state.outcome == expected
+    assert runner.report.outcomes["one"] == expected
+
+
+def _refusal_run(db, status, decisions, *, controls=None, workflow=None, index=0):
+    r = _tail_run(db, status, decisions, controls=controls, workflow=_requiring(workflow or WORKFLOW, index))
+    r.options["policy"] = {**POLICY, "red_action_types": ["pricing_change"]}
+    return r
+
+
+async def test_completed_rejected_script_then_refusal_is_script_complete(async_db_session):
+    r = _refusal_run(async_db_session, "rejected", [native("pricing_change", "research", "RED"), REFUSAL, REFUSAL])
+    events = await r.run()
+    assert harness.is_requirements_refusal(events[-1])
+    assert r.report.outcomes["one"] == "script_complete"
+    assert not r.report.failures
+
+
+async def test_approved_resumed_and_completed_script_then_refusal_is_script_complete(async_db_session):
+    r = _refusal_run(async_db_session, "approved", [native("pricing_change", "research", "RED"), native(),
+                     native("revisit", "research"), native("revisit", "research")], index=1)
+    events = await r.run()
+    assert harness.is_requirements_refusal(events[-1])
+    assert r.report.outcomes["one"] == "script_complete"
+    assert not r.report.failures
+
+
+async def test_refusal_after_approval_without_a_completed_transition_stays_a_failure(async_db_session):
+    r = _refusal_run(async_db_session, "approved", [native("pricing_change", "research", "RED"), REFUSAL, REFUSAL])
+    events = await r.run()
+    assert harness.is_requirements_refusal(events[-1])
+    assert r.report.outcomes["one"] == "waiting_on_evidence"
+    assert r.report.failures == [{"case_id": "one", "outcome": "waiting_on_evidence"}]
+
+
+async def test_refusal_with_no_control_entry_stays_a_failure(async_db_session):
+    r = Run(async_db_session, [REFUSAL, REFUSAL], workflow=_requiring(WORKFLOW))
+    await r.run()
+    assert r.report.outcomes["one"] == "waiting_on_evidence"
+    assert r.report.failures == [{"case_id": "one", "outcome": "waiting_on_evidence"}]
+
+
+FINISHABLE = {**WORKFLOW, "states": ["research", "done"], "terminal_states": ["done"], "transitions": [
+    {"from": "research", "to": "done", "action": "finish", "risk_level": "GREEN"}]}
+FINISH = native("finish", "done")
+PARKED = {**WORKFLOW, "states": ["research", "parked", "gated", "done"], "terminal_states": ["done"], "transitions": [
+    {"from": "research", "to": "done", "action": "finish", "risk_level": "GREEN"},
+    {"from": "gated", "to": "done", "action": "book_or_handoff_meeting", "risk_level": "GREEN",
+     "requirements": ["authoritative calendar or human handoff"]}]}
+
+
+def _declared(control, declaration):
+    return {"one": {**control["one"], "expected_wait": declaration}}
+
+
+async def test_refusal_evidencing_a_declared_blocked_action_wait_stays_a_credited_wait(async_db_session):
+    declaration = {"final_state": "research", "blocked_action": "finish"}
+    r = _refusal_run(async_db_session, "rejected", [native("pricing_change", "research", "RED"), FINISH, FINISH],
+                     controls=_declared(approval_controls(), declaration), workflow=FINISHABLE)
+    events = await r.run()
+    assert harness.is_requirements_refusal(events[-1])
+    assert r.report.outcomes["one"] == "expected_wait"
+    assert r.report.expected_waits == [{"case_id": "one", **declaration}]
+    assert not r.report.failures
+
+
+@pytest.mark.parametrize("declaration", [
+    {"final_state": "parked"}, {"final_state": "gated", "blocked_action": "book_or_handoff_meeting"}])
+async def test_refusal_with_an_unrelated_declared_wait_is_script_complete(async_db_session, declaration):
+    r = _tail_run(async_db_session, "rejected", [native("pricing_change", "research", "RED"), FINISH, FINISH],
+                  controls=_declared(approval_controls(), declaration), workflow=_requiring(PARKED, 0))
+    r.options["policy"] = {**POLICY, "red_action_types": ["pricing_change"]}
+    events = await r.run()
+    assert harness.is_requirements_refusal(events[-1])
+    assert r.report.outcomes["one"] == "script_complete"
+    assert r.report.expected_waits == []
+    assert not r.report.failures

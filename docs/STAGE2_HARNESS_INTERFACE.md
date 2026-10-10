@@ -182,6 +182,13 @@ that no-progress stall is `script_complete` instead of `waiting_on_evidence`. Th
 decisions stay in the event log. A case whose script has not fully run, or that has no
 approval-lifecycle control entry, keeps `waiting_on_evidence`.
 
+The same predicate also applies when the tail decision, after the script has fully run,
+is refused by the service itself (`failure_detected`, gate `transition`, result `blocked`,
+error `canonical transition requirements lack evidence`): that refusal is `script_complete`
+instead of `waiting_on_evidence`. The refusal has no side effect and stays in the event
+log. A declared `expected_wait` with a `blocked_action` that this very refusal evidences
+keeps `waiting_on_evidence` and is credited as `expected_wait` at the end of the run.
+
 A retry/founder-resolution
 control command dropped by budget exhaustion (marked consumed without ever
 dispatching) is reported explicitly as `dropped_commands`, distinct from

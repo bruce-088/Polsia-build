@@ -440,8 +440,7 @@ def classify_outcome(payload: dict) -> str:
         return "compliance_blocked"
     if kind == "failure_detected":
         if gate == "transition" and result in {"blocked", "failed"}:
-            return ("waiting_on_evidence" if result == "blocked" and
-                    payload.get("error") == REQUIREMENTS_REFUSAL else "transition_defect")
+            return "waiting_on_evidence" if is_requirements_refusal(payload) else "transition_defect"
         outcomes = {
             ("approval", "blocked"): "approval_collision", ("approval_resume", "blocked"): "resume_defect",
             ("contract", "failed"): "native_decision_defect", ("policy", "blocked"): "policy_blocked",
@@ -514,15 +513,19 @@ def validate_expected_wait(case_id: str, declaration: Any, workflow: dict | None
         raise FixtureAuthoringError(f"{case_id}: expected_wait blocked_action transition declares no requirements")
 
 
+def is_requirements_refusal(event: dict | None) -> bool:
+    """The service's own refusal of a canonical transition whose requirements lack evidence."""
+    return (isinstance(event, dict) and event.get("event_type") == "failure_detected"
+            and event.get("result") == "blocked" and (event.get("metadata") or {}).get("gate") == "transition"
+            and event.get("error") == REQUIREMENTS_REFUSAL)
+
+
 def wait_evidenced(declared: dict, event: dict | None) -> bool:
     """A blocked_action wait is only credited when the service itself refused that action last."""
     if "blocked_action" not in declared:
         return True
-    return (isinstance(event, dict) and event.get("event_type") == "failure_detected"
-            and event.get("action") == declared["blocked_action"] and event.get("result") == "blocked"
-            and (event.get("metadata") or {}).get("gate") == "transition"
-            and event.get("state_before") == event.get("state_after") == declared["final_state"]
-            and event.get("error") == REQUIREMENTS_REFUSAL)
+    return (is_requirements_refusal(event) and event.get("action") == declared["blocked_action"]
+            and event.get("state_before") == event.get("state_after") == declared["final_state"])
 
 
 def validate_pack(pack: dict, workflows: dict, corrections: list, registry: dict) -> None:
@@ -1024,6 +1027,12 @@ class _Runner:
             state.outcome = "unscripted_founder_request"
             if await self.script_complete(state):
                 state.outcome = "script_complete"
+        declared = state.source.get("expected_wait")
+        if (state.outcome == "waiting_on_evidence" and is_requirements_refusal(pair[0])
+                and not (isinstance(declared, dict) and "blocked_action" in declared
+                         and wait_evidenced(declared, pair[0]))
+                and await self.script_complete(state)):
+            state.outcome = "script_complete"
         if state.outcome == "ready":
             fingerprint = await decision_fingerprint(state.source, state.consumed, self.world,
                                                self.options["integration_registry"], self.db)
