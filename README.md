@@ -257,3 +257,43 @@ are append-only `CompanyOSActionEvent` rows. The service rejects invalid
 lifecycle jumps, authorization without approval, success without execution
 evidence, and failure without details. Recording evidence does not execute an
 action.
+
+
+## Venture lifecycle layer (Commander, Tracker, Predictor + phase leads)
+
+An opt-in layer above the operating agents that takes an idea from
+research to scale. It does not change the operating agents, the daily
+cycle, or the Company OS Stage 2 paths.
+
+```
+Founder ──► Commander ──► phase lead ──► worker agents (existing)
+               │           research_validation → launch → marketing → scaling
+               ├──► Tracker    (metrics from evidence, always unverified)
+               └──► Predictor  (idea rubric score, gate forecasts)
+```
+
+- `app/agents/venture/lifecycle.py` — phases, playbooks, exit gates,
+  delegation rules and the idea rubric. Pure and deterministic.
+- `app/agents/{commander,tracker,predictor,research_validation,launch,marketing,scaling}/`
+  — proposal-only agents, registered in `crew_factory.VENTURE_AGENT_MAP`.
+- `app/services/venture_service.py` — the enforcement point: permitted
+  delegation, unverified Tracker metrics, idempotent apply, and the RED
+  phase-advance path (gate must pass on verified metrics, founder approves
+  in the Founder Inbox, gate is re-checked on apply).
+- `/api/v1/ventures` — create/import ideas, record and verify metrics, run
+  agents, apply their proposals, request and apply phase advances.
+
+Typical loop:
+
+```bash
+# Import an idea exported from bbuilder (Mya → "Export Polsia brief")
+curl -X POST localhost/api/v1/ventures/import/bbuilder -H "X-API-Key: $API_KEY" -H "Content-Type: application/json" -d @polsia-company-x.json
+# Or generate ideas
+curl -X POST localhost/api/v1/ventures/ideate -H "X-API-Key: $API_KEY" -H "Content-Type: application/json" -d '{"constraints": "online only", "count": 8}'
+# Run Commander, then apply its plan (creates and queues the delegated tasks)
+curl -X POST localhost/api/v1/ventures/1/run -H "X-API-Key: $API_KEY" -H "Content-Type: application/json" -d '{"agent_type": "commander"}'
+curl -X POST localhost/api/v1/ventures/1/tasks/<task_id>/apply -H "X-API-Key: $API_KEY"
+# Record verified evidence, then ask to advance (RED approval in the Founder Inbox)
+curl -X POST localhost/api/v1/ventures/1/metrics -H "X-API-Key: $API_KEY" -H "Content-Type: application/json" -d '{"metrics": [{"metric": "committed_signals", "value": 3, "source": "Stripe pre-orders"}]}'
+curl -X POST localhost/api/v1/ventures/1/advance/request -H "X-API-Key: $API_KEY"
+```

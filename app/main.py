@@ -1,6 +1,18 @@
 from fastapi import FastAPI
 
-from app.api.v1 import agents, approvals, code, config, dashboard, emails, finance, memory, social, tasks
+from app.api.v1 import (
+    agents,
+    approvals,
+    code,
+    config,
+    dashboard,
+    emails,
+    finance,
+    memory,
+    social,
+    tasks,
+    ventures,
+)
 
 app = FastAPI(title="Polsia")
 
@@ -16,3 +28,4 @@ app.include_router(finance.webhook_router)
 app.include_router(memory.router)
 app.include_router(social.router)
 app.include_router(tasks.router)
+app.include_router(ventures.router)

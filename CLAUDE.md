@@ -81,6 +81,8 @@ All ORM models use `JSON` instead of `JSONB` or `ARRAY(String)` — this makes t
 4. Add a Beat schedule entry in `celery_app/beat_schedule.py` if it needs periodic runs
 5. Write unit tests in `tests/unit/test_<name>_agent.py`
 
+Venture-lifecycle agents (Commander, Tracker, Predictor, phase leads) are the exception: register them in `VENTURE_AGENT_MAP`, not `AGENT_MAP`/`VALID_AGENT_TYPES` — they need the venture snapshot that `/api/v1/ventures` puts in `task_metadata`. Gate, delegation and scoring rules live in `app/agents/venture/lifecycle.py`; enforcement lives in `app/services/venture_service.py`.
+
 ## Adding a new API endpoint
 
 1. Create `backend/app/api/v1/<name>.py`

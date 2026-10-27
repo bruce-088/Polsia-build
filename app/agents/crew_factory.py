@@ -18,12 +18,26 @@ AGENT_MAP: dict[str, tuple[str, str]] = {
     "governance": ("app.agents.governance.agent", "GovernanceAgent"),
 }
 
+# Venture lifecycle layer (app/agents/venture). Kept separate from AGENT_MAP
+# so the operating-agent status grid and generic trigger route are unchanged:
+# these agents need the venture snapshot that /api/v1/ventures supplies.
+VENTURE_AGENT_MAP: dict[str, tuple[str, str]] = {
+    "commander": ("app.agents.commander.agent", "CommanderAgent"),
+    "tracker": ("app.agents.tracker.agent", "TrackerAgent"),
+    "predictor": ("app.agents.predictor.agent", "PredictorAgent"),
+    "research_validation": ("app.agents.research_validation.agent", "ResearchValidationAgent"),
+    "launch": ("app.agents.launch.agent", "LaunchAgent"),
+    "marketing": ("app.agents.marketing.agent", "MarketingAgent"),
+    "scaling": ("app.agents.scaling.agent", "ScalingAgent"),
+}
+
 
 def run_agent_for_task(agent_type: str, task: dict, context: dict) -> dict:
-    if agent_type not in AGENT_MAP:
+    registry = AGENT_MAP if agent_type in AGENT_MAP else VENTURE_AGENT_MAP
+    if agent_type not in registry:
         raise ValueError(f"Unknown agent: {agent_type}")
 
-    module_path, class_name = AGENT_MAP[agent_type]
+    module_path, class_name = registry[agent_type]
     module = importlib.import_module(module_path)
     agent_class = getattr(module, class_name)
     agent = agent_class()

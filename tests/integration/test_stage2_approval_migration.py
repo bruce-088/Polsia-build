@@ -14,7 +14,9 @@ from app.config import settings
 def test_stage2_approval_migration_on_postgres(postgres_url, monkeypatch):
     monkeypatch.setattr(settings, "database_url", postgres_url)
     config = Config(str(Path(__file__).parents[2] / "alembic.ini"))
-    command.upgrade(config, "head")
+    # Pinned to 0005 (not "head") so later migrations don't change what this
+    # test verifies; tests/integration/test_ventures_migration.py covers 0006.
+    command.upgrade(config, "0005")
 
     async def check():
         engine = create_async_engine(postgres_url)
